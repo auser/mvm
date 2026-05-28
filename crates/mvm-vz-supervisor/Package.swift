@@ -33,5 +33,15 @@ let package = Package(
             name: "mvm-vz-supervisor",
             path: "Sources/mvm-vz-supervisor"
         ),
+        // Plan 102 W6.A.5 — XCTest harness for the bridged gvproxy
+        // device + BridgeWorker (Network.swift). Uses
+        // `@testable import mvm_vz_supervisor` to reach internal
+        // symbols. The Swift module name is the executable target
+        // name with hyphens replaced by underscores.
+        .testTarget(
+            name: "MvmVzSupervisorTests",
+            dependencies: ["mvm-vz-supervisor"],
+            path: "Tests/MvmVzSupervisorTests"
+        ),
     ]
 )

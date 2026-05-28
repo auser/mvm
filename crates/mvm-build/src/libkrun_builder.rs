@@ -394,6 +394,8 @@ impl LibkrunBuilderVm {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
 
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
@@ -494,6 +496,8 @@ impl LibkrunBuilderVm {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
         // Plan 89 W2 part 4: spawn the vsock response listener
         // BEFORE the supervisor so it can connect as soon as libkrun
@@ -763,6 +767,8 @@ impl BuilderVm for LibkrunBuilderVm {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
         // Plan 89 W2 part 4: same dispatch-listener wiring as
         // `run_shell_script`. Drained after the supervisor exits
@@ -936,6 +942,8 @@ impl VmBackendForBuilder for LibkrunBuilderBackend {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
 
         let mut child = spawn_supervisor_in_background(&self.supervisor_path, &cfg)?;
@@ -1827,6 +1835,8 @@ impl LibkrunPersistentBuilderVm {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
 
         let child = spawn_supervisor_in_background(&supervisor_path, &cfg)?;

@@ -3509,6 +3509,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-libkrun-supervisor"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "mvm-libkrun",
+ "mvm-plan",
+ "mvm-policy",
+ "mvm-providers",
+ "mvm-supervisor",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "mvm-mcp"
 version = "0.14.0"
 dependencies = [

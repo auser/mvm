@@ -121,6 +121,66 @@ Extends `ShellEnvironment` for fleet orchestration:
 - `ensure_bridge()`, `setup_tap()`, `teardown_tap()`
 - `record_revision()`
 
+### Supervisor: the two layers
+
+"Supervisor" is reused at two distinct layers in this codebase. Knowing which one a given file or PR talks about removes most of the confusion when reading the source.
+
+#### 1. `mvm-supervisor` — host-side admission and audit substrate
+
+The library at `crates/mvm-supervisor/`, consumed by `mvm-cli` when you run `mvmctl up`. It turns a "I want to run this workload" intent into a launched, audited microVM on a single host. Responsibilities, all on the host (not in the guest):
+
+- **Admit an `ExecutionPlan`** — verify the Ed25519 signature, enforce the validity window, refuse replays via a nonce ledger. See `admit_for_run` and `host_signer::load_or_init_at`.
+- **Chain-sign audit events** — append `plan.admitted` / `plan.launched` / `plan.failed` / `plan.oci_provenance` / `gateway.flow_opened` / `gateway.flow_closed` entries to `~/.mvm/audit/<tenant>.jsonl`, each hash-linked to the previous (`AuditEntry`, `FileAuditSigner` under cross-process `flock`, `verify_audit_chain`).
+- **Run the gateway audit bridge** — splice every guest network byte through an in-process bridge that emits flow events into the chain (`gateway_bridge`, `gateway_audit`). The bridge is the load-bearing piece of [security claim 10](/security/ci-claims).
+- **Verify sealed deps volumes**, **resolve policy bundles**, **enforce default-deny network policy**, **run the L4 / L7 egress proxies**.
+
+It does not link libkrun, does not call `krun_start_enter`, and never owns the guest's lifetime directly. It tells a per-VM child process to do that.
+
+#### 2. `mvm-libkrun-supervisor` (and `mvm-vz-supervisor`) — per-VM long-lived processes
+
+The bin at `crates/mvm-libkrun-supervisor/` (and the Swift sibling at `crates/mvm-vz-supervisor/`) is the actual process that owns one running guest. **One process per VM**, by design:
+
+> `krun_start_enter` calls `exit()` on the calling process when the guest powers off. An in-process registry would tear down every other libkrun guest the parent `mvmctl` is supervising. One process per VM scopes the `exit()` to a single supervisor, so the parent `mvmctl` returns immediately after spawning and survives a guest shutdown.
+
+Lifecycle:
+
+1. `mvm-backend::LibkrunBackend::start()` spawns the binary with a JSON `SupervisorConfig` piped to stdin.
+2. The bin ad-hoc-codesigns itself for `Hypervisor.framework` on macOS, creates the per-VM state dir, writes its PID file.
+3. Configures libkrun (`configure_with_gateway`), spawns the userspace network gateway (`passt` on Linux, `gvproxy` on macOS), spawns the gateway audit bridge.
+4. Calls `krun_start_enter`, which blocks until the guest exits, then `exit()`s.
+
+When `mvmctl stop <vm>` runs it reads the PID file and `SIGTERM`s this process. `mvm-vz-supervisor` is the parallel Swift binary that fills the same role on macOS 26+ Apple Silicon (Vz backend).
+
+#### How they relate
+
+The host-side `mvm-supervisor` (layer 1) builds a `SupervisorConfig`, spawns the per-VM bin (layer 2) with that JSON, and returns. The audit chain bridges the two layers: admission events (`plan.admitted` etc.) are written by layer 1 *before* layer 2 starts; runtime events (`gateway.flow_*`) are written by the bridge running *inside* layer 2. Both append to the same `~/.mvm/audit/<tenant>.jsonl` under cross-process `flock`, so the chain stays linear and `mvmctl audit verify` can validate it end-to-end.
+
+```
+mvmctl up <flake>
+  └── mvm-supervisor (layer 1, in mvmctl process)
+        │  • verifies ExecutionPlan signature
+        │  • emits plan.admitted to ~/.mvm/audit/<tenant>.jsonl
+        │  • resolves policy bundle, installs host firewall
+        │  • spawns ↓
+        └── mvm-libkrun-supervisor (layer 2, one process per VM)
+              • boots libkrun guest
+              • bridges guest network through gateway_bridge
+              • emits gateway.flow_opened / flow_closed
+                to the same ~/.mvm/audit/<tenant>.jsonl
+              • exits when the guest exits
+```
+
+#### Why the split exists at all (the mvm / mvmd boundary)
+
+This repo (`mvm`) is the single-host runtime — one host trusts itself with the hypervisor and the host-signer key. `mvm-supervisor` enforces the security claims at that boundary.
+
+Multi-tenant fleet orchestration lives in the separate [mvmd](https://github.com/tinylabscom/mvmd) repo. mvmd does *not* consume `mvm-supervisor` as a library — it has its own gateway (`mvmd-gateway`), its own runtime (`mvmd-runtime`), and its own admission flow that ultimately calls down to mvm-tier backends. The cross-repo split is intentional per the [threat model](/security/threat-model) (ADR-002) and the [CI-enforced security claims](/security/ci-claims) (claim 10 substrate, ADR-058):
+
+- `mvm-supervisor` ↔ per-VM, per-host, per-tenant admission + audit (security claims 8, 9, 10).
+- `mvmd` ↔ cross-VM, cross-host, cross-tenant orchestration. mvmd's Plan 50 (network manager) layers per-tenant gateway pools, egress quotas, cross-tenant traffic isolation, and tenant-level audit rollup *above* mvm-supervisor's per-VM substrate.
+
+A workload running through mvmd transits both layers: mvmd's admission decides which host the workload lands on and sets cross-tenant policy; mvm-supervisor on that host then runs the per-VM admission + audit substrate this doc describes.
+
 ### Supervisor Enforcement
 
 `mvm-supervisor` owns the host-side policy slots used after plan admission:

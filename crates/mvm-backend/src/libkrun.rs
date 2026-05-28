@@ -129,12 +129,18 @@ impl VmBackend for LibkrunBackend {
             // None for now — backend orchestrator population
             // (sourcing tenant_id from ExecutionPlan, gateway sockets
             // from mvm_data_dir()) lands alongside the
-            // run_supervisor_with_bridge wire-up (commit 6.5 / 7).
+            // run_supervisor_with_bridge wire-up (Plan 102 W6.A.5
+            // Phase 3).
             tenant_id: None,
             audit_dir: None,
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            // Plan 102 W6.A.5 plan/bundle fields — populated by the
+            // same Phase 3 wire-up that fills the audit-substrate
+            // paths.
+            plan: None,
+            bundle: None,
         };
         let pid_file = cfg.pid_file();
         // Remove any stale PID file from a previous crashed supervisor

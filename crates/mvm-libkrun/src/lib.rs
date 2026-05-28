@@ -21,6 +21,11 @@
 //! `mvm-backend` and `mvm-cli`.
 
 use std::path::Path;
+// Plan 102 W6.A.5 — `BridgeFds` carries OwnedFds; the
+// bridge-inserting configure path needs AsRawFd/FromRawFd to feed
+// libkrun's raw-fd API and to wrap socketpair(2) results.
+#[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+use std::os::fd::{AsRawFd, OwnedFd};
 
 #[cfg(feature = "libkrun-sys")]
 mod sys;
@@ -715,6 +720,272 @@ fn configure_with_gateway(ctx: &KrunContext) -> Result<(sys::Context, GatewayHan
     Ok((krun, handle))
 }
 
+// ============================================================================
+// Plan 102 W6.A.5 — bridge-inserting configure + run_supervisor_with_bridge
+// ============================================================================
+
+/// Endpoint fds the gateway audit bridge needs to splice between
+/// libkrun and the userspace network gateway (`passt` / `gvproxy`).
+///
+/// Constructed by [`configure_with_gateway_for_bridge`] alongside
+/// the libkrun `sys::Context` and a [`GatewayHandle`] that keeps
+/// the gateway child process alive. Consumed by the bridge factory
+/// closure passed to [`run_supervisor_with_bridge`], which builds
+/// `mvm_supervisor::gateway_bridge::BridgeEndpoints` from these
+/// values and calls `spawn_bridge_thread`.
+///
+/// Variants mirror `BridgeEndpoints` one-for-one so the bin can
+/// convert without case analysis: `Passt` → `BridgeEndpoints::Passt`,
+/// `LibkrunGvproxy` → `BridgeEndpoints::LibkrunGvproxy`.
+#[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+pub enum BridgeFds {
+    /// Linux libkrun + passt. Both sides are `SOCK_STREAM`:
+    /// - `gateway_fd` is the parent half of passt's socketpair;
+    ///   the bridge reads/writes raw virtio-net frames from passt.
+    /// - `supervisor_fd` is the supervisor half of an inner
+    ///   `socketpair(2)` whose other half was handed to libkrun via
+    ///   `add_net_unixstream_fd`; the bridge reads/writes the same
+    ///   raw frames toward libkrun.
+    ///
+    /// The bridge thread `tokio::io::copy_bidirectional`s the two
+    /// halves, sniffs first-byte-per-direction to emit
+    /// `gateway.flow_opened` audit entries, and emits paired
+    /// `gateway.flow_closed` on EOF or bridge error.
+    Passt {
+        gateway_fd: OwnedFd,
+        supervisor_fd: OwnedFd,
+    },
+    /// macOS libkrun + gvproxy. `SOCK_DGRAM`:
+    /// - `gvproxy_socket_path` is the path gvproxy bound its
+    ///   listener at on spawn.
+    /// - `supervisor_listen_path` is where libkrun has been told
+    ///   to connect (via `add_net_unixgram_path`); the bridge
+    ///   binds a `UnixDatagram` there inside its thread before
+    ///   libkrun's net device probes.
+    ///
+    /// libkrun is an anonymous unixgram client — the bridge caches
+    /// its autobind peer address from the first `recv_from`, then
+    /// uses `send_to(peer, …)` for the ingress direction.
+    LibkrunGvproxy {
+        gvproxy_socket_path: std::path::PathBuf,
+        supervisor_listen_path: std::path::PathBuf,
+    },
+}
+
+/// Plan 102 W6.A.5 — bridge-inserting variant of
+/// [`configure_with_gateway`]. Spawns passt / gvproxy, then
+/// interposes a supervisor-owned socket pair (`Passt`) or listener
+/// path (`LibkrunGvproxy`) between libkrun and the gateway so the
+/// gateway audit bridge can splice every byte through itself.
+///
+/// Refuses [`NetworkingMode::Tsi`] — TSI bypasses virtio-net
+/// entirely and violates the claim-10 no-bypass invariant (see
+/// ADR-058). Callers that need TSI must use the legacy
+/// [`run_supervisor`] entry point.
+#[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+fn configure_with_gateway_for_bridge(
+    ctx: &KrunContext,
+    bridge_scratch_dir: &std::path::Path,
+) -> Result<(sys::Context, GatewayHandle, BridgeFds), Error> {
+    // Claim-10 admission gate 2 — refuse TSI before any FFI call so
+    // the rejection is observable in unit tests that don't link
+    // libkrun (configure_pre_net calls `sys::Context::new`, which
+    // is real FFI). Moving the check up also avoids leaking a
+    // `sys::Context` on the refusal path.
+    if matches!(ctx.networking, NetworkingMode::Tsi) {
+        return Err(Error::Io {
+            context: "configure_with_gateway_for_bridge refuses NetworkingMode::Tsi: \
+                TSI bypasses virtio-net and violates the claim-10 no-bypass \
+                invariant (ADR-058). Use run_supervisor for legacy dev-mode VMs."
+                .to_string(),
+        });
+    }
+    let krun = configure_pre_net(ctx)?;
+    let (handle, bridge_fds) = match &ctx.networking {
+        NetworkingMode::Tsi => unreachable!("refused above"),
+        NetworkingMode::Passt { mac, scratch_dir } => {
+            let mut handle =
+                passt::spawn(std::path::Path::new(scratch_dir)).map_err(|e| Error::Io {
+                    context: format!("spawning passt for bridged NetworkingMode::Passt: {e}"),
+                })?;
+            // Take the passt-parent fd (faces passt). PasstHandle
+            // keeps the child alive via Drop; `take_socket` leaves
+            // the handle's `child` field in place.
+            let gateway_fd = handle.take_socket().ok_or_else(|| Error::Io {
+                context: "PasstHandle::take_socket returned None — \
+                            handle's parent_socket was already taken"
+                    .to_string(),
+            })?;
+            // Build the inner SOCK_STREAM socketpair. One half goes
+            // to libkrun; libkrun dups across `start_enter`, so we
+            // can close our copy of that half right after the
+            // add_net_* call. The other half stays with the bridge.
+            let (inner_libkrun, inner_supervisor) =
+                bridge_socketpair_stream().map_err(|e| Error::Io {
+                    context: format!("creating bridge socketpair (passt): {e}"),
+                })?;
+            krun.add_net_unixstream_fd(
+                inner_libkrun.as_raw_fd(),
+                mac,
+                sys::PASST_NET_FEATURES,
+                /* flags = */ 0,
+            )?;
+            // libkrun has dup'd; close our copy of the libkrun half.
+            drop(inner_libkrun);
+            (
+                GatewayHandle::Passt(handle),
+                BridgeFds::Passt {
+                    gateway_fd,
+                    supervisor_fd: inner_supervisor,
+                },
+            )
+        }
+        NetworkingMode::Gvproxy { mac, scratch_dir } => {
+            let handle =
+                gvproxy::spawn(std::path::Path::new(scratch_dir)).map_err(|e| Error::Io {
+                    context: format!("spawning gvproxy for bridged NetworkingMode::Gvproxy: {e}"),
+                })?;
+            // Snapshot gvproxy's bind path before moving the handle
+            // into GatewayHandle::Gvproxy — the bridge needs it to
+            // connect for the egress direction.
+            let gvproxy_socket_path = handle.socket_path().to_path_buf();
+            // Pick a fresh path inside the per-VM bridge scratch
+            // dir for the supervisor-side listener. The bridge
+            // thread binds it; libkrun's add_net_unixgram_path
+            // stores the path and connects lazily at net-device
+            // probe time (well after the bridge has bound).
+            std::fs::create_dir_all(bridge_scratch_dir).map_err(|e| Error::Io {
+                context: format!(
+                    "create bridge scratch dir {}: {e}",
+                    bridge_scratch_dir.display()
+                ),
+            })?;
+            let supervisor_listen_path = bridge_scratch_dir.join("bridge-libkrun.sock");
+            // Defensive: if a previous run left a stale socket
+            // file at this path the bridge bind would fail with
+            // EADDRINUSE. Pre-unlink under our umask.
+            let _ = std::fs::remove_file(&supervisor_listen_path);
+            krun.add_net_unixgram_path(
+                &supervisor_listen_path,
+                mac,
+                sys::PASST_NET_FEATURES,
+                sys::NET_FLAG_VFKIT | sys::NET_FLAG_DHCP_CLIENT,
+            )?;
+            (
+                GatewayHandle::Gvproxy(handle),
+                BridgeFds::LibkrunGvproxy {
+                    gvproxy_socket_path,
+                    supervisor_listen_path,
+                },
+            )
+        }
+    };
+    Ok((krun, handle, bridge_fds))
+}
+
+/// Build a `SOCK_STREAM` socketpair for the bridge's inner pair
+/// (libkrun ↔ supervisor). Mirrors `passt::make_socketpair` but
+/// kept here so the bridge insertion path doesn't need to leak
+/// passt internals into the bridge module signature.
+#[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+fn bridge_socketpair_stream() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: socketpair fills `fds` with two valid file descriptors
+    // on success (return 0); on failure (return -1) the array is
+    // untouched and we return errno.
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: kernel returned two valid fds.
+    let a = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let b = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((a, b))
+}
+
+/// Plan 102 W6.A.5 — supervisor entry point that runs the per-VM
+/// gateway audit bridge. Mirrors [`run_supervisor`] but interposes
+/// the bridge between libkrun and the userspace network gateway,
+/// then hands the resulting `BridgeFds` to a caller-supplied
+/// factory closure (which builds and spawns the bridge thread).
+///
+/// The factory runs synchronously after libkrun is configured but
+/// before `start_enter` is called. Typical implementation:
+///
+/// ```ignore
+/// run_supervisor_with_bridge(&cfg, |bridge_fds| {
+///     let endpoints = match bridge_fds {
+///         BridgeFds::Passt { gateway_fd, supervisor_fd } => {
+///             mvm_supervisor::gateway_bridge::BridgeEndpoints::Passt {
+///                 gateway_fd, supervisor_fd,
+///             }
+///         }
+///         BridgeFds::LibkrunGvproxy { gvproxy_socket_path, supervisor_listen_path } => {
+///             mvm_supervisor::gateway_bridge::BridgeEndpoints::LibkrunGvproxy {
+///                 gvproxy_socket_path, supervisor_listen_path,
+///             }
+///         }
+///     };
+///     let bridge_cfg = mvm_supervisor::gateway_bridge::BridgeConfig { /* … */ };
+///     let _join = mvm_supervisor::gateway_bridge::spawn_bridge_thread(endpoints, bridge_cfg);
+/// })?;
+/// ```
+///
+/// The bridge thread runs concurrently with `krun_start_enter`,
+/// which blocks until the guest exits and then calls `exit()` on
+/// the process — reaping the bridge thread without graceful join.
+///
+/// Claim-10 admission gates:
+/// 1. `cfg.validate_audit_substrate()` — refuses configs missing
+///    the audit-substrate paths or carrying an out-of-policy
+///    signing key.
+/// 2. `configure_with_gateway_for_bridge` refuses
+///    `NetworkingMode::Tsi`.
+#[cfg(feature = "libkrun-sys")]
+pub fn run_supervisor_with_bridge<F>(
+    cfg: &SupervisorConfig,
+    bridge_factory: F,
+) -> Result<std::convert::Infallible, Error>
+where
+    F: FnOnce(BridgeFds),
+{
+    // Claim-10 admission gate 1 — audit substrate fields.
+    cfg.validate_audit_substrate().map_err(|e| Error::Io {
+        context: format!("claim-10 admission: validate_audit_substrate refused: {e}"),
+    })?;
+
+    // Standard supervisor setup mirrors `run_supervisor`.
+    std::fs::create_dir_all(&cfg.vm_state_dir).map_err(|e| Error::Io {
+        context: format!("create_dir_all {}: {e}", cfg.vm_state_dir),
+    })?;
+    let pid_path = cfg.pid_file();
+    let pid = std::process::id().to_string();
+    std::fs::write(&pid_path, &pid).map_err(|e| Error::Io {
+        context: format!("write pid file {}: {e}", pid_path.display()),
+    })?;
+    if !is_available() {
+        return Err(Error::NotInstalled {
+            install_hint: install_hint(),
+        });
+    }
+
+    // Bridge scratch lives inside the per-VM state dir so it's
+    // reaped by the standard `mvmctl cache prune` walker.
+    let bridge_scratch_dir = std::path::PathBuf::from(&cfg.vm_state_dir).join("bridge");
+    let (krun, _gateway_handle, bridge_fds) =
+        configure_with_gateway_for_bridge(&cfg.krun, &bridge_scratch_dir)?;
+
+    // Hand the bridge fds to the factory. The factory spawns the
+    // bridge thread before we enter libkrun — so by the time
+    // `start_enter` brings up the guest's net device, the bridge
+    // is already serving / listening on both ends.
+    bridge_factory(bridge_fds);
+
+    install_shutdown_handler(&krun)?;
+    krun.start_enter()
+}
+
 /// Plan 87 — every part of `configure` that doesn't touch the
 /// networking backend. Shared between the plain `configure` path
 /// (TSI-only) and `configure_with_passt`.
@@ -995,6 +1266,30 @@ pub struct SupervisorConfig {
     /// `~/.mvm/keys/` (no path-traversal) at admission.
     #[serde(default)]
     pub signing_key_path: Option<std::path::PathBuf>,
+
+    // --- Plan 102 W6.A.5: plan + bundle for bridge construction -----
+    //
+    // The bridge ([`mvm_supervisor::gateway_bridge::BridgeConfig`])
+    // needs `Arc<ExecutionPlan>` + `Option<Arc<PolicyBundle>>` to
+    // construct chained `AuditEntry`s. Carrying them as
+    // `Option<serde_json::Value>` (instead of the typed structs)
+    // avoids adding `mvm-plan` / `mvm-policy` to this crate's deps,
+    // which would close the `mvm-libkrun ← mvm-core ← mvm-plan`
+    // cycle. The leaf bin crate `mvm-libkrun-supervisor` can freely
+    // depend on both and deserializes the Values on the bridge side.
+    /// JSON-encoded [`mvm_plan::ExecutionPlan`] for this admission.
+    /// The bin deserializes into the typed value when building
+    /// `BridgeConfig.plan`. `None` ⇒ legacy non-bridge path
+    /// (`tenant_id` will also be `None` and
+    /// `validate_audit_substrate` will refuse).
+    #[serde(default)]
+    pub plan: Option<serde_json::Value>,
+    /// JSON-encoded [`mvm_policy::PolicyBundle`] for this admission.
+    /// Optional even when `plan` is set — workloads can run with
+    /// no bundle (matches the existing `Option<Arc<PolicyBundle>>`
+    /// in `BridgeConfig`).
+    #[serde(default)]
+    pub bundle: Option<serde_json::Value>,
 }
 
 impl SupervisorConfig {
@@ -1497,6 +1792,8 @@ mod tests {
                 "/tmp/mvm/audit/gateway-events-vm-a.sock",
             )),
             signing_key_path: Some(keys.join("host-signer.ed25519")),
+            plan: None,
+            bundle: None,
         }
     }
 
@@ -1615,6 +1912,8 @@ mod tests {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
         let json = serde_json::to_string(&cfg_pre_w6a).unwrap();
         let parsed: SupervisorConfig =
@@ -1623,7 +1922,126 @@ mod tests {
         assert!(parsed.audit_dir.is_none());
         assert!(parsed.gateway_audit_socket.is_none());
         assert!(parsed.signing_key_path.is_none());
+        assert!(parsed.plan.is_none());
+        assert!(parsed.bundle.is_none());
         // But validate_audit_substrate must refuse it.
         assert!(parsed.validate_audit_substrate().is_err());
+    }
+
+    // Plan 102 W6.A.5 — `plan` + `bundle` fields on SupervisorConfig.
+    // Tests pin: (1) back-compat from JSON omitting both fields, (2)
+    // serde roundtrip with both fields populated, (3) the validate_*
+    // gate doesn't require them (validation covers paths only — the
+    // bridge factory consumes plan/bundle as soft data).
+
+    #[test]
+    fn supervisor_config_parses_pre_w6a5_json_missing_plan_and_bundle() {
+        // A pre-W6.A.5 caller would have omitted both new fields.
+        let json = r#"{
+            "krun": {
+                "name": "vm",
+                "kernel_path": "/k",
+                "rootfs_path": "/r",
+                "vcpus": 1,
+                "ram_mib": 256,
+                "kernel_cmdline": null,
+                "vsock_ports": [],
+                "extra_disks": [],
+                "console_output_path": null,
+                "vsock_socket_dir": null
+            },
+            "vm_state_dir": "/tmp/vms/vm",
+            "pid_file_name": null
+        }"#;
+        let parsed: SupervisorConfig =
+            serde_json::from_str(json).expect("pre-W6.A.5 JSON must still parse");
+        assert!(parsed.plan.is_none());
+        assert!(parsed.bundle.is_none());
+    }
+
+    #[test]
+    fn supervisor_config_roundtrips_with_plan_and_bundle_populated() {
+        let mut cfg = well_formed_supervisor_config();
+        // Stand-in JSON shapes — the bin crate is what decodes these
+        // into typed `ExecutionPlan` / `PolicyBundle`, so the
+        // mvm-libkrun layer only verifies the Values roundtrip.
+        cfg.plan = Some(serde_json::json!({
+            "tenant_id": "tenant-x",
+            "kind": "workload",
+            "version": 1
+        }));
+        cfg.bundle = Some(serde_json::json!({
+            "name": "default",
+            "version": 1,
+            "rules": []
+        }));
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(parsed.plan, cfg.plan);
+        assert_eq!(parsed.bundle, cfg.bundle);
+    }
+
+    #[test]
+    fn supervisor_config_plan_without_bundle_is_legal() {
+        let mut cfg = well_formed_supervisor_config();
+        cfg.plan = Some(serde_json::json!({ "kind": "workload" }));
+        cfg.bundle = None;
+        // No validation involvement — bridge factory tolerates the
+        // bundle being absent (matches `Option<Arc<PolicyBundle>>`
+        // in BridgeConfig). Confirm serde roundtrip preserves the
+        // shape without errors.
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip");
+        assert!(parsed.plan.is_some());
+        assert!(parsed.bundle.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Plan 102 W6.A.5 — bridge-inserting configure + BridgeFds.
+    // The configure_with_gateway_for_bridge tests below are gated on
+    // both `libkrun-sys` (needs the FFI bindings to compile) and
+    // unix (the gateway types are unix-family only).
+    // ---------------------------------------------------------------
+
+    #[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+    #[test]
+    fn bridge_socketpair_stream_returns_two_distinct_fds() {
+        use std::os::fd::AsRawFd;
+        let (a, b) = bridge_socketpair_stream().expect("socketpair");
+        assert_ne!(a.as_raw_fd(), b.as_raw_fd());
+        assert!(a.as_raw_fd() >= 0);
+        assert!(b.as_raw_fd() >= 0);
+    }
+
+    #[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+    #[test]
+    fn configure_with_gateway_for_bridge_refuses_tsi() {
+        // TSI bypasses virtio-net entirely and violates the
+        // claim-10 no-bypass invariant. The refusal must fire
+        // before configure_pre_net (which touches FFI) so the
+        // test passes on hosts without libkrun installed.
+        let ctx = KrunContext::new("vm", "/k", "/r"); // defaults to NetworkingMode::Tsi
+        assert!(matches!(ctx.networking, NetworkingMode::Tsi));
+        let scratch = std::path::PathBuf::from("/tmp/mvm-bridge-test-tsi-refusal");
+        let result = configure_with_gateway_for_bridge(&ctx, &scratch);
+        // Avoid `expect_err` because Result::expect_err requires Debug
+        // on the Ok type, and `sys::Context` is FFI-opaque without one.
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("Tsi networking must be refused"),
+        };
+        match err {
+            Error::Io { context } => {
+                assert!(
+                    context.contains("Tsi"),
+                    "error context must name Tsi: {context}"
+                );
+                assert!(
+                    context.contains("claim-10"),
+                    "error context must cite claim-10: {context}"
+                );
+            }
+            other => panic!("expected Error::Io with Tsi message, got {other:?}"),
+        }
     }
 }

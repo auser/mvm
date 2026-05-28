@@ -41,12 +41,16 @@ tracing = "0.1"
 # itself. Compile cost is marginal; serde is already in nearly
 # every other workspace crate's dep graph.
 serde = { workspace = true }
-# Plan 57 W4 supervisor binary (`src/bin/mvm-libkrun-supervisor.rs`)
-# needs JSON parsing on stdin and pulls `ensure_signed()` from
-# mvm-providers (macOS codesigning gate). Both are optional and
-# gated on `libkrun-sys` so the default workspace build (CI fast
-# lane, hosts without libkrun.h) skips the heavier dep graph.
-#
+# Plan 102 W6.A.5 — `SupervisorConfig` carries the per-VM
+# ExecutionPlan + PolicyBundle as `Option<serde_json::Value>` so the
+# bin (`mvm-libkrun-supervisor`) can feed them into the bridge
+# factory without forcing mvm-libkrun to depend on mvm-plan / mvm-
+# policy (which would close the `mvm-libkrun ← mvm-core ← mvm-plan`
+# cycle). The bin crate, being a leaf, deserializes the Values into
+# typed `ExecutionPlan` / `PolicyBundle` since it can depend on
+# both. Always-on (not feature-gated) because `SupervisorConfig` is
+# always-on per the comment above.
+serde_json.workspace = true
 # We intentionally do NOT pull `mvm-guest` from regular deps: that
 # would close a cycle (mvm-core → mvm-libkrun → mvm-guest → mvm-core,
 # since mvm-core depends on mvm-libkrun for `Platform::has_libkrun`).
@@ -55,8 +59,14 @@ serde = { workspace = true }
 # composing the config, not by the supervisor consuming it. The
 # `libkrun-smoke` example keeps `mvm-guest` as a dev-dep because
 # dev-deps are excluded from cycle analysis.
-mvm-providers = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+#
+# Plan 102 W6.A.5 moved the `mvm-libkrun-supervisor` bin out into
+# its own leaf crate (`crates/mvm-libkrun-supervisor/`) so the bin
+# can also depend on `mvm-supervisor` for the gateway audit
+# substrate. The optional `mvm-providers` + `serde_json` deps that
+# previously gated the bin moved with it. `serde_json` is still
+# needed in `[dev-dependencies]` for the `SupervisorConfig` /
+# `KrunContext` serde-roundtrip tests.
 # Plan 87 W2 — `passt` module probes $PATH for the `passt` binary
 # before spawning it. `which` is already in the workspace dep tree
 # (mvm-cli/mvm-build); pulling it in here keeps the dep graph
@@ -74,12 +84,11 @@ bindgen = "0.72"
 default = []
 # Opt-in: generate FFI bindings and link `libkrun`. Off by default so
 # the workspace builds on hosts without libkrun installed (CI fast lane,
-# Linux contributors who don't run the Tier 2 backend). Enables the
-# supervisor binary and its mvm-guest/mvm-providers/serde dep chain.
-libkrun-sys = [
-    "dep:mvm-providers",
-    "dep:serde_json",
-]
+# Linux contributors who don't run the Tier 2 backend). With the
+# supervisor bin moved to `mvm-libkrun-supervisor` (Plan 102 W6.A.5),
+# this feature only gates the FFI surface in lib.rs (`configure_*`,
+# `run_supervisor`, etc.); the bin pulls its own dep chain.
+libkrun-sys = []
 
 [dev-dependencies]
 # Plan 87 W2 — passt supervisor tests stage scratch dirs.
@@ -111,14 +120,10 @@ path = "examples/libkrun-smoke.rs"
 required-features = ["libkrun-sys"]
 
 # Plan 57 W4 — long-running supervisor process. One process per
-# libkrun guest. Reads a JSON `SupervisorConfig` on stdin, binds host
-# vsock listeners, writes its PID under ~/.mvm/vms/<name>/, then
-# `start_enter`s the guest. The W4.2 PR wires
-# `LibkrunBackend::start()` to spawn this binary.
-[[bin]]
-name = "mvm-libkrun-supervisor"
-path = "src/bin/mvm-libkrun-supervisor.rs"
-required-features = ["libkrun-sys"]
+# libkrun guest. The bin moved to its own leaf crate
+# (`crates/mvm-libkrun-supervisor/`) under Plan 102 W6.A.5 so it can
+# depend on `mvm-supervisor` (gateway audit substrate) without
+# closing the `mvm-supervisor → mvm-backend → mvm-libkrun` cycle.
 
 [lints]
 workspace = true

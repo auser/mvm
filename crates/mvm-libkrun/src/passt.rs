@@ -137,10 +137,28 @@ impl PasstHandle {
     /// libkrun, dup, …). After this call [`Self::socket_fd`] panics.
     /// libkrun's `start_enter` semantics consume the fd implicitly,
     /// so most callers never need this.
+    ///
+    /// Consumes the handle, so the child process is killed via Drop
+    /// once the returned fd is dropped. Use [`Self::take_socket`]
+    /// when the caller wants to keep the child alive (e.g., the
+    /// gateway audit bridge that splices passt ↔ libkrun for the
+    /// guest's lifetime).
     pub fn into_socket(mut self) -> OwnedFd {
         self.parent_socket
             .take()
             .expect("PasstHandle::into_socket called twice")
+    }
+
+    /// Plan 102 W6.A.5 — take ownership of the parent socket
+    /// *without* consuming the handle. The PasstHandle keeps the
+    /// child alive (Drop on the handle still SIGTERMs the child),
+    /// so the bridge thread can splice the returned fd ↔ libkrun's
+    /// inner half for the guest's lifetime.
+    ///
+    /// Returns `None` on the second call (parent_socket already
+    /// taken). After this call [`Self::socket_fd`] panics on access.
+    pub fn take_socket(&mut self) -> Option<OwnedFd> {
+        self.parent_socket.take()
     }
 }
 
@@ -381,6 +399,28 @@ mod tests {
             args.iter().any(|arg| arg == "-P"),
             "passt args should keep the pid file path: {args:?}"
         );
+    }
+
+    /// Plan 102 W6.A.5 — `take_socket` returns the parent fd
+    /// without consuming the handle, so the child stays alive
+    /// (its SIGTERM-on-Drop continues to fire). A second call
+    /// returns `None`.
+    #[test]
+    fn take_socket_keeps_handle_alive() {
+        let Some(_) = locate_passt() else {
+            eprintln!("test skipped: passt not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut handle = spawn(tmp.path()).expect("spawn passt");
+        let first = handle.take_socket();
+        assert!(first.is_some(), "first take_socket must yield the fd");
+        let second = handle.take_socket();
+        assert!(second.is_none(), "second take_socket must yield None");
+        // Drop should still kill the child cleanly — if take_socket
+        // had consumed the handle (like into_socket does), the child
+        // would already be unreachable here.
+        drop(handle);
     }
 
     /// Spawn passt and immediately drop the handle. Verifies the

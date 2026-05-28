@@ -37,6 +37,7 @@ use mvm_core::vm_backend::{
     VmCapabilities, VmExitStatus, VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
+use crate::host_gvproxy;
 use crate::vz_control;
 use mvm_base::ui;
 use mvm_vz as vz;
@@ -52,6 +53,27 @@ use std::time::{Duration, Instant};
 /// type still compiles, but `is_available()` always returns `Ok(false)`
 /// and `start` bails before spawning anything.
 pub struct VzBackend;
+
+/// Plan 102 W6.A.5 — tear-down guard for host-side gvproxy in the
+/// attached-VM path (`VzBackend::run_attached`). Ensures gvproxy is
+/// stopped even on panic / early return between spawn and the
+/// supervisor's exit. The detached `start()` path doesn't need this:
+/// `VzBackend::stop` reads the PID file and cleans up there.
+struct AttachedGvproxyGuard {
+    state_dir: PathBuf,
+}
+
+impl Drop for AttachedGvproxyGuard {
+    fn drop(&mut self) {
+        if let Err(e) = host_gvproxy::stop_by_pid_file(&self.state_dir) {
+            tracing::warn!(
+                state_dir = %self.state_dir.display(),
+                error = %e,
+                "AttachedGvproxyGuard: host_gvproxy stop failed on drop"
+            );
+        }
+    }
+}
 
 /// PID file name the supervisor writes inside `vm_state_dir`. Distinct
 /// from libkrun's `libkrun.pid` so the two backends can coexist under
@@ -134,8 +156,15 @@ impl VmBackend for VzBackend {
         mvm_build::builder_vm::admit_overlay_aware(rootfs_dir)?;
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
+        // Plan 102 W6.A.5 — spawn host-side gvproxy so the Swift
+        // supervisor has something to connect to. VzBackend is
+        // stateless; the child is detached (PID file under state
+        // dir lets `stop()` find it later).
+        let gvproxy_info = host_gvproxy::spawn_detached(&state_dir)
+            .map_err(|e| anyhow!("spawn host-side gvproxy for Vz VM '{}': {e}", config.name))?;
+
         // Vz config build.
-        let cfg = build_supervisor_config(config, kernel, &state_dir);
+        let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info);
         let pid_file = state_dir.join(PID_FILE_NAME);
         // Stale-PID-file cleanup from a previous crashed supervisor so
         // the wait-loop below detects the *new* one unambiguously.
@@ -275,6 +304,20 @@ impl VmBackend for VzBackend {
         }
 
         let _ = std::fs::remove_file(&pid_path);
+
+        // Plan 102 W6.A.5 — tear down the host-side gvproxy
+        // spawned by `start()`. Best-effort: the supervisor stop
+        // already succeeded; a stuck gvproxy is a leak but not a
+        // correctness issue (the listener socket is per-VM and the
+        // PID file would be unlinked by the next start).
+        if let Err(e) = host_gvproxy::stop_by_pid_file(&vm_state_dir(&id.0)) {
+            tracing::warn!(
+                vm = %id.0,
+                error = %e,
+                "host_gvproxy stop failed (non-fatal)"
+            );
+        }
+
         ui::success(&format!("Vz VM '{}' stopped.", id.0));
         Ok(())
     }
@@ -479,7 +522,20 @@ impl VzBackend {
         std::fs::create_dir_all(&state_dir)
             .map_err(|e| anyhow!("create per-VM state dir {}: {e}", state_dir.display()))?;
 
-        let cfg = build_supervisor_config(config, kernel, &state_dir);
+        // Plan 102 W6.A.5 — attached path also needs the
+        // host-side gvproxy. `run_attached` ties gvproxy's
+        // lifetime to its own caller stack: the wait-on-exit
+        // below blocks until the supervisor process ends, then
+        // we tear down gvproxy on the way out (best-effort
+        // tear-down inside the `Drop` of `AttachedGvproxyGuard`
+        // below so panics + early returns still clean up).
+        let gvproxy_info = host_gvproxy::spawn_detached(&state_dir)
+            .map_err(|e| anyhow!("spawn host-side gvproxy for Vz VM '{}': {e}", config.name))?;
+        let _gvproxy_guard = AttachedGvproxyGuard {
+            state_dir: state_dir.clone(),
+        };
+
+        let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info);
         let pid_file = state_dir.join(PID_FILE_NAME);
         let _ = std::fs::remove_file(&pid_file);
 
@@ -759,6 +815,29 @@ fn vm_state_dir(name: &str) -> PathBuf {
     vms_root().join(name)
 }
 
+/// Plan 102 W6.A.5 — per-VM Vz events-ingest socket path. The Swift
+/// bridge (once written) connects here, sends the
+/// `MVM_VZ_BRIDGE_V1\n` handshake, and writes NDJSON `FlowEventWire`
+/// entries. The Rust supervisor's signer task drains them into the
+/// per-tenant audit chain. Lives under `~/.mvm/audit/` so the path
+/// is co-located with the chain files and the subscriber socket
+/// (`gateway-<vm>.sock`).
+///
+/// Returned as a `String` to fit straight into
+/// `NetworkConfig::Gvproxy.events_ingest_socket_path` without an
+/// extra conversion.
+fn events_ingest_socket_path(vm_name: &str) -> String {
+    // `mvm_core::config::mvm_data_dir` returns `String`; convert to
+    // PathBuf to use `Path::join`, then back to String for the JSON
+    // field shape `NetworkConfig::Gvproxy.events_ingest_socket_path`
+    // declares.
+    PathBuf::from(mvm_core::config::mvm_data_dir())
+        .join("audit")
+        .join(format!("gateway-events-{vm_name}.sock"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Build the [`mvm_vz::SupervisorConfig`] the supervisor binary
 /// consumes on stdin. Maps the backend-agnostic `VmStartConfig` to
 /// the Vz-specific JSON shape.
@@ -771,6 +850,7 @@ fn build_supervisor_config(
     config: &VmStartConfig,
     kernel: &str,
     state_dir: &Path,
+    gvproxy: &host_gvproxy::HostGvproxyInfo,
 ) -> vz::SupervisorConfig {
     let state_dir_str = state_dir.to_string_lossy().into_owned();
     let vsock_dir = state_dir.join("vsock").to_string_lossy().into_owned();
@@ -806,10 +886,20 @@ fn build_supervisor_config(
             socket_dir: vsock_dir,
         },
         console_output_path: Some(console_log),
-        // gvproxy wiring lands in a follow-up slice (needs
-        // host-side gvproxy lifecycle the libkrun path already
-        // performs for `MVM_NETWORKING=gvproxy`).
-        network: None,
+        // Plan 102 W6.A.5 — gvproxy backend with claim-10 audit
+        // bridge ingest hookup. `socket_path` is where the Swift
+        // supervisor connects gvproxy; `events_ingest_socket_path`
+        // is where the (future) Swift bridge writes NDJSON
+        // FlowEventWire entries for the Rust supervisor's signer
+        // task to drain. The path is stable per VM under
+        // `~/.mvm/audit/gateway-events-<vm>.sock` so a future
+        // run_supervisor_with_bridge-style entry point on the Vz
+        // side can bind that listener and consume the stream.
+        network: Some(vz::NetworkConfig::Gvproxy {
+            socket_path: gvproxy.socket_path.to_string_lossy().into_owned(),
+            mac: host_gvproxy::derive_mac(&config.name),
+            events_ingest_socket_path: Some(events_ingest_socket_path(&config.name)),
+        }),
         balloon: Some(vz::BalloonConfig {
             enabled: true,
             floor_mib: 128,
@@ -1085,7 +1175,15 @@ mod tests {
         cfg.kernel_path = Some("/abs/vmlinux".into());
         cfg.rootfs_path = "/abs/rootfs.ext4".into();
         let state_dir = Path::new("/tmp/vz-smoke-state");
-        let built = build_supervisor_config(&cfg, "/abs/vmlinux", state_dir);
+        // Plan 102 W6.A.5 — build_supervisor_config now takes
+        // HostGvproxyInfo (the host-side gvproxy lifecycle's
+        // socket + PID, populated into NetworkConfig::Gvproxy).
+        // Test passes a stub — actual gvproxy isn't spawned here.
+        let gvproxy_info = host_gvproxy::HostGvproxyInfo {
+            socket_path: state_dir.join("gvproxy.sock"),
+            pid: 0,
+        };
+        let built = build_supervisor_config(&cfg, "/abs/vmlinux", state_dir, &gvproxy_info);
 
         assert_eq!(built.name, "smoke");
         assert_eq!(built.kernel.path, "/abs/vmlinux");
@@ -1099,6 +1197,32 @@ mod tests {
         // Console capture goes to a file under state_dir; never `None`
         // — capture-only is the workload contract (Plan 97 Security §9).
         assert!(built.console_output_path.is_some());
+        // Plan 102 W6.A.5 — network field is now populated with the
+        // gvproxy socket + MAC + events_ingest path.
+        match built.network {
+            Some(vz::NetworkConfig::Gvproxy {
+                socket_path,
+                mac,
+                events_ingest_socket_path,
+            }) => {
+                assert!(
+                    socket_path.ends_with("gvproxy.sock"),
+                    "socket path: {socket_path}"
+                );
+                assert!(
+                    mac.starts_with("02:")
+                        || mac.starts_with("06:")
+                        || mac.starts_with("0a:")
+                        || mac.starts_with("0e:"),
+                    "locally-administered MAC: {mac}"
+                );
+                assert!(
+                    events_ingest_socket_path.is_some(),
+                    "events_ingest_socket_path should be populated for W6.A.5 Vz bridge"
+                );
+            }
+            None => panic!("network should be Some(Gvproxy {{ .. }}) after W6.A.5"),
+        }
     }
 
     #[test]

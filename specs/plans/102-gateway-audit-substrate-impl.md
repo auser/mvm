@@ -178,25 +178,74 @@ to compile-verify, and the Rust `configure_with_gateway` split
 (needed for libkrun fd interception) is invasive enough to want
 its own focused PR.
 
-- [ ] `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/Network.swift`
-      — `makeGvproxyDevice` rewrite (socketpair + ingest connect
-      with `MVM_VZ_BRIDGE_V1\n` handshake + `Task.detached` splice
-      loops + NDJSON emit on first packet / shutdown)
-- [ ] Swift XCTest harness (5 tests: shuffles_datagrams,
-      emits_flow_opened, emits_flow_closed, handshake_sent_first,
-      reconnect)
-- [ ] `crates/mvm-backend/src/vz.rs:809-812` — populate `network`
-      with `NetworkConfig::Gvproxy { events_ingest_socket_path:
-      Some(...) }` sourced from `mvm_data_dir() + audit/`
-- [ ] `crates/mvm-backend/src/libkrun.rs` — populate `SupervisorConfig`
-      audit fields from `ExecutionPlan` (tenant_id) + `mvm_data_dir()`
-- [ ] Split `configure_with_gateway` into `configure_pre_net` +
-      bridge-socketpair-insertion in `crates/mvm-libkrun/src/lib.rs`
-- [ ] Add `pub fn run_supervisor_with_bridge<F>(cfg, factory)` in
-      mvm-libkrun, swap `mvm-libkrun-supervisor::main` from
-      `run_supervisor` to `run_supervisor_with_bridge`
+Status as of 2026-05-27 — substrate wire-up landed under one PR
+on `worktree-plan-102-w6a-5-wire-up` (8 commits). Producer
+activation + live smokes are tracked separately as Phase 3c.
+
+- [x] `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/Network.swift`
+      — `makeBridgedGvproxyDevice` added alongside the legacy
+      `makeGvproxyDevice` (selection keyed on
+      `eventsIngestSocketPath: nil` vs `Some`). Socketpair
+      interposition + ingest connect with `MVM_VZ_BRIDGE_V1\n`
+      handshake + `DispatchSourceRead` splice loops + NDJSON emit
+      on first packet / shutdown.
+- [x] Swift XCTest harness — 5 tests at
+      `crates/mvm-vz-supervisor/Tests/MvmVzSupervisorTests/BridgeWorkerTests.swift`
+      covering handshake constant pin, `flow_opened` wire shape,
+      `flow_closed` wire shape, end-to-end shuffle + emit, and
+      flow_closed on cancel. `swift test` green.
+- [x] `crates/mvm-backend/src/vz.rs` — populate `network` with
+      `NetworkConfig::Gvproxy { events_ingest_socket_path:
+      Some(...) }` sourced from `mvm_data_dir() + audit/`. New
+      module `host_gvproxy.rs` owns the parent-process gvproxy
+      lifecycle: detached spawn, PID-file sidecar, MAC derivation,
+      `VzBackend::stop` tear-down.
+- [ ] `crates/mvm-backend/src/libkrun.rs` — populate
+      `SupervisorConfig` audit fields from `ExecutionPlan`
+      (tenant_id) + `mvm_data_dir()`. **Deferred to Phase 3c
+      follow-up PR.** Touches `mvm_core::vm_backend::VmStartConfig`
+      + ~6 call sites in mvm-cli to thread the `AdmittedPlan`
+      through to backends. Until this lands the substrate code is
+      dormant — every spawn falls through to the legacy
+      `run_supervisor` path because `cfg.tenant_id` stays `None`.
+- [/] Split `configure_with_gateway` into `configure_pre_net` +
+      bridge-socketpair-insertion in `crates/mvm-libkrun/src/lib.rs`.
+      `configure_pre_net` already existed pre-PR; this PR adds
+      `configure_with_gateway_for_bridge` alongside the existing
+      `configure_with_gateway`. The two coexist — TSI / non-bridge
+      callers (Stage 0 builder VMs, smoke tests) keep the
+      original. Full unification of the two paths is a follow-up
+      if desired but not load-bearing.
+- [x] `pub fn run_supervisor_with_bridge<F>(cfg, factory)` in
+      `mvm-libkrun`, with `mvm-libkrun-supervisor::main` branching
+      on `cfg.tenant_id` (`Some` → bridge factory, `None` →
+      legacy `run_supervisor`).
 - [ ] Live smoke on all three backends (Linux+passt,
-      macOS+libkrun+gvproxy, macOS+Vz+gvproxy)
+      macOS+libkrun+gvproxy, macOS+Vz+gvproxy). **Blocked on
+      Phase 3c** — until the producer side activates `tenant_id`,
+      no spawn takes the bridge path, so live smokes wouldn't
+      exercise the substrate. Scheduled with the Phase 3c PR.
+
+#### Phase 3c — producer activation (next PR in this work stream)
+
+Threads the `AdmittedPlan` from `mvm-cli`'s `mvmctl up` admission
+flow down to backend `start()` so the audit-substrate fields
+actually populate at runtime:
+
+- [ ] Widen `mvm_core::vm_backend::VmStartConfig` with three
+      `Option<String>` fields: `tenant_id`, `plan_json`,
+      `bundle_json`. All `Option<String>` so mvm-core gains no
+      typed deps.
+- [ ] Populate the new fields from `AdmittedPlan` at each
+      `VmStartConfig` construction site in `mvm-cli` (~6 sites).
+- [ ] `mvm-backend/src/libkrun.rs::start()` reads them and
+      populates the five `SupervisorConfig` audit fields +
+      `plan` + `bundle` from `mvm_data_dir()` + the
+      pre-serialized JSON.
+- [ ] Same pattern for the Vz backend (vz.rs already populates
+      `events_ingest_socket_path`; the Vz-side `tenant_id`
+      pumping is the parallel work).
+- [ ] Live smoke per backend.
 
 ### W6.B follow-ups (real flow extraction, next PR in this work stream)
 
