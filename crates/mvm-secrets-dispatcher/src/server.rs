@@ -37,13 +37,13 @@ pub async fn serve(
     info!(
         workload_id = %workload_id,
         max_frame_bytes,
-        "mvm-broker accept loop started"
+        "mvm-secrets-dispatcher accept loop started"
     );
     loop {
         let (stream, _addr) = listener
             .accept()
             .await
-            .context("mvm-broker UDS accept failed")?;
+            .context("mvm-secrets-dispatcher UDS accept failed")?;
         let registry = registry.clone();
         let workload_id = workload_id.clone();
         let tenant_id = tenant_id.clone();
@@ -51,7 +51,7 @@ pub async fn serve(
             if let Err(e) =
                 handle_connection(stream, registry, workload_id, tenant_id, max_frame_bytes).await
             {
-                warn!(error = %e, "mvm-broker connection terminated with error");
+                warn!(error = %e, "mvm-secrets-dispatcher connection terminated with error");
             }
         });
     }
@@ -83,7 +83,7 @@ async fn handle_connection(
         service = %call.service,
         verb = %call.verb,
         correlation_id = %call.correlation_id,
-        "mvm-broker received call"
+        "mvm-secrets-dispatcher received call"
     );
 
     // W1a stub ctx: profile = Dev (default), composition counters = 0.
@@ -117,7 +117,7 @@ async fn handle_connection(
     stream
         .shutdown()
         .await
-        .context("mvm-broker UDS shutdown failed")?;
+        .context("mvm-secrets-dispatcher UDS shutdown failed")?;
     Ok(())
 }
 
@@ -132,34 +132,37 @@ pub async fn read_frame<T: serde::de::DeserializeOwned>(
     stream
         .read_exact(&mut len_buf)
         .await
-        .context("mvm-broker length-prefix read failed")?;
+        .context("mvm-secrets-dispatcher length-prefix read failed")?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > max_frame_bytes {
-        bail!("mvm-broker frame too large: {} > {}", len, max_frame_bytes);
+        bail!(
+            "mvm-secrets-dispatcher frame too large: {} > {}",
+            len,
+            max_frame_bytes
+        );
     }
     let mut body = vec![0u8; len];
     stream
         .read_exact(&mut body)
         .await
-        .context("mvm-broker body read failed")?;
-    serde_json::from_slice(&body).context("mvm-broker JSON parse failed")
+        .context("mvm-secrets-dispatcher body read failed")?;
+    serde_json::from_slice(&body).context("mvm-secrets-dispatcher JSON parse failed")
 }
 
 /// Write a length-prefixed JSON frame.
 pub async fn write_frame<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
-    let body = serde_json::to_vec(value).context("mvm-broker JSON encode failed")?;
-    let len: u32 = body
-        .len()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("mvm-broker frame body too large for u32 prefix"))?;
+    let body = serde_json::to_vec(value).context("mvm-secrets-dispatcher JSON encode failed")?;
+    let len: u32 = body.len().try_into().map_err(|_| {
+        anyhow::anyhow!("mvm-secrets-dispatcher frame body too large for u32 prefix")
+    })?;
     stream
         .write_all(&len.to_be_bytes())
         .await
-        .context("mvm-broker length-prefix write failed")?;
+        .context("mvm-secrets-dispatcher length-prefix write failed")?;
     stream
         .write_all(&body)
         .await
-        .context("mvm-broker body write failed")?;
+        .context("mvm-secrets-dispatcher body write failed")?;
     Ok(())
 }
 
@@ -254,11 +257,7 @@ mod tests {
     async fn rejects_frames_above_the_cap() {
         let dir = tempdir().unwrap();
         let path = uds_path(&dir);
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("failed to bind broker test listener: {err}"),
-        };
+        let listener = UnixListener::bind(&path).unwrap();
         let registry = Arc::new(Registry::new());
 
         let server_task = tokio::spawn({
