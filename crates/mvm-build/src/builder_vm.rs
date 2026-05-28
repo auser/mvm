@@ -322,6 +322,21 @@ pub enum BuilderVmError {
     #[error("libkrun not available: {0}")]
     LibkrunUnavailable(String),
 
+    /// Plan 100 W1 / Plan 105 — a host VMM the operator explicitly
+    /// asked for isn't available on this platform. Carries the
+    /// requested label (e.g. `"linux-builder-vm"`, `"vz"`) and an
+    /// actionable hint pointing at the kernel-module parameter,
+    /// platform-version gap, or install step the operator needs.
+    #[error("{requested} is not available on this host: {reason}")]
+    VmmUnavailable {
+        /// Short tag identifying the VMM the operator requested
+        /// (typically the env-var value or `--builder` flag value).
+        requested: String,
+        /// Operator-actionable explanation including the fix
+        /// command or kernel parameter to enable.
+        reason: String,
+    },
+
     /// OCI image pull failed (network, registry auth, digest
     /// mismatch). Wraps the underlying error.
     #[error("OCI image pull failed: {0}")]
