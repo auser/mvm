@@ -47,6 +47,12 @@ pub mod audit_signer_proxy;
 // the spawn call site.
 pub mod binary_integrity;
 pub mod broker_proxy;
+// Plan 104 W1b.2b.3 — supervisor-side config envelope signer
+// (§H-L3.6 / G1). Wraps SubprocessConfig bytes before stdin write.
+// ProcessSpawner integration + subprocess parse_signed adoption +
+// no-backcompat removal of unsigned `config::parse` paths land in
+// W1b.2b.3.5 (or W1b.2b.5 — TBD).
+pub mod config_signer;
 pub mod frame;
 pub mod host_signer_proxy;
 pub mod secrets_proxy;
