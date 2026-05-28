@@ -8,6 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[package.metadata.mvm.architecture]
+substrate_server_category = "per-workload broker subprocess substrate"
+
 # The broker is one of the four per-VM subprocesses spawned by the
 # supervisor (Plan 104 §"Host-side: four-subprocess architecture"; ADR-061
 # §"Decision"). It runs at uid 903 with seccomp + setpriv + per-workload
