@@ -25,6 +25,8 @@
 //! a UDS path. W1b.2b.2 wraps the spawn call site with cosign verify.
 //! W1b.2c wraps further with cgroup setup + seccomp install.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -36,10 +38,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
-
 use crate::services::binary_integrity::{IntegrityChecker, IntegrityError};
+
 /// Errors a spawn / lifecycle operation can return.
 #[derive(Debug, Error)]
 pub enum SpawnError {
