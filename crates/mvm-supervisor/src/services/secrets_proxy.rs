@@ -22,6 +22,8 @@ use super::{
     frame::{DEFAULT_MAX_FRAME_BYTES, connect, read_frame, write_frame},
 };
 
+// allow(secret-debug): transport metadata only; no secret payloads or
+// credentials are stored on the proxy struct itself.
 #[derive(Debug, Clone)]
 pub struct SecretsProxy {
     pub uds_path: PathBuf,
