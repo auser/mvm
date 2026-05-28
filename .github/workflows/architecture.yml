@@ -74,6 +74,11 @@ jobs:
   #      addon proxy over vsock. This is per-VM developer substrate;
   #      distributed service discovery, tenant policy, and
   #      cryptographic routing remain mvmd-owned.
+  #   8. Per-workload broker subprocess substrate
+  #      (`crates/mvm-broker/src/bin/mvm-broker.rs`). This listener is
+  #      a VM-local capability endpoint behind the supervisor's UDS
+  #      routing, not a shared orchestration plane server. It exists so
+  #      host services can be split across least-privilege subprocesses.
   #
   # The in-guest vsock agent in `mvm-guest` is also excluded — it
   # runs *inside* the microVM, not on the host.
@@ -159,6 +164,7 @@ jobs:
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
               --glob '!crates/mvm-backend/src/mock_guest_agent.rs' \
               --glob '!crates/mvm-addon-vsock-bridge/**' \
+              --glob '!crates/mvm-broker/src/bin/mvm-broker.rs' \
               -e "$PATTERNS" \
               crates/ src/ \
               || true)
