@@ -2162,13 +2162,11 @@ See [Plan 100](plans/100-symmetric-builder-vm-rollout.md). Lifts claim 1 ("no ho
 Plan 100 W1 — implementation tracker (Plan 105). First slice: env-gated `MVM_LINUX_BUILDER_VM=1` dispatch + `has_nested_kvm()` predicate + `mvmctl doctor` `nested-kvm` line. Opt-in only; default unchanged. The default flip + direct-Firecracker retirement is W6.
 
 - [ ] **W0** — feasibility prototype (off-branch, throw-away): measure cold-start latency on a Linux + nested-KVM host. Numbers feed into the W1 PR body.
-- [ ] **W1** — `MVM_LINUX_BUILDER_VM` env-gate in `crates/mvm-build/src/builder_backend_select.rs` + `Platform::has_nested_kvm()` predicate + 5 hermetic unit tests. ~80 lines including tests.
+- [x] **W1** — `MVM_LINUX_BUILDER_VM` env-gate in `crates/mvm-build/src/builder_backend_select.rs` + `Platform::has_nested_kvm()` predicate + hermetic unit tests. Shipped in PR #479.
 - [x] **W3-doctor** — `mvmctl doctor` reports nested-KVM availability + extends the Plan 98 `builder backend` line with the `MVM_LINUX_BUILDER_VM` source. Bundled with W1 prep (PR #479).
-- [x] **W2** — Linux Nix image build validation. Paths-gated `builder-vm-image-linux` lane in `ci.yml` builds the builder-vm flake on Ubuntu and asserts the four output artifacts land on disk. Bundled with W1 prep PR (#479 follow-up).
-- [ ] **W4** (deferred) — Nested-KVM CI lane in `ci.yml`. Pairs with W2.
-- [ ] **W5** (deferred) — Persistent-builder variant on Linux (mirrors Plan 98 Slice 2A's `VzPersistentBuilderVm` shape with libkrun-on-Linux backing).
-- [ ] **W6** (deferred) — Retire direct-Firecracker code path. Gated on W4 CI proof + Plan 101 Leg 1 (volume encryption) so the trust uplift lands at flip-time.
-- [ ] **W7/W8** (deferred) — ADR-001 update + ADR-002 Claim 1 rewording. Prose follow-ups.
+- [x] **W2** — Linux Nix image build validation. Paths-gated `builder-vm-image-linux` lane in `ci.yml` builds the builder-vm flake on Ubuntu and asserts the four output artifacts land on disk. Bundled with W1 prep PR (#479).
+- [ ] **W6 dispatch flip** — brainstorm in [Plan 106](plans/106-plan-100-w6-dispatch-flip.md) (decision locked 2026-05-27 on Approach A: shared libkrun host VM, Firecracker per workload). Executable phases A1–A6 tracked in [Plan 107](plans/107-plan-100-w6-approach-a.md).
+- [ ] **W4 / W5 / W7 / W8** — gated on Plan 107 A4 landing.
 
 ### W2 — Volume confidentiality (claim 10 leg 1)  🟡 proposed
 
