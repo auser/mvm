@@ -1,7 +1,9 @@
-# Plan 105 — Guest control-layer dep-reduction + encryption design (Zig + lean-Rust v2 evaluation)
+# Plan 109 — Guest control-layer dep-reduction + encryption design (Zig + lean-Rust v2 evaluation)
+
+> **Renumbering note (2026-05-28):** originally drafted as Plan 105 (commits `eb345fbc` + `24fe3a3d`); slot 105 was claimed concurrently on `main` by `105-plan-100-w1-linux-builder-vm.md`. This plan migrates to slot 109 — slots 105/106/107/108 are all taken on `main`. Same content, same workstreams, same recommendation. Per the spec-numbering-chaos memory, future readers should treat **Plan 109** as canonical and ignore any stale "Plan 105" references in prior commit messages on this branch.
 
 Status: proposed (exploration, not commitment)
-Created: 2026-05-27
+Created: 2026-05-27 (as Plan 105); renumbered 2026-05-28 (as Plan 109)
 Owner: tbd
 Related: SPRINT.md Sprint 57, Sprint 42 Track E, ADR-002, ADR-053, ADR-055, ADR-058, ADR-059, Plan 25, Plan 64, Plan 102, **Plan 104** (host services broker — adjacent vsock surface; see §"Process lineage" and W3)
 
