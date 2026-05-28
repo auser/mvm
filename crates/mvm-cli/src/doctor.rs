@@ -584,7 +584,7 @@ fn nested_kvm_check(plat: Platform) -> Check {
         };
     }
     let has_nested = plat.has_nested_kvm();
-    let env_requested = mvm_build::builder_backend_select::linux_builder_vm_requested();
+    let env_requested = linux_builder_vm_requested_for_doctor();
     match (has_nested, env_requested) {
         (true, true) => Check {
             name: "nested-kvm",
@@ -620,6 +620,16 @@ fn nested_kvm_check(plat: Platform) -> Check {
                 .to_string(),
         },
     }
+}
+
+#[cfg(feature = "builder-vm")]
+fn linux_builder_vm_requested_for_doctor() -> bool {
+    mvm_build::builder_backend_select::linux_builder_vm_requested()
+}
+
+#[cfg(not(feature = "builder-vm"))]
+fn linux_builder_vm_requested_for_doctor() -> bool {
+    false
 }
 
 fn kvm_check(plat: Platform, in_vm: bool) -> Check {
