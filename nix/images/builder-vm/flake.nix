@@ -52,12 +52,14 @@
   #   persistent `/nix` store) + util-linux (`mount`, `umount`,
   #   `losetup`).
   # - iproute2 (used by `udhcpc` and friends; small).
-  # - iptables — Plan 73 Followup B.2.y / ADR-047 defense-in-
-  #   depth: `mvm-builder-init` installs an OUTPUT-chain
-  #   default-deny + uid-owner ACCEPT for `mvm-egress-proxy`
-  #   (uid 1801), so a build step that ignores `HTTP_PROXY`
-  #   cannot reach upstream. See
-  #   `crates/mvm-builder-init/src/network.rs`.
+  # - No iptables / proxy stack on the default flake-build path.
+  #   The builder image is the hot path for contributor
+  #   bootstraps, and ordinary `nix build` jobs do not use the
+  #   app-deps install pipeline. Keeping the egress-lockdown
+  #   userspace out of the default image trims the closure that
+  #   Stage 0 has to build before `dev up` can make progress.
+  #   Install-pipeline-specific tooling should live in a distinct
+  #   profile once that path has its own image variant.
   # - **No** `procps`-interactive / `less` per the plan's
   #   slimming directive.
   # - `mvm-builder-init` mounted at `/sbin/mvm-builder-init` via
@@ -120,28 +122,6 @@
       # Per Plan 72 §W2 — narrower than the dev-shell image.
       # See module-level docs above for the rationale on each.
       #
-      # Plan 73 Followup B.2 adds the application-dependency
-      # install pipeline (ADR-047): `uv` / `pnpm` drive the
-      # installer, `cyclonedx-py` / `pnpm sbom` emit SBOMs, and
-      # `pip-audit` / `pnpm audit` run the CVE scan. Each is
-      # currently a soft gate — `mvm-builder-init::install`
-      # emits a CycloneDX-1.5 empty stub when the SBOM / CVE
-      # tool isn't on PATH and logs a warning. B.2.x will
-      # hard-gate the SBOM + CVE side once the egress allowlist
-      # lands.
-      #
-      # Plan 73 Followup B.2.x closed the egress side: the
-      # builder VM now runs `mvm-egress-proxy` (built via
-      # `mvmEgressProxyFor system`, installed at
-      # `/sbin/mvm-egress-proxy` via `extraFiles` below).
-      # `mvm-builder-init::install::run_install` spawns it
-      # before the installer + injects `HTTPS_PROXY` /
-      # `HTTP_PROXY` on `uv` / `pnpm`'s env. The proxy refuses
-      # anything outside ADR-047's four hostnames:
-      # `pypi.org`, `files.pythonhosted.org`,
-      # `registry.npmjs.org`, `objects.githubusercontent.com`.
-      # Complementary iptables drop-rule defense-in-depth is
-      # B.2.y (not in this slice).
       builderPackages = pkgs: with pkgs; [
         bashInteractive
         coreutils
@@ -168,26 +148,18 @@
         curl
         jq
         iproute2
-        # iptables — installed at boot by mvm-builder-init's
-        # network::install_egress_lockdown (Plan 73 Followup
-        # B.2.y / ADR-047). FATAL if absent.
-        iptables
         e2fsprogs
         util-linux
         (pinnedCryptsetupFor pkgs) # provides pinned veritysetup
-        # Plan 73 Followup B.2 — app-deps install pipeline.
-        uv
-        pnpm
         # NOTE (Plan 72 W5.D unblock): `python3Packages.cyclonedx-bom`
         # and `python3Packages.pip-audit` are referenced here but not
         # present in nixpkgs-25.11 under those exact attribute names;
         # the Stage 0 nix eval bails with "attribute 'cyclonedx-bom'
         # missing". Commented out until the right attribute name (or
         # a newer nixpkgs pin that has them) lands. Plan 73's
-        # deps-volume audit pipeline still works at runtime via the
-        # `mvm-egress-proxy` allowlist; the SBOM/CVE tools were a
-        # nice-to-have inside the builder VM, not a load-bearing
-        # blocker for `mvmctl dev up`.
+        # deps-volume audit pipeline remains a follow-up for the
+        # default flake-build image; the SBOM/CVE tools were never
+        # load-bearing for `mvmctl dev up`.
         # python3Packages.cyclonedx-bom
         # python3Packages.pip-audit
       ];
@@ -221,32 +193,6 @@
           };
         };
 
-      # Build `mvm-egress-proxy` (Plan 73 Followup B.2.x) for the
-      # target system. Same `rustPlatform.buildRustPackage` shape
-      # as `mvm-builder-init` — the workspace's `Cargo.lock`
-      # drives the closure so we don't fork dep versions across
-      # the two builder-VM binaries. Tests run in CI's
-      # `cargo test --workspace` lane; `doCheck = false` here for
-      # the same reason.
-      mvmEgressProxyFor = system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "mvm-egress-proxy";
-          version = "0.14.0";
-          src = workspace;
-          cargoLock = {
-            lockFile = workspace + "/Cargo.lock";
-          };
-          buildAndTestSubdir = "crates/mvm-egress-proxy";
-          doCheck = false;
-          meta = {
-            description = "Builder-VM egress allowlist proxy (Plan 73 Followup B.2.x, ADR-047)";
-            mainProgram = "mvm-egress-proxy";
-          };
-        };
-
       # Canonical kernel cmdline for the builder VM. `LibkrunBuilderVm`
       # (Plan 72 W4) reads this from the cmdline.txt output and
       # passes it to `mvm_libkrun::KrunContext.kernel_cmdline`.
@@ -259,18 +205,22 @@
       # - `init=/sbin/mvm-builder-init` — Plan 72 W3 binary as PID 1.
       builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
 
-      # Rootfs builder. The custom kernel under `./kernel` is built
-      # `CONFIG_MODULES=n` (everything in-tree is `=y`), so the
-      # rootfs ships no `/lib/modules/<kver>/` tree and mkGuest's
-      # kernel arg goes unused — same rootfs whether we're producing
-      # the full builder-VM image or the Stage 0 seed.
-      # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
+      # Rootfs builder. The default builder-VM path now targets the
+      # stock nixpkgs kernel so contributor bootstraps get
+      # substituter hits instead of compiling a custom kernel on the
+      # hot path. When a kernel is supplied, mkGuest copies the
+      # module closure for vsock + virtiofs + fuse into the rootfs;
+      # `mvm-builder-init` modprobes what it needs at boot.
+      #
+      # The slim custom kernel from Plan 92 remains available as an
+      # explicit alternate image output for comparison and follow-up
+      # hardening work.
       mkBuilderVmRootfs =
         system:
+        { kernel ? null }:
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
-          egressProxy = mvmEgressProxyFor system;
         in
         (libFor { inherit system; }).mkGuest {
           name = "mvm-builder-vm";
@@ -290,41 +240,29 @@
           # need to declare one to satisfy the type contract.
           entrypoint.shell = "/bin/sh";
           packages = builderPackages pkgs;
+          inherit kernel;
           extraFiles = {
             "/sbin/mvm-builder-init" =
               "${builderInit}/bin/mvm-builder-init";
-            # Plan 73 Followup B.2.x — egress allowlist proxy.
-            # `mvm-builder-init::install::run_install` spawns
-            # this from PATH (kernel default PATH includes
-            # `/sbin`) before invoking `uv` / `pnpm`. The
-            # binary embeds the ADR-047 four-hostname list at
-            # compile time; no env-var override path on the
-            # production build.
-            "/sbin/mvm-egress-proxy" =
-              "${egressProxy}/bin/mvm-egress-proxy";
           };
         };
 
-      mkBuilderVmImage = system:
+      mkBuilderVmImage =
+        system:
+        { imageName
+        , kernelPkg
+        , rootfs
+        }:
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
-          egressProxy = mvmEgressProxyFor system;
-          # Slim custom kernel — see `./kernel/default.nix`.
-          # `pkgs.linuxManualConfig` over `make tinyconfig` + a
-          # narrow `enables` list. `CONFIG_MODULES=n` so the kernel
-          # has only what `mvm-builder-init` actually uses built-in
-          # — no driver modules tree to ship.
-          # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
-          kernelPkg = import ./kernel { inherit pkgs; };
-          rootfs = mkBuilderVmRootfs system;
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64 then "Image" else "bzImage";
         in
-        pkgs.runCommand "mvm-builder-vm-image-${system}"
+        pkgs.runCommand imageName
           {
             passthru = {
-              inherit rootfs builderInit egressProxy;
+              inherit rootfs builderInit;
               kernel = kernelPkg;
               cmdline = builderCmdline;
             };
@@ -385,13 +323,35 @@
             MANIFEST
           '';
 
+      mkBuilderVmDefaultImage = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          kernelPkg = pkgs.linuxPackages.kernel;
+          rootfs = mkBuilderVmRootfs system { kernel = kernelPkg; };
+        in
+        mkBuilderVmImage system {
+          imageName = "mvm-builder-vm-image-${system}";
+          inherit kernelPkg rootfs;
+        };
+
+      mkBuilderVmSlimKernelImage = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          kernelPkg = import ./kernel { inherit pkgs; };
+          rootfs = mkBuilderVmRootfs system { };
+        in
+        mkBuilderVmImage system {
+          imageName = "mvm-builder-vm-slim-kernel-image-${system}";
+          inherit kernelPkg rootfs;
+        };
+
       mkBuilderVmStage0Rootfs = system:
         let
           pkgs = import nixpkgs { inherit system; };
           # Stage 0 boots under a different kernel than what nixpkgs
           # ships, so omit the kernel + module tree to avoid
           # misleading modprobe with a foreign kver.
-          rootfs = mkBuilderVmRootfs system;
+          rootfs = mkBuilderVmRootfs system { };
         in
         pkgs.runCommand "mvm-builder-vm-stage0-rootfs-${system}" { } ''
           mkdir -p $out
@@ -439,7 +399,8 @@
     in
     {
       packages = forAllSystems (system: {
-        default = mkBuilderVmImage system;
+        default = mkBuilderVmDefaultImage system;
+        slim-kernel = mkBuilderVmSlimKernelImage system;
         stage0-rootfs = mkBuilderVmStage0Rootfs system;
         kernel-configfile = mkKernelConfigfile system;
       });

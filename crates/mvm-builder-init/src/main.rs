@@ -449,6 +449,7 @@ mod linux {
     /// exclusive — install jobs don't carry a cmd.sh, flake jobs
     /// don't carry an install_spec.json.
     const INSTALL_SPEC_FILENAME: &str = "install_spec.json";
+    const EGRESS_PROXY_PATH: &str = "/sbin/mvm-egress-proxy";
 
     pub fn run() -> ExitCode {
         eprintln!("mvm-builder-init: pid 1 starting");
@@ -558,52 +559,6 @@ mod linux {
         let _ = track_b.join();
         let _ = track_c.join();
 
-        // In-guest egress lockdown — Plan 73 Followup B.2.y /
-        // ADR-047 defense-in-depth. Installs iptables OUTPUT
-        // default-deny + proxy-uid-only ACCEPT so a build step
-        // that ignores HTTP_PROXY env vars cannot bypass
-        // `mvm-egress-proxy`. FATAL on failure — without these
-        // rules the builder VM's egress allowlist is unenforced
-        // and ADR-002's Claim 9 transitive trust onto the
-        // builder VM has no defense layer. (Note: this is
-        // installed even when `setup_network()` failed, because
-        // the rules don't depend on a working IP address —
-        // offline builds still need the policy in place in case
-        // a substituter URL is reached via cache rather than
-        // network.)
-        if let Err(e) = crate::network::install_egress_lockdown(
-            &crate::network::SystemIptables,
-            crate::network::PROXY_UID,
-        ) {
-            // Plan 86: in the Stage 0 / ur-seed bootstrap context the
-            // libkrunfw-bundled kernel ships without netfilter — both
-            // `iptables-nft` and `iptables-legacy` bail with "table
-            // does not exist" or "protocol not supported" at the first
-            // rule install. The egress lockdown is defense-in-depth
-            // for the Plan 73 deps-install pipeline (untrusted code
-            // running in the steady-state builder VM). Stage 0 only
-            // runs flake builds — `nix build` against a pinned
-            // `path:/work#…` reference — where Nix's own fixed-output
-            // derivation hashes carry the integrity guarantee. We
-            // log + continue rather than fail closed.
-            //
-            // The steady-state builder VM image (built by Stage 0 via
-            // the in-repo TSI-patched kernel under
-            // `nix/images/builder-vm/kernel/`) carries netfilter, so
-            // this fallback only triggers in Stage 0 — the audit
-            // signal still distinguishes the two contexts.
-            if egress_error_indicates_no_netfilter(&e) {
-                eprintln!(
-                    "mvm-builder-init: egress lockdown SKIPPED (kernel lacks netfilter — \
-                     Stage 0 / libkrunfw-bundled-kernel context): {e}"
-                );
-            } else {
-                eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
-                write_result(2, &format!("egress lockdown failed: {e}"));
-                return power_off();
-            }
-        }
-
         // Plan 89 W3 part 3 dispatch: if the host staged a
         // `dispatch.sock.marker` in /job, this VM is persistent
         // (host-side `LibkrunPersistentBuilderVm`, W3 part 4).
@@ -643,6 +598,11 @@ mod linux {
         // existing cmd.sh flake-build flow.
         let install_spec_path = format!("{JOB_DIR}/{INSTALL_SPEC_FILENAME}");
         if Path::new(&install_spec_path).exists() {
+            if let Err(e) = maybe_install_egress_lockdown() {
+                eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
+                write_result(2, &format!("egress lockdown failed: {e}"));
+                return power_off();
+            }
             eprintln!("mvm-builder-init: install spec detected, routing through install pipeline");
             stamp(&timings, |t| {
                 t.job_start_ms = Some(BootTimings::ms_since(anchor))
@@ -1110,28 +1070,6 @@ mod linux {
         job_dir_relpath: &str,
         cold_boot_timings: Option<BootTimings>,
     ) -> String {
-        // Plan 89 W3 part 12 — flush + re-install the egress
-        // lockdown before every dispatch. A previous build that
-        // mutated iptables (whether via a CAP_NET_ADMIN leak or
-        // because we haven't shipped the cap drop yet) loses its
-        // changes here. Fail closed: if iptables is broken we
-        // refuse the dispatch — that's safer than running a
-        // build against a chain whose state we no longer trust.
-        if let Err(e) = crate::network::reapply_egress_lockdown(
-            &crate::network::SystemIptables,
-            crate::network::PROXY_UID,
-        ) {
-            eprintln!("mvm-builder-init: dispatch loop: iptables baseline re-apply failed: {e}");
-            let response = crate::dispatch_response::DispatchResponse {
-                job_id,
-                exit_code: 126,
-                stderr_tail: format!("iptables baseline re-apply failed: {e}"),
-                boot_timings: cold_boot_timings,
-                build_ms: 0,
-            };
-            return response.to_json();
-        }
-
         let (exit_code, stderr_tail, build_ms) = match job {
             crate::builder_request::BuilderJob::Flake { .. } => {
                 let cmd_path = format!("{JOB_DIR}/{job_dir_relpath}/cmd.sh");
@@ -1205,6 +1143,19 @@ mod linux {
                 }
             }
             crate::builder_request::BuilderJob::Install { spec_path } => {
+                if let Err(e) = maybe_reapply_egress_lockdown() {
+                    eprintln!(
+                        "mvm-builder-init: dispatch loop: iptables baseline re-apply failed: {e}"
+                    );
+                    let response = crate::dispatch_response::DispatchResponse {
+                        job_id,
+                        exit_code: 126,
+                        stderr_tail: format!("iptables baseline re-apply failed: {e}"),
+                        boot_timings: cold_boot_timings,
+                        build_ms: 0,
+                    };
+                    return response.to_json();
+                }
                 // Plan 89 W3 part 8: route Install dispatches
                 // through the existing single-shot pipeline with
                 // per-dispatch paths. The host (PersistentBuilderVm)
@@ -1462,6 +1413,41 @@ mod linux {
             || err.contains("Protocol not supported")
     }
 
+    fn install_tools_present() -> bool {
+        Path::new(EGRESS_PROXY_PATH).exists()
+    }
+
+    fn maybe_install_egress_lockdown() -> Result<(), String> {
+        if !install_tools_present() {
+            return Ok(());
+        }
+        crate::network::install_egress_lockdown(
+            &crate::network::SystemIptables,
+            crate::network::PROXY_UID,
+        )
+        .or_else(|e| {
+            if egress_error_indicates_no_netfilter(&e) {
+                eprintln!(
+                    "mvm-builder-init: egress lockdown SKIPPED (kernel lacks netfilter — \
+                     Stage 0 / libkrunfw-bundled-kernel context): {e}"
+                );
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+    }
+
+    fn maybe_reapply_egress_lockdown() -> Result<(), String> {
+        if !install_tools_present() {
+            return Ok(());
+        }
+        crate::network::reapply_egress_lockdown(
+            &crate::network::SystemIptables,
+            crate::network::PROXY_UID,
+        )
+    }
+
     fn mount_pseudofs() -> Result<(), String> {
         // Standard init filesystems. libkrun's kernel mounts
         // devtmpfs (and sometimes /proc /sys) before handing off to
@@ -1520,11 +1506,14 @@ mod linux {
             t.nix_device_ready_ms = Some(BootTimings::ms_since(anchor))
         });
 
-        // Plan 92: the slim custom kernel under
-        // `nix/images/builder-vm/kernel/` builds overlay, vsock,
-        // fuse, virtiofs, and the iptables tables as `=y`. No
-        // modprobe needed before `mount -t overlay` or `socket(AF_VSOCK)`
-        // — the kernel comes up with the subsystems registered.
+        // The default builder image now uses the stock nixpkgs
+        // kernel, so `overlay` and the virtio-vsock transport may
+        // be modules. Best-effort modprobe them before we try the
+        // overlay mount or any later AF_VSOCK use. On the slim
+        // custom-kernel variant these are built in, and modprobe is
+        // a harmless no-op.
+        run_modprobe("overlay");
+        run_modprobe("vmw_vsock_virtio_transport");
 
         match mount_nix_overlay() {
             Ok(()) => {}

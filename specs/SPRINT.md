@@ -1993,6 +1993,8 @@ PRs landed on `main` to walk Stage 0 → persistent builder VM → inner `nix bu
 - ✅ #421 — ext4 geometry recovery + udhcpc path + dev-image flake lock pin.
 - ✅ #422 — builder-VM fingerprint expansion to cover `mvm-builder-init` / `mvm-egress-proxy` / `Cargo.lock` (`155b561f`).
 - ✅ #423 — `mkGuest` skips `addon-dns` bake for the builder VM (Stage 0 OOM mitigation).
+- ✅ Default builder-VM image slimming follow-up — the source-checkout flake-build path no longer bakes the install-pipeline egress-lockdown stack (`iptables` + `mvm-egress-proxy`) into `nix/images/builder-vm`. `mvm-builder-init` now applies the lockdown only when an install-spec job is present, so ordinary `nix build` bootstraps stop paying for that closure on the hot path.
+- ✅ Builder-kernel split follow-up — `nix/images/builder-vm#packages.<system>.default` now uses the stock nixpkgs kernel so contributor bootstraps can hit substitutes instead of compiling the custom kernel on the hot path, while `packages.<system>.slim-kernel` preserves the old `linuxManualConfig` image for comparison and future hardening work. `mvm-builder-init` now best-effort modprobes `overlay` and `vmw_vsock_virtio_transport` before the `/nix` overlay mount so the stock-kernel path can boot the same rootfs.
 - 🟡 #424 (`worktree-stage0-error-handler`) — `mknod /dev/null` insurance + `/dev` probe at boot + error-handler hardening so the next Stage 0 nix-build failure surfaces its real stderr instead of `can't create /dev/null: nonexistent directory`. All checks green; ready to merge.
 - 🟡 `worktree-dev-fd-symlinks` (PR pending) — adds `/dev/fd → /proc/self/fd` (plus `std{in,out,err}`) at builder-VM boot and in `mkGuest /init`, surfaces `<job_dir>/nix-stderr.log` path + 4 KiB tail on `finalize_flake_job` failure, and prints job dir at dispatch. Closes the `mvm-guest-agent-0.14.0.drv` inner-build failure observed at the very last step of `mvmctl dev up` — every Rust derivation in the dev image's closure was tripping nixpkgs's `cargoInstallHook` line 27 process substitution on a missing `/dev/fd`. Full plan + diagnosis log in [`backlog/42-tracking.md`](backlog/42-tracking.md).
 
@@ -2021,6 +2023,7 @@ Apple's `Virtualization.framework` has supported Linux guests since
 macOS 11 and exposes virtio-blk / virtio-net / virtio-vsock /
 virtio-console / virtio-rng / virtio-fs natively — exactly the device
 classes our guests already drive. Today, workload microVMs on macOS
+
 nest Firecracker inside a libkrun-hosted Linux VM because Firecracker
 needs `/dev/kvm`. Vz can host Linux guests directly, so a Vz backend
 collapses the nesting on macOS, adds the macOS 11–25 / Intel coverage
@@ -2280,6 +2283,43 @@ ADR-059 additionally documents the narrowing of ADR-002's "malicious host" out-o
 - [ ] `host.logging.v1` — workload-emitted structured logs to tenant log sink (depends on mvmd Plan 51 W3).
 - [ ] `host.audit.v1` — workload-emitted chain-signed audit entries under `EventCategory::WorkloadAudit`.
 - [ ] ADR-060 — workload-audit semantics + chain rotation policy.
+
+## Sprint 56 — Single canonical builder VM image (proposed) [`plans/101-single-builder-image-rollout.md`](plans/101-single-builder-image-rollout.md) | [`adrs/060-single-builder-image.md`](adrs/060-single-builder-image.md)
+
+Collapses the current `nix/images/builder-vm` vs
+`nix/images/builder` split into one canonical builder VM image. The dev
+shell becomes an **interactive mode of the builder VM**, not a separate
+rootfs lineage, so the same image developers boot is also the image
+that builds microVMs.
+
+### Why this sprint
+
+- The current Layer 1 / Layer 2 split is conceptually wrong for the
+  intended workflow: contributors debug one VM while automation builds
+  with another.
+- Bootstrap and cache logic are more complicated than they need to be
+  because they have to reason about two builder-adjacent image classes.
+- Builder-VM hardening and slimming work should apply to one image
+  lineage, not two.
+
+### Proposed waves
+
+- [ ] **W0** — inventory and terminology freeze
+- [ ] **W1** — interactive mode inside `nix/images/builder-vm`
+- [ ] **W2** — route `mvmctl dev up` to the canonical builder image
+- [ ] **W3** — Stage 0 / ur-seed / cache migration off the separate
+  dev-image assumption
+- [ ] **W4** — persistent-builder and dev-path convergence
+- [ ] **W5** — remove `nix/images/builder/` as a separate lineage
+- [ ] **W6** — verification and documentation close-out
+
+### Success criteria
+
+- `mvmctl dev up` boots the same rootfs lineage that build automation
+  uses.
+- The interactive builder VM can build microVMs directly.
+- Cache/status output and docs stop describing builder vs dev as
+  separate image classes.
 
 ## Completed Sprints
 
