@@ -35,6 +35,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+
 /// Errors a spawn / lifecycle operation can return.
 #[derive(Debug, Error)]
 pub enum SpawnError {
@@ -224,7 +227,7 @@ impl SubprocessSpawner for ProcessSpawner {
             // on the POSIX async-signal-safe list and `libc::prctl`
             // forwards directly. No allocation, no Rust runtime, no
             // tokio state.
-            <Command as std::os::unix::process::CommandExt>::pre_exec(&mut command, || {
+            command.as_std_mut().pre_exec(|| {
                 let ret = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
