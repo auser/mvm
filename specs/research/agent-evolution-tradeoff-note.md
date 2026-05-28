@@ -3,16 +3,16 @@
 > Research document — no implementation changes in this note itself.
 > Track E §"Zig evaluation gates" in [Sprint 42](../SPRINT.md) requires a written tradeoff note before any Zig prototype.
 > This document satisfies that gate by analyzing **both** the Zig path and the lean-Rust v2 path symmetrically.
-> Implementing plan: [Plan 105 — Guest control-layer dep-reduction + encryption design](../plans/105-zig-pid0-exploration.md).
+> Implementing plan: [Plan 109 — Guest control-layer dep-reduction + encryption design](../plans/109-zig-pid0-exploration.md).
 > Date: 2026-05-27.
 
 ---
 
 ## Context
 
-The guest-side control-layer in mvm is currently Rust + a heavy transitive dependency tree (`tokio`, `serde_json`, `ed25519-dalek`, `rtnetlink`, `seccompiler`, hundreds of crates downstream). Track E in Sprint 42 set the discipline that any Zig evaluation must be preceded by this kind of written tradeoff. Plan 105 turns that gate into a concrete A/B evaluation between Zig and a "lean Rust v2" alternative.
+The guest-side control-layer in mvm is currently Rust + a heavy transitive dependency tree (`tokio`, `serde_json`, `ed25519-dalek`, `rtnetlink`, `seccompiler`, hundreds of crates downstream). Track E in Sprint 42 set the discipline that any Zig evaluation must be preceded by this kind of written tradeoff. Plan 109 turns that gate into a concrete A/B evaluation between Zig and a "lean Rust v2" alternative.
 
-**Recommendation up front (from Plan 105 §"Systems-design recommendation"):**
+**Recommendation up front (from Plan 109 §"Systems-design recommendation"):**
 
 > Stay Rust. Adopt **lean Rust v2** as the agent's evolution path. Treat the Zig prototype as a measurement check, not a direction.
 
@@ -62,7 +62,7 @@ Plan 104 (host services broker over vsock, merged 2026-05-26) and the in-flight 
 | **5301** | `mvm-secrets-dispatcher` subprocess (uid 902, seccomp-locked, separate address space from the supervisor) | mvm SDK in workload | `AuthenticatedFrame` → `ServiceCall`/`ServiceResponse` | Secrets channel: `host.secrets.v1` only — out-of-process for blast-radius isolation per Plan 104 §"Host-side: two-process architecture" |
 | (53 — legacy) | supervisor in-process | guest | `HostBoundRequest` | Being deprecated by Plan 104; replaced by the broker on :5300 |
 
-**Implications for Plan 105:**
+**Implications for Plan 109:**
 
 - **W3 (Noise_NK encryption design)** must cover **all three guest↔host vsock connections** (5252, 5300, 5301), not just the agent control channel. The same host static Ed25519 pubkey (already baked in via `mkGuest { hostPubkey = ...; }`) authenticates all three. Each port runs its own session — three independent Noise_NK handshakes, same key material.
 - **W4 ADR "control-plane vs data-plane"** must name the broker explicitly as part of the control plane. Workload→host service calls (secrets, time, cost) are control-plane traffic — they cross the boundary, carry audit-emitting RPCs, and gate on the signed `ExecutionPlan.services` bindings. They are **not** data plane (D3) — the data plane is workload bytes (stdout, network, fs); broker calls are workload→host *service* invocations.
@@ -267,7 +267,7 @@ These need W2/W2′ measurement output before they can be answered:
 
 ## 7. What this note does NOT decide
 
-- Whether to do the agent rewrite *at all*. Plan 105 is exploration; the agent rewrite is explicitly out of scope.
+- Whether to do the agent rewrite *at all*. Plan 109 is exploration; the agent rewrite is explicitly out of scope.
 - Which specific Rust JSON library replaces `serde_json` if lean Rust v2 wins. Hand-rolled vs `nanoserde` vs `miniserde` is a sub-decision for a future agent-v2 plan.
 - Whether Zig is suitable for the Apple VZ Swift shims (separate surface; ADR-056 / Plan 98 own it).
 - Whether `mvm-builder-init` should swap off `nix` 0.29. That's a stronger second-target candidate if W2/W2′ measurements support it; deferred to a follow-on plan.
@@ -276,7 +276,7 @@ These need W2/W2′ measurement output before they can be answered:
 
 ## Related
 
-- [Plan 105 — Guest control-layer dep-reduction + encryption design](../plans/105-zig-pid0-exploration.md) (this note implements its W1)
+- [Plan 109 — Guest control-layer dep-reduction + encryption design](../plans/109-zig-pid0-exploration.md) (this note implements its W1)
 - [Sprint 42 Track E — Zig evaluation gates](../SPRINT.md#track-e--zig-evaluation-gates) (this note satisfies the prerequisite)
 - [ADR-002 — microVM security posture](../adrs/002-microvm-security-posture.md) (claims 1-10; the audit invariants this exploration must preserve)
 - [ADR-053 — Guest protocol versioning and readiness](../adrs/053-guest-protocol-versioning-and-readiness.md) (informal control/data-plane hint that W4 promotes to a contract)
