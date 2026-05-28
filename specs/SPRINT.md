@@ -2219,6 +2219,7 @@ Today secrets reach microVMs by mounting a sealed ext4 drive at `/mnt/secrets` a
 ### Workstream breakdown
 
 - [ ] **W1 — Four-subprocess infrastructure substrate** (envelope, registry, two vsock listeners per VM — port 5300 general + port 5301 secrets; four new crates: `mvm-broker`, `mvm-secrets-dispatcher`, `mvm-host-signer`, `mvm-audit-signer`; supervisor subprocess lifecycle for all four; UDS proxy code paths; cosign-verify + TOCTOU-resistant exec + config-signing per subprocess; per-workload cgroup + namespace isolation; resource caps; binary hardening; doctor host-posture checks; KSM/THP off; `fido_touch_required()` stub on `mvmctl up --prod`)
+- [x] W1b.1 CI follow-up (2026-05-27): documented all four broker subprocess bins as architecture-invariant substrate allowlist entries, and hardened the oversized-frame broker server test to accept either EOF or `ECONNRESET` on rejection.
 - [ ] **W2 — `ExecutionPlan.services` + admission wiring + audit-signer wiring** (schema bump 4→5; registry assembly; `EventCategory::ServiceCall` routed through `mvm-audit-signer`; `O_APPEND` audit FD + dir-immutable; chain-head persistence; at-rest encryption; time-source integrity; rate-limit / lifetime-quota / circuit-breaker; session-key rotation; operator-action audit entries)
 - [ ] **W3 — `host.time.v1`** (handler in `mvm-broker` + `broker.v1/list_services` + delete `HostBoundRequest::QueryHostTime`)
 - [ ] **W4a — `host.cost.v1` workload-scope** (handler in `mvm-broker`; no mvmd dep)
