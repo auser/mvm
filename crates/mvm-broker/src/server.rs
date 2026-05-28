@@ -254,7 +254,11 @@ mod tests {
     async fn rejects_frames_above_the_cap() {
         let dir = tempdir().unwrap();
         let path = uds_path(&dir);
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("failed to bind broker test listener: {err}"),
+        };
         let registry = Arc::new(Registry::new());
 
         let server_task = tokio::spawn({
