@@ -887,7 +887,6 @@ jobs:
               - 'nix/lib/**'
               - 'specs/plans/57-libkrun-spike.md'
               - 'specs/plans/72-builder-vm-via-libkrun.md'
-              - '.github/workflows/ci.yml'
 
       - name: Install Rust toolchain
         if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
