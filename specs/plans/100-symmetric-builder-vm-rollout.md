@@ -14,7 +14,7 @@ Bring Linux up to the macOS execution model: workload microVMs always run inside
 
 - [ ] **W1 — Backend dispatch.** Extend `resolve_builder_backend()` (`crates/mvm-build/src/builder_backend_select.rs:86-91`) so Linux returns `LibkrunBuilderVm` instead of falling through to direct Firecracker. Gate behind `MVM_LINUX_BUILDER_VM=1` env var for the rollout window so we can flip it on/off without a recompile.
 
-- [ ] **W2 — Image distribution on Linux.** Ensure `nix/images/builder-vm/` builds on Linux contributor hosts (currently exercised mostly via macOS). No mvm-published prebuilt artifact — source-checkout-only per CLAUDE.md ("source-checkout builds never depend on mvm-published artifacts"). Validate `nix build .#builder-vm` from a Linux contributor host.
+- [x] **W2 — Image distribution on Linux.** Paths-gated `builder-vm-image-linux` CI lane in `.github/workflows/ci.yml` runs `nix build ./nix/images/builder-vm#packages.x86_64-linux.default` on Ubuntu, asserts all four flake outputs (`vmlinux`, `rootfs.ext4`, `cmdline.txt`, `manifest.json`) land on disk, and prints SHA-256 + size for diff-grade visibility on kernel-config changes. No mvm-published prebuilt artifact — source-checkout-only per CLAUDE.md ("source-checkout builds never depend on mvm-published artifacts"). PR #TODO once filed.
 
 - [ ] **W3 — Doctor probe.** Add `linux_nested_kvm_available()` to `mvmctl doctor`. Detect via `/sys/module/kvm_intel/parameters/nested` or `/sys/module/kvm_amd/parameters/nested`; report degraded mode if either is `0` / `N`. Emit install hint pointing to the kernel-module parameter fix.
 

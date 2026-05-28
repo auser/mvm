@@ -2163,7 +2163,7 @@ Plan 100 W1 — implementation tracker (Plan 105). First slice: env-gated `MVM_L
 - [ ] **W0** — feasibility prototype (off-branch, throw-away): measure cold-start latency on a Linux + nested-KVM host. Numbers feed into the W1 PR body.
 - [ ] **W1** — `MVM_LINUX_BUILDER_VM` env-gate in `crates/mvm-build/src/builder_backend_select.rs` + `Platform::has_nested_kvm()` predicate + 5 hermetic unit tests. ~80 lines including tests.
 - [ ] **W3-doctor** — `mvmctl doctor` reports nested-KVM availability + extends the Plan 98 `builder backend` line with the `MVM_LINUX_BUILDER_VM` source. Small standalone PR after W1.
-- [ ] **W2** (deferred) — Linux Nix image build validation. Separate PR after W1 lands.
+- [x] **W2** — Linux Nix image build validation. Paths-gated `builder-vm-image-linux` lane in `ci.yml` builds the builder-vm flake on Ubuntu and asserts the four output artifacts land on disk. Bundled with W1 prep PR (#479 follow-up).
 - [ ] **W4** (deferred) — Nested-KVM CI lane in `ci.yml`. Pairs with W2.
 - [ ] **W5** (deferred) — Persistent-builder variant on Linux (mirrors Plan 98 Slice 2A's `VzPersistentBuilderVm` shape with libkrun-on-Linux backing).
 - [ ] **W6** (deferred) — Retire direct-Firecracker code path. Gated on W4 CI proof + Plan 101 Leg 1 (volume encryption) so the trust uplift lands at flip-time.
