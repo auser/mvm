@@ -212,6 +212,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     });
 
     checks.push(kvm_check(plat, false));
+    checks.push(nested_kvm_check(plat));
     checks.push(apple_container_check(plat));
     checks.push(vz_check(plat));
     checks.push(libkrun_check(plat));
@@ -557,6 +558,78 @@ fn platform_description(plat: Platform) -> String {
         }
         Platform::Windows => "Windows".to_string(),
     }
+}
+
+/// Plan 105 W1 / Plan 100 W3 — surface nested-KVM availability on
+/// Linux. Required for the Plan 100 W6 dispatch flip (libkrun
+/// builder VM → nested Firecracker workload). Linux-only: macOS and
+/// Windows hosts get a clean "n/a" line so the doctor output isn't
+/// noisy on the platforms the question doesn't apply to.
+///
+/// Two states matter to operators:
+///   1. `MVM_LINUX_BUILDER_VM` is unset → informational only (this
+///      is the default today; nested-KVM either ready or a future
+///      enablement step).
+///   2. `MVM_LINUX_BUILDER_VM=1` is set → the operator has opted in;
+///      nested-KVM missing is now a hard "fix this before Plan 100
+///      W6 ships" error.
+fn nested_kvm_check(plat: Platform) -> Check {
+    if !matches!(plat, Platform::LinuxNative) {
+        return Check {
+            name: "nested-kvm",
+            category: "platform",
+            ok: true,
+            info: "n/a (Linux-only — macOS hosts use libkrun/Vz; Plan 100 W6 affects Linux only)"
+                .to_string(),
+        };
+    }
+    let has_nested = plat.has_nested_kvm();
+    let env_requested = linux_builder_vm_requested_for_doctor();
+    match (has_nested, env_requested) {
+        (true, true) => Check {
+            name: "nested-kvm",
+            category: "platform",
+            ok: true,
+            info: "available — MVM_LINUX_BUILDER_VM=1 is set; Plan 100 W6 nesting ready".to_string(),
+        },
+        (true, false) => Check {
+            name: "nested-kvm",
+            category: "platform",
+            ok: true,
+            info: "available (informational — set MVM_LINUX_BUILDER_VM=1 to opt into Plan 100 W6 nesting once it lands)"
+                .to_string(),
+        },
+        (false, true) => Check {
+            name: "nested-kvm",
+            category: "platform",
+            ok: false,
+            info: "MVM_LINUX_BUILDER_VM=1 but nested KVM not enabled. \
+                   Enable on Intel: `modprobe -r kvm_intel && modprobe kvm_intel nested=Y` \
+                   (or `options kvm_intel nested=Y` in /etc/modprobe.d/). \
+                   AMD: `modprobe -r kvm_amd && modprobe kvm_amd nested=1`. \
+                   Confirm via /sys/module/kvm_intel/parameters/nested or \
+                   /sys/module/kvm_amd/parameters/nested."
+                .to_string(),
+        },
+        (false, false) => Check {
+            name: "nested-kvm",
+            category: "platform",
+            ok: true, // Not a failure unless the operator opts in.
+            info: "not enabled (informational — enable kvm_intel/kvm_amd nested=1 before \
+                   setting MVM_LINUX_BUILDER_VM=1 ahead of Plan 100 W6)"
+                .to_string(),
+        },
+    }
+}
+
+#[cfg(feature = "builder-vm")]
+fn linux_builder_vm_requested_for_doctor() -> bool {
+    mvm_build::builder_backend_select::linux_builder_vm_requested()
+}
+
+#[cfg(not(feature = "builder-vm"))]
+fn linux_builder_vm_requested_for_doctor() -> bool {
+    false
 }
 
 fn kvm_check(plat: Platform, in_vm: bool) -> Check {
@@ -1046,7 +1119,8 @@ fn libkrun_check(plat: Platform) -> Check {
 #[cfg(feature = "builder-vm")]
 fn builder_backend_check(plat: Platform) -> Check {
     use mvm_build::builder_backend_select::{
-        BuilderBackendChoice, MVM_BUILDER_BACKEND_ENV, auto_detect_default, resolve_env_override,
+        BuilderBackendChoice, MVM_BUILDER_BACKEND_ENV, MVM_LINUX_BUILDER_VM_ENV,
+        auto_detect_default, linux_builder_vm_requested, resolve_env_override,
     };
 
     let env_override = resolve_env_override();
@@ -1058,10 +1132,18 @@ fn builder_backend_check(plat: Platform) -> Check {
     // env at startup, so we can't distinguish them after the fact;
     // surface both possibilities so an operator reading the report
     // knows where to look.
-    let source = match env_override {
+    let mut source = match env_override {
         Some(_) => format!("override via --builder / ${MVM_BUILDER_BACKEND_ENV}"),
         None => format!("auto-detected (default: {})", auto.name()),
     };
+    // Plan 105 W1 — surface the Linux-only rollout signal alongside
+    // the backend selection. The env doesn't change *which* backend
+    // wins (libkrun stays the Linux default); it changes how the
+    // workload path will dispatch once Plan 100 W6 lands. Operators
+    // who set it should see it acknowledged in `doctor` output.
+    if linux_builder_vm_requested() {
+        source = format!("{source}; ${MVM_LINUX_BUILDER_VM_ENV}=1 (Plan 100 W6 opt-in)");
+    }
 
     let availability = match resolved {
         BuilderBackendChoice::Libkrun => {
@@ -2841,6 +2923,102 @@ mod tests {
         assert!(
             c.info.contains("Vz NOT available"),
             "expected `Vz NOT available` segment on Linux; got: {}",
+            c.info
+        );
+    }
+
+    // ── Plan 105 W1 — nested-kvm check + MVM_LINUX_BUILDER_VM line ──
+
+    #[test]
+    fn nested_kvm_check_macos_reports_na() {
+        let c = nested_kvm_check(Platform::MacOS);
+        assert!(c.ok, "macOS host must not fail on Linux-only probe");
+        assert_eq!(c.name, "nested-kvm");
+        assert_eq!(c.category, "platform");
+        assert!(c.info.contains("n/a"), "got: {}", c.info);
+        assert!(c.info.contains("Linux-only"), "got: {}", c.info);
+    }
+
+    #[test]
+    fn nested_kvm_check_windows_reports_na() {
+        let c = nested_kvm_check(Platform::Windows);
+        assert!(c.ok);
+        assert!(c.info.contains("n/a"));
+    }
+
+    #[test]
+    fn nested_kvm_check_wsl2_reports_na() {
+        let c = nested_kvm_check(Platform::Wsl2);
+        assert!(c.ok);
+        assert!(c.info.contains("n/a"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "builder-vm"))]
+    #[test]
+    fn nested_kvm_check_linux_native_reports_actionable_text() {
+        // Without spoofing the sysfs probe we can't pin the (ok/!ok)
+        // outcome — different CI runners report different nested-KVM
+        // states. What we CAN pin: the line is "nested-kvm", category
+        // "platform", and the info text covers one of the four
+        // documented branches (env-set + ready, env-set + missing,
+        // env-unset + ready, env-unset + missing).
+        let prev = std::env::var_os("MVM_LINUX_BUILDER_VM");
+        unsafe {
+            std::env::remove_var("MVM_LINUX_BUILDER_VM");
+        }
+        let c = nested_kvm_check(Platform::LinuxNative);
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("MVM_LINUX_BUILDER_VM", v);
+            }
+        }
+        assert_eq!(c.name, "nested-kvm");
+        assert_eq!(c.category, "platform");
+        let info = &c.info;
+        // Env-unset branch — one of two truthy paths.
+        assert!(
+            info.contains("informational")
+                || info.contains("not enabled (informational")
+                || info.contains("available (informational"),
+            "expected informational env-unset text; got: {info}"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "builder-vm"))]
+    #[test]
+    fn builder_backend_check_linux_surfaces_linux_builder_vm_env() {
+        // When MVM_LINUX_BUILDER_VM=1 is set, the builder-backend line
+        // adds the rollout-opt-in annotation alongside the resolved
+        // backend + availability.
+        let prev_bb = std::env::var_os("MVM_BUILDER_BACKEND");
+        let prev_lbvm = std::env::var_os("MVM_LINUX_BUILDER_VM");
+        unsafe {
+            std::env::remove_var("MVM_BUILDER_BACKEND");
+            std::env::set_var("MVM_LINUX_BUILDER_VM", "1");
+        }
+
+        let c = builder_backend_check(Platform::LinuxNative);
+
+        unsafe {
+            match prev_bb {
+                Some(v) => std::env::set_var("MVM_BUILDER_BACKEND", v),
+                None => std::env::remove_var("MVM_BUILDER_BACKEND"),
+            }
+            match prev_lbvm {
+                Some(v) => std::env::set_var("MVM_LINUX_BUILDER_VM", v),
+                None => std::env::remove_var("MVM_LINUX_BUILDER_VM"),
+            }
+        }
+
+        assert!(c.ok);
+        assert!(
+            c.info.contains("MVM_LINUX_BUILDER_VM"),
+            "expected Plan 100 W6 opt-in annotation; got: {}",
+            c.info
+        );
+        assert!(
+            c.info.contains("Plan 100 W6 opt-in"),
+            "expected `Plan 100 W6 opt-in` annotation; got: {}",
             c.info
         );
     }
