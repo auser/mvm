@@ -298,7 +298,9 @@ mod tests {
             Ok(0) => {}
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
             Ok(n) => panic!("expected EOF/reset after oversized frame rejection, got {n} bytes"),
-            Err(err) => panic!("expected EOF/reset after oversized frame rejection, got {err}"),
+            Err(err) => {
+                panic!("expected EOF/reset after oversized frame rejection, got {err}")
+            }
         }
 
         server_task.abort();
