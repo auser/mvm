@@ -427,10 +427,6 @@ jobs:
               - 'nix/images/builder-vm/**'
               - 'nix/lib/**'
               - 'crates/mvm-builder-init/**'
-              - 'specs/plans/100-symmetric-builder-vm-rollout.md'
-              - 'specs/plans/105-plan-100-w1-linux-builder-vm.md'
-              - 'specs/adrs/057-symmetric-builder-vm.md'
-              - '.github/workflows/ci.yml'
 
       - name: Install Nix
         if: steps.filter.outputs.builder_vm == 'true' || github.ref == 'refs/heads/main'
