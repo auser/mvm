@@ -74,15 +74,14 @@ jobs:
   #      addon proxy over vsock. This is per-VM developer substrate;
   #      distributed service discovery, tenant policy, and
   #      cryptographic routing remain mvmd-owned.
-  #   8. Per-workload broker subprocess substrate
-  #      (`crates/mvm-broker/src/bin/mvm-broker.rs`,
-  #      `crates/mvm-secrets-dispatcher/src/bin/mvm-secrets-dispatcher.rs`,
-  #      `crates/mvm-host-signer/src/bin/mvm-host-signer.rs`,
-  #      `crates/mvm-audit-signer/src/bin/mvm-audit-signer.rs`).
-  #      These listeners are VM-local capability endpoints behind the
-  #      supervisor's UDS routing, not shared orchestration-plane
-  #      servers. They exist so host services can be split across
-  #      least-privilege subprocesses.
+  #   8. Per-workload broker subprocess substrate. Crates that belong
+  #      to this category declare
+  #      `[package.metadata.mvm.architecture].substrate_server_category`
+  #      in their `Cargo.toml`. Today that includes `mvm-broker`,
+  #      `mvm-secrets-dispatcher`, `mvm-host-signer`, and
+  #      `mvm-audit-signer`. These UDS listeners are VM-local
+  #      broker/signer/secrets helpers spawned by the supervisor for a
+  #      single workload, not multi-tenant control-plane servers.
   #
   # The in-guest vsock agent in `mvm-guest` is also excluded — it
   # runs *inside* the microVM, not on the host.
@@ -146,9 +145,27 @@ jobs:
             ' "$1"
           }
 
-          # Substrate allowlist — files documented in this workflow's
-          # header. Adding to the list requires a new category, not a
-          # new server in an existing category.
+          metadata_allows_server_patterns() {
+            local file="$1"
+            local crate_dir cargo_toml
+            crate_dir=$(dirname "$file")
+            while [ "$crate_dir" != "." ] && [ "$crate_dir" != "/" ]; do
+              cargo_toml="$crate_dir/Cargo.toml"
+              if [ -f "$cargo_toml" ]; then
+                if rg -n '^[[:space:]]*substrate_server_category[[:space:]]*=' "$cargo_toml" >/dev/null; then
+                  return 0
+                fi
+                return 1
+              fi
+              crate_dir=$(dirname "$crate_dir")
+            done
+            return 1
+          }
+
+          # Substrate allowlist — categories documented in this
+          # workflow's header. File-level exceptions are limited to the
+          # long-standing non-crate cases; crate-owned server
+          # exceptions must be declared structurally via Cargo metadata.
           CANDIDATES=$(rg \
               --type rust \
               --files-with-matches \
@@ -168,10 +185,6 @@ jobs:
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
               --glob '!crates/mvm-backend/src/mock_guest_agent.rs' \
               --glob '!crates/mvm-addon-vsock-bridge/**' \
-              --glob '!crates/mvm-broker/src/bin/mvm-broker.rs' \
-              --glob '!crates/mvm-secrets-dispatcher/src/bin/mvm-secrets-dispatcher.rs' \
-              --glob '!crates/mvm-host-signer/src/bin/mvm-host-signer.rs' \
-              --glob '!crates/mvm-audit-signer/src/bin/mvm-audit-signer.rs' \
               -e "$PATTERNS" \
               crates/ src/ \
               || true)
@@ -179,6 +192,9 @@ jobs:
           MATCHES=""
           while IFS= read -r f; do
             [ -z "$f" ] && continue
+            if metadata_allows_server_patterns "$f"; then
+              continue
+            fi
             hits=$(strip_cfg_test_mods "$f" | grep -nE "$PATTERNS" || true)
             if [ -n "$hits" ]; then
               while IFS= read -r hit; do
@@ -197,7 +213,8 @@ jobs:
             echo "If your addition is a new category of substrate (privilege boundary,"
             echo "per-VM security, per-VM provider plumbing, observability, or ephemeral"
             echo "port discovery), document it at the top of"
-            echo ".github/workflows/architecture.yml AND add the file to the allowlist"
+            echo ".github/workflows/architecture.yml and, for crate-owned listeners,"
+            echo "mark the crate with package.metadata.mvm.architecture.substrate_server_category"
             echo "in the same PR. The bar is 'a new category emerged' — not 'I want to"
             echo "add a new server here'."
             echo ""

@@ -8,6 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[package.metadata.mvm.architecture]
+substrate_server_category = "per-workload broker subprocess substrate"
+
 # One of the four per-VM subprocesses (mvm-broker, mvm-secrets-dispatcher,
 # mvm-host-signer, mvm-audit-signer — see ADR-061 §"Decision"). Runs at
 # uid 902 with seccomp + setpriv + per-workload cgroup + namespace
