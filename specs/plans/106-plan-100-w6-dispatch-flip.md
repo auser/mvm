@@ -1,20 +1,24 @@
 # Plan 106 — Plan 100 W6 brainstorm: workload-path dispatch flip
 
-> **Status (2026-05-27):** brainstorm doc. Designs the architectural
-> dispatch flip that completes Plan 100 — Linux workload microVMs
-> nest through a libkrun host VM instead of running Firecracker
-> directly on the Linux host. This plan is **planning only** —
-> implementation slices spawn from here as Plan 107+ once an approach
-> is locked.
+> **Status (2026-05-27):** brainstorm doc — **decision locked:
+> Approach A** (shared libkrun host VM, Firecracker per workload).
+> Executable phases A1–A6 move to Plan 107
+> (`specs/plans/107-plan-100-w6-approach-a.md`); this file remains as
+> the design rationale + the considered alternatives (B, C) for
+> future readers.
+>
+> Designs the architectural dispatch flip that completes Plan 100 —
+> Linux workload microVMs nest through a libkrun host VM instead of
+> running Firecracker directly on the Linux host. This plan was
+> planning-only; implementation slices live in Plan 107+.
 >
 > Picks up after Plan 105 (W1 prep + W2 nix-build CI lane + W3 doctor
 > probe) landed in PR #479. W1's `MVM_LINUX_BUILDER_VM` env constant
 > and `linux_builder_vm_readiness()` predicate are the rollout signal
 > this plan flips on.
 >
-> Pick-up command for fresh sessions: read this file top to bottom,
-> then jump to the approach-selection question in the §"Decision
-> needed" section.
+> Pick-up command for fresh sessions: read this file top to bottom
+> for the design rationale; for the active workstream see Plan 107.
 
 ## Context
 
@@ -406,10 +410,25 @@ ADR-002 Claim 1 will cite post-A6.2.
 
 ---
 
-## Decision point for the user
+## Decision
 
-**Approach A, B, or C?** Recommendation: A. Locked decision feeds
-into the executable Plan 107 (the first implementation slice — A1
-protocol generalisation). If the user picks B or C, the executable
-plan structure changes substantively; this brainstorm is the place
-to redirect.
+**Locked 2026-05-27: Approach A** (shared libkrun host VM,
+Firecracker per workload). Executable phases A1–A6 are tracked in
+`specs/plans/107-plan-100-w6-approach-a.md`. This brainstorm stays
+as the design rationale + the rejected alternatives (B, C) for
+future readers.
+
+Reasoning recap (full version above in §"Approach A" through
+§"Comparison"):
+
+- Trust boundary is clean: the host userland never sees the
+  workload's Firecracker process tree (the W6 trust uplift).
+- Amortises libkrun cold-start across many workloads via a single
+  long-lived host VM (the warm-pool builder pattern, generalised).
+- Reuses the existing `LibkrunPersistentBuilderVm` dispatch
+  pattern, the existing `BuilderRequest` framing shape, and the
+  existing `mvm-builder-init` guest-side dispatch loop.
+- B and C were rejected for the reasons in §"Approach B" and
+  §"Approach C" — B pays libkrun cold-start per workload (loses
+  the warm-pool win); C diverges from ADR-001's Firecracker
+  hardening surface.
