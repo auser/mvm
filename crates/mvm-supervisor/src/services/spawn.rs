@@ -297,8 +297,7 @@ impl SubprocessSpawner for ProcessSpawner {
             // on the POSIX async-signal-safe list and `libc::prctl`
             // forwards directly. No allocation, no Rust runtime, no
             // tokio state.
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
+            <Command as std::os::unix::process::CommandExt>::pre_exec(&mut command, || {
                 let ret = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());

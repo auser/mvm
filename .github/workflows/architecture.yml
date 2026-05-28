@@ -74,6 +74,14 @@ jobs:
   #      addon proxy over vsock. This is per-VM developer substrate;
   #      distributed service discovery, tenant policy, and
   #      cryptographic routing remain mvmd-owned.
+  #   8. Per-workload broker subprocess substrate
+  #      (`crates/mvm-broker/src/bin/mvm-broker.rs`,
+  #      `crates/mvm-secrets-dispatcher/src/bin/mvm-secrets-dispatcher.rs`,
+  #      `crates/mvm-host-signer/src/bin/mvm-host-signer.rs`,
+  #      `crates/mvm-audit-signer/src/bin/mvm-audit-signer.rs`).
+  #      These UDS listeners are VM-local broker/signer/secrets
+  #      helpers spawned by the supervisor for a single workload, not
+  #      multi-tenant control-plane servers.
   #
   # The in-guest vsock agent in `mvm-guest` is also excluded — it
   # runs *inside* the microVM, not on the host.
@@ -159,6 +167,10 @@ jobs:
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
               --glob '!crates/mvm-backend/src/mock_guest_agent.rs' \
               --glob '!crates/mvm-addon-vsock-bridge/**' \
+              --glob '!crates/mvm-broker/src/bin/mvm-broker.rs' \
+              --glob '!crates/mvm-secrets-dispatcher/src/bin/mvm-secrets-dispatcher.rs' \
+              --glob '!crates/mvm-host-signer/src/bin/mvm-host-signer.rs' \
+              --glob '!crates/mvm-audit-signer/src/bin/mvm-audit-signer.rs' \
               -e "$PATTERNS" \
               crates/ src/ \
               || true)
