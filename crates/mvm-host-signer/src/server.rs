@@ -296,8 +296,14 @@ mod tests {
         };
         write_req(&mut client, &req).await.unwrap();
         let mut buf = [0u8; 4];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "server must drop oversized frames");
+        match client.read(&mut buf).await {
+            Ok(0) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(n) => panic!("expected EOF/reset after oversized frame rejection, got {n} bytes"),
+            Err(err) => {
+                panic!("expected EOF/reset after oversized frame rejection, got {err}")
+            }
+        }
 
         server_task.abort();
     }

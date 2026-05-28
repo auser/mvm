@@ -291,14 +291,16 @@ mod tests {
         client.write_all(&len.to_be_bytes()).await.unwrap();
         client.write_all(&body).await.unwrap();
 
-        // The server should drop the connection; reading a response
-        // returns EOF.
+        // The server should drop the connection; depending on platform
+        // scheduling, the client may observe either EOF or a reset.
         let mut buf = [0u8; 4];
         match client.read(&mut buf).await {
             Ok(0) => {}
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Ok(n) => panic!("expected EOF after oversized frame rejection, got {n} bytes"),
-            Err(err) => panic!("expected EOF/ECONNRESET after oversized frame rejection, got {err}"),
+            Ok(n) => panic!("expected EOF/reset after oversized frame rejection, got {n} bytes"),
+            Err(err) => {
+                panic!("expected EOF/reset after oversized frame rejection, got {err}")
+            }
         }
 
         server_task.abort();
