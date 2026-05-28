@@ -45,6 +45,13 @@ pub mod broker_proxy;
 pub mod frame;
 pub mod host_signer_proxy;
 pub mod secrets_proxy;
+// Plan 104 W1b.2b.1 — subprocess spawn lifecycle: SubprocessSpawner +
+// ProcessSpawner + RestartSupervisor + UDS-connect readiness probe.
+// W1b.2b.2 wraps the spawn site with cosign verify (§H-L3.1) +
+// TOCTOU-resistant exec (§H-L3.2). W1b.2b.3 wraps with signed config
+// envelope (§H-L3.6). W1b.2b.4 wraps with per-spawn response signing
+// (§H-L4.2).
+pub mod spawn;
 
 use thiserror::Error;
 
