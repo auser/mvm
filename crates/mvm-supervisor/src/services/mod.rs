@@ -41,6 +41,11 @@
 //!   when they call into these proxies)
 
 pub mod audit_signer_proxy;
+// Plan 104 W1b.2b.2 — pre-spawn binary integrity check
+// (§H-L3.1 cosign-style verify). TOCTOU close (§H-L3.2) via
+// fexecve is the deferred follow-on; the seam is documented at
+// the spawn call site.
+pub mod binary_integrity;
 pub mod broker_proxy;
 pub mod frame;
 pub mod host_signer_proxy;

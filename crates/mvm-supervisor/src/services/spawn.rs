@@ -27,6 +27,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -38,6 +39,7 @@ use tracing::{debug, info, warn};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
+use crate::services::binary_integrity::{IntegrityChecker, IntegrityError};
 /// Errors a spawn / lifecycle operation can return.
 #[derive(Debug, Error)]
 pub enum SpawnError {
@@ -83,6 +85,16 @@ pub enum SpawnError {
         binary: PathBuf,
         crashes: u32,
         budget: u32,
+    },
+    /// Pre-spawn integrity check refused the binary (Plan 104 §H-L3.1).
+    /// Wraps the typed [`IntegrityError`] so callers can branch on the
+    /// specific refusal (tamper / unknown signer / missing sidecar /
+    /// unsupported alg / malformed sidecar).
+    #[error("integrity check refused {binary}: {source}")]
+    IntegrityCheckFailed {
+        binary: PathBuf,
+        #[source]
+        source: IntegrityError,
     },
 }
 
@@ -195,8 +207,48 @@ pub trait SubprocessSpawner: Send + Sync + 'static {
 /// Production spawner — `tokio::process::Command` + parent-death attach
 /// (Linux only — macOS impl deferred to W1b.2b.{4,c} once we settle on
 /// the kqueue-watcher-vs-PID-watchdog choice).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessSpawner;
+///
+/// An optional [`IntegrityChecker`] runs *before* `Command::spawn`. If
+/// the check fails, the subprocess is never started; the supervisor
+/// surfaces [`SpawnError::IntegrityCheckFailed`] with the typed
+/// [`IntegrityError`] for audit emission (W1b.2b.5).
+///
+/// **TOCTOU window still open** between verify-time and exec-time
+/// (Plan 104 §H-L3.2). Closing it requires Linux `fexecve` (or macOS
+/// `posix_spawn`-with-fd) — that lands in a follow-on PR
+/// (W1b.2b.2.5 or alongside the W1b.2c cgroup/seccomp plumbing).
+#[derive(Default, Clone)]
+pub struct ProcessSpawner {
+    integrity_checker: Option<Arc<dyn IntegrityChecker>>,
+}
+
+impl std::fmt::Debug for ProcessSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessSpawner")
+            .field("integrity_checker", &self.integrity_checker.is_some())
+            .finish()
+    }
+}
+
+impl ProcessSpawner {
+    /// Create a spawner with no integrity check (development /
+    /// internal-test path). Production should always use
+    /// [`ProcessSpawner::with_integrity_checker`].
+    pub fn unchecked() -> Self {
+        Self {
+            integrity_checker: None,
+        }
+    }
+
+    /// Attach a pre-spawn integrity check. The W1b.2b.5 admission
+    /// ceremony wires the production
+    /// [`crate::services::binary_integrity::SignedBinaryChecker`] here.
+    pub fn with_integrity_checker(checker: Arc<dyn IntegrityChecker>) -> Self {
+        Self {
+            integrity_checker: Some(checker),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl SubprocessSpawner for ProcessSpawner {
@@ -206,6 +258,26 @@ impl SubprocessSpawner for ProcessSpawner {
             uds_path = %request.uds_path.display(),
             "ProcessSpawner spawning subprocess"
         );
+
+        // Pre-spawn integrity check (Plan 104 §H-L3.1). Refuse to
+        // even Command::spawn if the verify fails.
+        //
+        // TOCTOU window: an attacker who swaps the binary between this
+        // verify call and the `Command::new` exec below wins. Closing
+        // the window requires fexecve on Linux / posix_spawn-with-fd
+        // on macOS — see follow-on per §H-L3.2.
+        if let Some(checker) = &self.integrity_checker {
+            checker
+                .verify(&request.binary)
+                .map_err(|source| SpawnError::IntegrityCheckFailed {
+                    binary: request.binary.clone(),
+                    source,
+                })?;
+            debug!(
+                binary = %request.binary.display(),
+                "ProcessSpawner integrity check passed"
+            );
+        }
 
         let mut command = Command::new(&request.binary);
         command
@@ -650,7 +722,7 @@ mod tests {
     #[tokio::test]
     async fn process_spawner_real_binary_propagates_spawn_error_on_missing_path() {
         let dir = tempdir().unwrap();
-        let spawner = ProcessSpawner;
+        let spawner = ProcessSpawner::unchecked();
         let request = SpawnRequest::new(
             "/definitely/not/a/real/path/mvm-fake",
             dir.path().join("nope.sock"),
@@ -663,6 +735,69 @@ mod tests {
         match err {
             SpawnError::Spawn { .. } => {}
             other => panic!("expected Spawn error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_spawner_refuses_tampered_binary_before_calling_command_spawn() {
+        // Wires the IntegrityChecker into ProcessSpawner end-to-end:
+        // sign a tempdir "binary", attach the bundle, tamper the file,
+        // then assert spawn fails with IntegrityCheckFailed (not the
+        // downstream Spawn / ReadinessTimeout that would fire if the
+        // checker were bypassed). The shell-script body never runs.
+        use std::sync::Arc;
+
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        use crate::services::binary_integrity::{
+            BinarySignature, IntegrityError, ReleaseKeyBundle, SignedBinaryChecker,
+        };
+
+        let dir = tempdir().unwrap();
+        let binary_path = dir.path().join("fake-bin");
+        let original = b"#!/bin/sh\nsleep 5\n";
+        std::fs::write(&binary_path, original).unwrap();
+
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let signature = signing_key.sign(original);
+
+        let mut bundle = ReleaseKeyBundle::new();
+        let key_id = bundle.add(verifying_key);
+
+        use base64::Engine;
+        let sidecar = BinarySignature {
+            sig_alg: mvm_core::security::SIG_ALG_ED25519,
+            signature_b64: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+            signer_key_id: key_id,
+        };
+        sidecar.write_for(&binary_path).unwrap();
+
+        // TAMPER the binary after signing.
+        std::fs::write(&binary_path, b"#!/bin/sh\necho TAMPERED\n").unwrap();
+
+        let checker = SignedBinaryChecker::new(bundle);
+        let spawner = ProcessSpawner::with_integrity_checker(Arc::new(checker));
+        let request = SpawnRequest::new(
+            &binary_path,
+            dir.path().join("never-binds.sock"),
+            b"{}".to_vec(),
+        );
+
+        let err = spawner
+            .spawn(request)
+            .await
+            .expect_err("tampered binary must be refused before spawn");
+        match err {
+            SpawnError::IntegrityCheckFailed { source, .. } => {
+                assert!(
+                    matches!(source, IntegrityError::SignatureMismatch { .. }),
+                    "expected SignatureMismatch, got {source:?}"
+                );
+            }
+            other => panic!("expected IntegrityCheckFailed, got {other:?}"),
         }
     }
 }
