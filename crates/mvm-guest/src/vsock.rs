@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use mvm_core::security::{
-    AgentProfile, AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SessionHello, SessionHelloAck,
+    AgentProfile, AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SIG_ALG_ED25519,
+    SessionHello, SessionHelloAck,
 };
 use mvm_core::signing::SignedPayload;
 use serde::{Deserialize, Serialize};
@@ -1556,6 +1557,7 @@ pub fn write_authenticated_frame<T: Serialize>(
 
     let frame = AuthenticatedFrame {
         version: PROTOCOL_VERSION_AUTHENTICATED,
+        sig_alg: SIG_ALG_ED25519,
         session_id: session_id.to_string(),
         sequence,
         timestamp: chrono::Utc::now().to_rfc3339(),

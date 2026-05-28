@@ -33,7 +33,7 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use libfuzzer_sys::fuzz_target;
-use mvm_core::security::{AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED};
+use mvm_core::security::{AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SIG_ALG_ED25519};
 use mvm_core::signing::SignedPayload;
 use mvm_guest::vsock::{GuestRequest, verify_authenticated_frame};
 
@@ -78,6 +78,7 @@ fuzz_target!(|data: &[u8]| {
 
     let frame = AuthenticatedFrame {
         version: PROTOCOL_VERSION_AUTHENTICATED,
+        sig_alg: SIG_ALG_ED25519,
         session_id: SESSION_ID.to_string(),
         sequence: EXPECTED_MIN_SEQUENCE,
         timestamp: "2026-05-05T00:00:00Z".to_string(),
