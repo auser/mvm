@@ -40,7 +40,6 @@ use tracing::{debug, info, warn};
 use std::os::unix::process::CommandExt;
 
 use crate::services::binary_integrity::{IntegrityChecker, IntegrityError};
-
 /// Errors a spawn / lifecycle operation can return.
 #[derive(Debug, Error)]
 pub enum SpawnError {
