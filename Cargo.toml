@@ -54,10 +54,14 @@ members = [
     # mvm-broker, mvm-secrets-dispatcher, mvm-host-signer,
     # mvm-audit-signer). W1a ships the dispatch-loop skeleton + UDS
     # listener + config envelope for the general broker subprocess
-    # only; the other three plus the supervisor lifecycle / cosign-verify
-    # / cgroup setup / seccomp etc. land in W1b. ADR-061 / Plan 104
-    # §"Host-side: four-subprocess architecture".
+    # only. ADR-061 / Plan 104 §"Host-side: four-subprocess architecture".
     "crates/mvm-broker",
+    # Plan 104 W1b.1 — the remaining three subprocesses, each as its
+    # own crate. The supervisor lifecycle + cosign-verify + cgroup +
+    # seccomp + binary hardening land in W1b.2.
+    "crates/mvm-secrets-dispatcher",
+    "crates/mvm-host-signer",
+    "crates/mvm-audit-signer",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because

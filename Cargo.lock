@@ -3231,6 +3231,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-audit-signer"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "mvm-core",
+ "rand 0.8.6",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "mvm-backend"
 version = "0.14.0"
 dependencies = [
@@ -3444,6 +3465,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-host-signer"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "mvm-core",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "mvm-ir"
 version = "0.14.0"
 dependencies = [
@@ -3588,6 +3627,21 @@ dependencies = [
 [[package]]
 name = "mvm-sdk-macros"
 version = "0.14.0"
+
+[[package]]
+name = "mvm-secrets-dispatcher"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "mvm-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "mvm-security"
@@ -5697,6 +5751,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
