@@ -28,14 +28,28 @@
 //! match the *runtime* default there. Older macOS and Linux contributors
 //! keep libkrun as the cross-platform path they were already using.
 
-use crate::builder_vm::BuilderVm;
+use crate::builder_vm::{BuilderVm, BuilderVmError};
 use crate::libkrun_builder::LibkrunBuilderVm;
 use crate::vz_builder::VzBuilderVm;
-use mvm_core::platform::current;
+use mvm_core::platform::{Platform, current};
 
 /// Env-var name the dispatch consults. Surfaced as a constant so
 /// `mvmctl doctor` can reference it without re-deriving the string.
 pub const MVM_BUILDER_BACKEND_ENV: &str = "MVM_BUILDER_BACKEND";
+
+/// Plan 100 W1 env-var name: `MVM_LINUX_BUILDER_VM=1` opts the host
+/// into the symmetric-builder-VM rollout on Linux. The dispatch flip
+/// itself (replace direct-Firecracker workload execution with a
+/// nested libkrun-builder-VM → Firecracker chain) is Plan 100 W6.
+///
+/// Plan 105 W1 (this slice) wires the env constant + readiness
+/// predicate + doctor probe so operators can validate their host
+/// ahead of W6, and so the W6 dispatch wiring has a single
+/// canonical signal to consume.
+///
+/// Surfaced as a constant so `mvmctl doctor` can reference it
+/// without re-deriving the string.
+pub const MVM_LINUX_BUILDER_VM_ENV: &str = "MVM_LINUX_BUILDER_VM";
 
 /// Recognised choices for [`MVM_BUILDER_BACKEND_ENV`]. Kept as a
 /// tagged enum so a future addition (e.g. Firecracker-builder on
@@ -152,6 +166,83 @@ pub fn resolve_builder_backend_with_override(
         BuilderBackendChoice::Libkrun => Box::new(LibkrunBuilderVm::default()),
         BuilderBackendChoice::Vz => Box::new(VzBuilderVm::new()),
     }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Plan 105 W1 — `MVM_LINUX_BUILDER_VM` readiness gate
+// ──────────────────────────────────────────────────────────────────
+
+/// Pure predicate over an `MVM_LINUX_BUILDER_VM` env-var value.
+/// Lifted out so unit tests can drive both arms without touching
+/// process env. Truthy values: `1`, `true`, `yes`, `on`
+/// (case-insensitive, whitespace-trimmed). Anything else (including
+/// `0`, `false`, `no`, `off`, the empty string, missing) → `false`.
+///
+/// The "is anything but a recognised truthy false-like value false?"
+/// pattern matches operators' expectations from kernel cmdline flags
+/// and avoids confusing `MVM_LINUX_BUILDER_VM=disabled` accidentally
+/// turning the gate on.
+pub fn linux_builder_vm_requested_for(raw: Option<&str>) -> bool {
+    let Some(s) = raw else {
+        return false;
+    };
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on",
+    )
+}
+
+/// Live runtime check: is `MVM_LINUX_BUILDER_VM` set to a truthy
+/// value? Plan 100 W6 will consume this to decide whether the
+/// workload path nests through a libkrun builder VM.
+pub fn linux_builder_vm_requested() -> bool {
+    let raw = std::env::var(MVM_LINUX_BUILDER_VM_ENV).ok();
+    linux_builder_vm_requested_for(raw.as_deref())
+}
+
+/// Pure readiness predicate. Lifted out so unit tests can inject
+/// `(platform, has_nested_kvm)` directly without spoofing the live
+/// host. Returns `Ok(())` when the host is Linux with nested KVM
+/// enabled; returns `Err(BuilderVmError::VmmUnavailable)` with an
+/// actionable hint otherwise.
+///
+/// Called only when [`linux_builder_vm_requested`] is true — when
+/// the env isn't set, the existing direct path stays untouched.
+pub fn linux_builder_vm_readiness_for(
+    plat: Platform,
+    has_nested_kvm: bool,
+) -> Result<(), BuilderVmError> {
+    if !matches!(plat, Platform::LinuxNative) {
+        return Err(BuilderVmError::VmmUnavailable {
+            requested: "linux-builder-vm".into(),
+            reason: format!(
+                "{MVM_LINUX_BUILDER_VM_ENV} is a Linux-only opt-in (Plan 100). \
+                 The current host is {plat}; unset {MVM_LINUX_BUILDER_VM_ENV} to proceed."
+            ),
+        });
+    }
+    if !has_nested_kvm {
+        return Err(BuilderVmError::VmmUnavailable {
+            requested: "linux-builder-vm".into(),
+            reason: format!(
+                "{MVM_LINUX_BUILDER_VM_ENV}=1 requires nested KVM on the host but \
+                 neither /sys/module/kvm_intel/parameters/nested nor \
+                 /sys/module/kvm_amd/parameters/nested reports it enabled. \
+                 Enable on Intel hosts with `modprobe -r kvm_intel && modprobe kvm_intel nested=Y` \
+                 (or set `options kvm_intel nested=Y` in /etc/modprobe.d/), \
+                 or on AMD with `modprobe -r kvm_amd && modprobe kvm_amd nested=1`."
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Live readiness check using the runtime platform + sysfs probe.
+/// `mvmctl doctor` and the future Plan 100 W6 dispatch both call
+/// this to surface clean errors before mid-build.
+pub fn linux_builder_vm_readiness() -> Result<(), BuilderVmError> {
+    let plat = current();
+    linux_builder_vm_readiness_for(plat, plat.has_nested_kvm())
 }
 
 #[cfg(test)]
@@ -342,5 +433,99 @@ mod tests {
             let _backend =
                 resolve_builder_backend_with_override(Some(BuilderBackendChoice::Libkrun));
         });
+    }
+
+    // ── Plan 105 W1 — MVM_LINUX_BUILDER_VM env predicate ──────────
+
+    #[test]
+    fn linux_builder_vm_requested_truthy_values() {
+        for raw in ["1", "true", "yes", "on", "TRUE", "Yes", "On", "  1  "] {
+            assert!(
+                linux_builder_vm_requested_for(Some(raw)),
+                "expected {raw:?} to register as truthy"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_builder_vm_requested_falsey_values() {
+        for raw in [
+            "0",
+            "false",
+            "no",
+            "off",
+            "FALSE",
+            "No",
+            "Off",
+            "",
+            "  ",
+            "anything-else",
+        ] {
+            assert!(
+                !linux_builder_vm_requested_for(Some(raw)),
+                "expected {raw:?} to register as falsey"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_builder_vm_requested_none_is_false() {
+        assert!(!linux_builder_vm_requested_for(None));
+    }
+
+    // ── Plan 105 W1 — readiness predicate ────────────────────────
+
+    #[test]
+    fn linux_builder_vm_readiness_ok_when_linux_native_with_nested_kvm() {
+        assert!(linux_builder_vm_readiness_for(Platform::LinuxNative, true).is_ok());
+    }
+
+    #[test]
+    fn linux_builder_vm_readiness_refuses_without_nested_kvm() {
+        let err = linux_builder_vm_readiness_for(Platform::LinuxNative, false)
+            .expect_err("nested KVM missing must refuse");
+        let msg = format!("{err}");
+        // Operator-actionable error names both the env-var and the
+        // kernel-module fix.
+        assert!(msg.contains("MVM_LINUX_BUILDER_VM"), "got: {msg}");
+        assert!(
+            msg.contains("kvm_intel") || msg.contains("kvm_amd"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("nested"), "got: {msg}");
+    }
+
+    #[test]
+    fn linux_builder_vm_readiness_refuses_on_macos() {
+        let err = linux_builder_vm_readiness_for(Platform::MacOS, true)
+            .expect_err("Linux-only env on macOS must refuse");
+        let msg = format!("{err}");
+        assert!(msg.contains("Linux-only"), "got: {msg}");
+        assert!(msg.contains("MVM_LINUX_BUILDER_VM"), "got: {msg}");
+    }
+
+    #[test]
+    fn linux_builder_vm_readiness_refuses_on_wsl2() {
+        // WSL2 with nested KVM still refuses — Plan 100 W1 targets
+        // LinuxNative only; WSL2 nested-KVM-builder is a future
+        // backend project, not the W1 surface.
+        let err = linux_builder_vm_readiness_for(Platform::Wsl2, true)
+            .expect_err("WSL2 not Plan 100 W1 surface");
+        assert!(format!("{err}").contains("Linux-only"));
+    }
+
+    #[test]
+    fn linux_builder_vm_readiness_refuses_on_linux_no_kvm() {
+        let err = linux_builder_vm_readiness_for(Platform::LinuxNoKvm, false)
+            .expect_err("LinuxNoKvm not Plan 100 W1 surface");
+        assert!(format!("{err}").contains("Linux-only"));
+    }
+
+    #[test]
+    fn linux_builder_vm_env_constant_is_canonical() {
+        // Pin the exact env var name so a future rename trips a
+        // single visible test failure rather than a silent doctor
+        // / dispatch divergence.
+        assert_eq!(MVM_LINUX_BUILDER_VM_ENV, "MVM_LINUX_BUILDER_VM");
     }
 }
