@@ -185,6 +185,7 @@ jobs:
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
               --glob '!crates/mvm-backend/src/mock_guest_agent.rs' \
               --glob '!crates/mvm-addon-vsock-bridge/**' \
+              --glob '!crates/mvm-broker/src/bin/mvm-broker.rs' \
               -e "$PATTERNS" \
               crates/ src/ \
               || true)

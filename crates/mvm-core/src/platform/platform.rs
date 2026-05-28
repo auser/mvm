@@ -26,6 +26,28 @@ impl Platform {
         }
     }
 
+    /// Whether this platform supports nested KVM — required for Plan
+    /// 100's symmetric builder-VM-on-Linux story (libkrun builder VM
+    /// runs in a nested KVM under the host's KVM). Plan 105 W1 uses
+    /// this to gate the opt-in `MVM_LINUX_BUILDER_VM=1` dispatch path.
+    ///
+    /// Linux-only — macOS / Windows / WSL2 / no-KVM return `false`
+    /// unconditionally because the question doesn't apply. On
+    /// `LinuxNative`, probes `/sys/module/kvm_intel/parameters/nested`
+    /// (must read `Y`) or `/sys/module/kvm_amd/parameters/nested`
+    /// (must read `1`). Either being enabled qualifies — the host
+    /// runs Intel or AMD CPUs but not both, so only one of the two
+    /// sysfs nodes typically exists.
+    pub fn has_nested_kvm(self) -> bool {
+        if !matches!(self, Platform::LinuxNative) {
+            return false;
+        }
+        has_nested_kvm_at(
+            "/sys/module/kvm_intel/parameters/nested",
+            "/sys/module/kvm_amd/parameters/nested",
+        )
+    }
+
     /// Whether the microvm.nix runner can execute natively on this host.
     pub fn supports_native_runner(self) -> bool {
         matches!(self, Platform::LinuxNative)
@@ -171,6 +193,29 @@ impl Platform {
     }
 }
 
+/// Pure probe of two candidate sysfs paths for nested-KVM. Lifted
+/// out of [`Platform::has_nested_kvm`] so unit tests can drive it
+/// with tempfile-backed paths instead of the real `/sys` tree.
+///
+/// Either path being enabled qualifies (Intel host has only the
+/// `kvm_intel` node; AMD host has only `kvm_amd`). Intel exposes the
+/// flag as `Y` / `N`; AMD as `1` / `0`. We accept either truthy
+/// glyph on either path so the helper isn't picky about which
+/// module's encoding lives where (the kernel has changed this in
+/// the past).
+fn has_nested_kvm_at(intel_path: &str, amd_path: &str) -> bool {
+    fn read_enabled(path: &str) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(s) => {
+                let trimmed = s.trim();
+                trimmed.eq_ignore_ascii_case("Y") || trimmed == "1"
+            }
+            Err(_) => false,
+        }
+    }
+    read_enabled(intel_path) || read_enabled(amd_path)
+}
+
 /// Check whether the current macOS version is 13.0 (Ventura) or later.
 /// Plan 97 §"Minimum macOS version" — Vz's full virtio surface lands
 /// here. macOS 11–12 fall back to libkrun.
@@ -285,6 +330,81 @@ mod tests {
         let a = current();
         let b = current();
         assert_eq!(a, b);
+    }
+
+    // ── Plan 105 W1 — has_nested_kvm_at ──────────────────────────
+
+    fn write_sysfs(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn nested_kvm_intel_y_enabled() {
+        let scratch = tempfile::tempdir().unwrap();
+        let intel = write_sysfs(scratch.path(), "intel-nested", "Y\n");
+        let amd_missing = scratch.path().join("amd-nested-missing");
+        assert!(has_nested_kvm_at(
+            intel.to_str().unwrap(),
+            amd_missing.to_str().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn nested_kvm_amd_1_enabled() {
+        let scratch = tempfile::tempdir().unwrap();
+        let intel_missing = scratch.path().join("intel-nested-missing");
+        let amd = write_sysfs(scratch.path(), "amd-nested", "1\n");
+        assert!(has_nested_kvm_at(
+            intel_missing.to_str().unwrap(),
+            amd.to_str().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn nested_kvm_intel_n_disabled() {
+        let scratch = tempfile::tempdir().unwrap();
+        let intel = write_sysfs(scratch.path(), "intel-nested", "N\n");
+        let amd_missing = scratch.path().join("amd-nested-missing");
+        assert!(!has_nested_kvm_at(
+            intel.to_str().unwrap(),
+            amd_missing.to_str().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn nested_kvm_amd_0_disabled() {
+        let scratch = tempfile::tempdir().unwrap();
+        let intel_missing = scratch.path().join("intel-nested-missing");
+        let amd = write_sysfs(scratch.path(), "amd-nested", "0\n");
+        assert!(!has_nested_kvm_at(
+            intel_missing.to_str().unwrap(),
+            amd.to_str().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn nested_kvm_both_missing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let intel = scratch.path().join("intel-nested-missing");
+        let amd = scratch.path().join("amd-nested-missing");
+        assert!(!has_nested_kvm_at(
+            intel.to_str().unwrap(),
+            amd.to_str().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn nested_kvm_lowercase_y_accepted() {
+        // Defence in depth — `eq_ignore_ascii_case` accepts `y` too.
+        let scratch = tempfile::tempdir().unwrap();
+        let intel = write_sysfs(scratch.path(), "intel-nested", "y");
+        let amd_missing = scratch.path().join("amd-nested-missing");
+        assert!(has_nested_kvm_at(
+            intel.to_str().unwrap(),
+            amd_missing.to_str().unwrap(),
+        ));
     }
 
     #[test]

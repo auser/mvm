@@ -259,6 +259,7 @@ Recent maintenance:
 - [x] Plan 85 Phase E Claim 10 preview: OCI pulls now persist a provenance JSON sidecar with registry, repo, supplied reference, resolved digest, layer digest list, trust policy, and verification status; `mvmctl run --image` admits a signed plan before launch and writes `plan.oci_provenance` into the audit chain.
 - [x] Plan 85 Phase F Claim 10 ship gate: `--prod` OCI pulls and `run --image --prod` now require a digest-pinned reference plus an OCI policy (`MVM_OCI_POLICY` or `$MVM_DATA_DIR/oci-policy.toml`) with allowed registries and trusted cosign keyless identities; the resolved digest is verified with `cosign verify` before cache admission or boot, and missing, invalid, denied, or signature-disabled policies fail closed.
 - [x] Plan 85 Phase G registry auth foundation: `mvm-oci` now accepts explicit bearer/basic registry credentials without reading Docker config or shelling out to credential helpers; `mvmctl image pull` and `run --image` resolve bearer tokens from `MVM_OCI_BEARER_TOKEN_<HOST>` or `MVM_OCI_BEARER_TOKEN`, pass them through secret-carrying types, and audit only the credential source name.
+- [x] CI follow-up (2026-05-27): fixed the Plan 100 W1 prep `mvm-cli` compile regression by routing the new `nested-kvm` doctor probe through a local helper that degrades cleanly when the `builder-vm` feature is off, so `default-features = false`/packaging builds no longer reference `mvm_build::builder_backend_select`.
 - [x] Hardened builder-VM reliability follow-ups from GitHub triage: Stage 0 seed selection now skips cached dev rootfs images that lack `/sbin/mvm-builder-init`, source-built builder VM artifacts must contain that init before promotion, cached builder images fail fast when `cmdline.txt` is missing, libkrun supervisor waits have a bounded `MVM_BUILDER_VM_TIMEOUT_SECS` escape hatch, and flake builds now carry the Nix store-path hash through `/job/store-path` for stable `revision_hash` reuse.
 - [x] Resolved spec-number collisions across `specs/plans/` and `specs/adrs/` by renumbering duplicate-prefixed files, updating references, and adding `cargo xtask check-spec-numbers` to CI so future duplicate Plan/ADR prefixes fail before merge.
 - [x] Shortened top-level `mvmctl --help` command summaries and added a regression test keeping each summary to 72 characters or less.
@@ -2155,9 +2156,18 @@ Two structural gaps in the current trust story:
 1. Linux host's userland is in the TCB; macOS host's isn't (asymmetric trust). The same `mvmctl` should give the same claim posture on both. See [ADR-057](adrs/057-symmetric-builder-vm.md).
 2. RW tenant volumes are plaintext while mounted; gateway traffic is unaudited. A compromised host can read tenant data and exfil silently — both invisible to the audit chain. Plan 63 / ADR-042 cover host-side snapshot crypto + secret store, but not the in-use mount surface. See [ADR-058](adrs/058-claim-10-bytes-leaving-trust-boundary.md).
 
-### W1 — Symmetric builder VM  🟡 proposed
+### W1 — Symmetric builder VM  🟡 in flight  [`plans/105-plan-100-w1-linux-builder-vm.md`](plans/105-plan-100-w1-linux-builder-vm.md)
 
 See [Plan 100](plans/100-symmetric-builder-vm-rollout.md). Lifts claim 1 ("no host-fs access from a guest") to true-on-both-OSes via identical builder-VM TCB. Retires the direct-Firecracker-on-Linux path.
+
+Plan 100 W1 — implementation tracker (Plan 105). First slice: env-gated `MVM_LINUX_BUILDER_VM=1` dispatch + `has_nested_kvm()` predicate + `mvmctl doctor` `nested-kvm` line. Opt-in only; default unchanged. The default flip + direct-Firecracker retirement is W6.
+
+- [ ] **W0** — feasibility prototype (off-branch, throw-away): measure cold-start latency on a Linux + nested-KVM host. Numbers feed into the W1 PR body.
+- [x] **W1** — `MVM_LINUX_BUILDER_VM` env-gate in `crates/mvm-build/src/builder_backend_select.rs` + `Platform::has_nested_kvm()` predicate + hermetic unit tests. Shipped in PR #479.
+- [x] **W3-doctor** — `mvmctl doctor` reports nested-KVM availability + extends the Plan 98 `builder backend` line with the `MVM_LINUX_BUILDER_VM` source. Bundled with W1 prep (PR #479).
+- [x] **W2** — Linux Nix image build validation. Paths-gated `builder-vm-image-linux` lane in `ci.yml` builds the builder-vm flake on Ubuntu and asserts the four output artifacts land on disk. Bundled with W1 prep PR (#479).
+- [ ] **W6 dispatch flip** — brainstorm in [Plan 106](plans/106-plan-100-w6-dispatch-flip.md) (decision locked 2026-05-27 on Approach A: shared libkrun host VM, Firecracker per workload). Executable phases A1–A6 tracked in [Plan 107](plans/107-plan-100-w6-approach-a.md).
+- [ ] **W4 / W5 / W7 / W8** — gated on Plan 107 A4 landing.
 
 ### W2 — Volume confidentiality (claim 10 leg 1)  🟡 proposed
 
@@ -2221,6 +2231,7 @@ Today secrets reach microVMs by mounting a sealed ext4 drive at `/mnt/secrets` a
 
 - [ ] **W1 — Four-subprocess infrastructure substrate** (envelope, registry, two vsock listeners per VM — port 5300 general + port 5301 secrets; four new crates: `mvm-broker`, `mvm-secrets-dispatcher`, `mvm-host-signer`, `mvm-audit-signer`; supervisor subprocess lifecycle for all four; UDS proxy code paths; cosign-verify + TOCTOU-resistant exec + config-signing per subprocess; per-workload cgroup + namespace isolation; resource caps; binary hardening; doctor host-posture checks; KSM/THP off; `fido_touch_required()` stub on `mvmctl up --prod`)
 - [x] W1b.2a CI follow-up (2026-05-27): documented all four broker subprocess bins as architecture-invariant substrate allowlist entries, and hardened the oversized-frame broker server test to accept either EOF or `ECONNRESET` on rejection.
+- [x] W1a CI follow-up (2026-05-27): documented `mvm-broker` as an explicit architecture-invariant substrate allowlist entry, and hardened the oversized-frame server test to accept either EOF or `ECONNRESET` on rejection.
 - [ ] **W2 — `ExecutionPlan.services` + admission wiring + audit-signer wiring** (schema bump 4→5; registry assembly; `EventCategory::ServiceCall` routed through `mvm-audit-signer`; `O_APPEND` audit FD + dir-immutable; chain-head persistence; at-rest encryption; time-source integrity; rate-limit / lifetime-quota / circuit-breaker; session-key rotation; operator-action audit entries)
 - [ ] **W3 — `host.time.v1`** (handler in `mvm-broker` + `broker.v1/list_services` + delete `HostBoundRequest::QueryHostTime`)
 - [ ] **W4a — `host.cost.v1` workload-scope** (handler in `mvm-broker`; no mvmd dep)
