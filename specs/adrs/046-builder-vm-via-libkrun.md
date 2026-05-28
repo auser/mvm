@@ -9,13 +9,6 @@ related: ADR-013 (libkrun + libkrun pivot); ADR-002 (security posture); plan 57 
 
 Proposed. Implementation sequenced in `specs/plans/72-builder-vm-via-libkrun.md`. This ADR replaces the **builder VM** half of ADR-013, leaving the runtime backend selection unchanged.
 
-> Update 2026-05-27: ADR-060 supersedes this document's
-> "Two artifact layers, two acquisition paths" section. ADR-046 still
-> owns the builder-VM transport, launcher, and distribution contract;
-> ADR-060 changes the higher-level artifact model from "builder image +
-> separate dev image" to "one canonical builder image with interactive
-> and non-interactive modes."
-
 ## Context
 
 ADR-013 chose libkrun for two distinct jobs:
@@ -75,10 +68,6 @@ The vendoring option (fork libkrun in-tree) is on the table as a fallback if the
 The builder VM moves to a direct libkrun (macOS Apple Silicon / Intel) and Firecracker (Linux) launcher. libkrun is removed from the build-time dependency closure once plan 72 ships.
 
 ### Two artifact layers, two acquisition paths
-
-> Historical note: this section records the Plan 72 artifact model and
-> remains here for implementation context. ADR-060 supersedes it as the
-> forward-looking product decision.
 
 mvm builds and launches **two different VM images**, and they have different lifecycles:
 
