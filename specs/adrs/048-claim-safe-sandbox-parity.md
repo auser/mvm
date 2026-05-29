@@ -41,7 +41,7 @@ This ADR records the claims we want to make and the runtime primitives `mvm` mus
 1. **Claims hygiene:** public docs clearly distinguish Shipped, Preview, Planned, and Not claimed.
 2. **OCI ingest:** users can run digest-pinned OCI images in microVMs without Docker as the runtime.
 3. **Programmable network policy:** deny-by-default egress with DNS pinning, SNI/Host enforcement, metadata endpoint protection, and audit.
-4. **Secrets do not enter guests by default:** workloads receive opaque placeholders; real secret values are substituted only by trusted host-side policy for approved destinations.
+4. **Secrets do not enter guests by default:** workloads receive opaque placeholders; real secret values are released only by trusted host-side policy for approved destinations, and only on host-mediated outbound surfaces. Guest HTTPS CONNECT egress is not a request-time substitution path.
 5. **SDK-owned lifecycle:** Python/TypeScript/Rust SDKs can create, exec, inspect, snapshot, and stop sandboxes with cleanup bound to the parent process.
 6. **Measured cold-start story:** published latency numbers are produced by a reproducible harness and split by fresh boot, guest-agent-ready, snapshot restore, and warm-pool claim.
 7. **Extensible filesystem backends:** local, encrypted, object-store-backed, and in-memory filesystem substrates share one contract and state which backends are mountable versus API-only.

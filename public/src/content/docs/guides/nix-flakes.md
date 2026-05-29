@@ -281,7 +281,13 @@ These map to `packages.${system}.<profile>` in the flake.
 
 ## Running an LLM agent inside a microVM
 
-A worked example: a microVM that boots `claude-code` (or any other agent binary) and reads its API key from a host-injected secret. You write this in **your project's** flake — mvm doesn't ship a starter image to fork; you compose `mkGuest` yourself per [Building MicroVM Images](/guides/building-microvm-images).
+A worked example: a microVM that boots `claude-code` (or any other
+agent binary) and reads its API key from a file you mount into the
+guest yourself. This is a manual file-materialization path, not the
+managed-secret model. For host-mediated managed secret refs, use
+`mvm.toml` or the SDKs. You write this in **your project's** flake —
+mvm doesn't ship a starter image to fork; you compose `mkGuest`
+yourself per [Building MicroVM Images](/guides/building-microvm-images).
 
 ```nix
 # my-claude-code-vm/flake.nix
@@ -303,10 +309,10 @@ A worked example: a microVM that boots `claude-code` (or any other agent binary)
 
         entrypoint.command = [ "${pkgs.claude-code}/bin/claude" "code" ];
 
-        # Anthropic API key delivered via secrets — never enters the
-        # rootfs at build time. Phase 6 wires the secret-injection
-        # path; today the field is metadata that mvmctl reads.
-        # secrets.anthropic-api-key = "/run/mvm-secrets/claude-code/api-key";
+        # If you choose to mount a credentials file manually, keep it
+        # out of the rootfs and point the app at the mounted path.
+        # Managed secret refs are declared through mvm.toml / SDKs,
+        # not through this flake-only example.
 
         # Defense in depth: the workload is rootless by default in
         # prod (uid 1000); per-service seccomp tier lands in Phase 6.
@@ -325,8 +331,13 @@ cd my-claude-code-vm
 mvmctl build
 mvmctl up \
   --add-dir "$PWD:/workspace:rw" \
-  --secret-file "$HOME/.config/mvm/secrets/anthropic:claude-code/anthropic-api-key"
+  --volume "$HOME/.config/mvm/secrets:/mnt/secrets"
 ```
+
+Inside the guest, your workload can read the file you mounted under
+`/mnt/secrets`. If you do not want the guest to ever see the raw
+credential, do not use this manual file-mount pattern; use managed
+secret refs instead.
 
 Why a microVM and not a process sandbox: process sandboxes share the host kernel and trust it. A microVM gives the agent its own kernel, so a kernel exploit can't pivot to the host.
 

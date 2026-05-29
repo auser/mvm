@@ -42,7 +42,6 @@ The intentionally kept top-level command families are:
 | `mvmctl up --network-preset <preset>` | Network egress policy: `unrestricted` (default), `none`, `registries`, `dev`, `agent` (LLM-inference + GitHub bundle — see [ADR-004](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/004-hypervisor-egress-policy.md)) |
 | `mvmctl up --network-allow host:port` | Allow egress to specific host:port (repeatable, mutually exclusive with preset) |
 | `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard` (default), `network`, `unrestricted`. The selected tier is enforced through the guest `seccomp.json` manifest and recorded in the signed admission profile for audit. |
-| `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |
 | `mvmctl up --network <name>` | Named dev network to attach VM to (default: "default") |
 | `mvmctl down [name]` | Stop VMs by name, or all if omitted |
 | `mvmctl ls` | List running VMs (aliases: `ps`, `status`) |

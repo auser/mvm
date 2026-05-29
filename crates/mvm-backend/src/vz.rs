@@ -163,8 +163,10 @@ impl VmBackend for VzBackend {
         let gvproxy_info = host_gvproxy::spawn_detached(&state_dir)
             .map_err(|e| anyhow!("spawn host-side gvproxy for Vz VM '{}': {e}", config.name))?;
 
-        // Vz config build.
-        let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info);
+        // Vz config build. The `?` propagates allowlist failures from
+        // `audit_substrate::compute_audit_substrate` (unsafe tenant_id
+        // / vm_name) — see Plan 112 Phase 3c.
+        let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info)?;
         let pid_file = state_dir.join(PID_FILE_NAME);
         // Stale-PID-file cleanup from a previous crashed supervisor so
         // the wait-loop below detects the *new* one unambiguously.
@@ -535,7 +537,7 @@ impl VzBackend {
             state_dir: state_dir.clone(),
         };
 
-        let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info);
+        let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info)?;
         let pid_file = state_dir.join(PID_FILE_NAME);
         let _ = std::fs::remove_file(&pid_file);
 
@@ -846,12 +848,33 @@ fn events_ingest_socket_path(vm_name: &str) -> String {
 /// dev-shell image are mapped. gvproxy networking, the runtime
 /// overlay, dm-verity sidecar, and port forwarding all land in
 /// follow-up slices when their host-side plumbing is in place.
+///
+/// Plan 112 Phase 3c — pre-flight: when the producer threaded an
+/// AdmittedPlan in (`VmStartConfig.tenant_id` Some), run the
+/// DNS-label allowlist through `audit_substrate::compute_audit_substrate`
+/// so an unsafe tenant/vm_name fails fast before Swift spawn. The
+/// **Vz consumer side** for the audit chain (a Rust drainer that
+/// binds `events_ingest_socket_path` and emits to the chain) is a
+/// follow-up plan after Phase 3c — until then, the substrate's
+/// path values are computed but not threaded into
+/// `vz::SupervisorConfig` (which would also require lockstep Swift
+/// `Config.swift` decoder updates per the schema deny-unknown-fields
+/// contract). The Swift bridge already writes flow events to
+/// `events_ingest_socket_path` (PR #487 commit 7); the drainer
+/// closes the loop.
 fn build_supervisor_config(
     config: &VmStartConfig,
     kernel: &str,
     state_dir: &Path,
     gvproxy: &host_gvproxy::HostGvproxyInfo,
-) -> vz::SupervisorConfig {
+) -> Result<vz::SupervisorConfig> {
+    // Plan 112 Phase 3c — defense-in-depth validation. The resolved
+    // AuditSubstrate isn't yet threaded into vz::SupervisorConfig
+    // (Vz drainer is a follow-up), but the tenant_id / vm_name
+    // allowlist check fires here so an unsafe value never reaches
+    // the Swift supervisor.
+    let _substrate =
+        crate::audit_substrate::compute_audit_substrate(&config.name, config.tenant_id.as_deref())?;
     let state_dir_str = state_dir.to_string_lossy().into_owned();
     let vsock_dir = state_dir.join("vsock").to_string_lossy().into_owned();
     let console_log = state_dir.join("console.log").to_string_lossy().into_owned();
@@ -866,7 +889,7 @@ fn build_supervisor_config(
         read_only: true,
     }];
 
-    vz::SupervisorConfig {
+    Ok(vz::SupervisorConfig {
         name: config.name.clone(),
         vm_state_dir: state_dir_str,
         pid_file_name: Some(PID_FILE_NAME.to_string()),
@@ -917,7 +940,7 @@ fn build_supervisor_config(
         // boot path; the restore path constructs its own config in
         // `build_restore_supervisor_config` below.
         startup_mode: vz::StartupMode::Boot,
-    }
+    })
 }
 
 /// Resolve the absolute path to the `mvm-vz-supervisor` binary,
@@ -1183,7 +1206,8 @@ mod tests {
             socket_path: state_dir.join("gvproxy.sock"),
             pid: 0,
         };
-        let built = build_supervisor_config(&cfg, "/abs/vmlinux", state_dir, &gvproxy_info);
+        let built =
+            build_supervisor_config(&cfg, "/abs/vmlinux", state_dir, &gvproxy_info).expect("build");
 
         assert_eq!(built.name, "smoke");
         assert_eq!(built.kernel.path, "/abs/vmlinux");
@@ -1223,6 +1247,36 @@ mod tests {
             }
             None => panic!("network should be Some(Gvproxy {{ .. }}) after W6.A.5"),
         }
+    }
+
+    #[test]
+    fn build_supervisor_config_refuses_unsafe_tenant() {
+        // Plan 112 Phase 3c — defense-in-depth: an unsafe tenant_id
+        // (DNS-label allowlist violation) is refused inside
+        // build_supervisor_config before any Swift spawn or file
+        // touch. Same posture as libkrun's
+        // build_supervisor_config_refuses_unsafe_tenant.
+        let cfg = VmStartConfig {
+            name: "smoke".into(),
+            cpus: 1,
+            memory_mib: 256,
+            kernel_path: Some("/abs/vmlinux".into()),
+            rootfs_path: "/abs/rootfs.ext4".into(),
+            tenant_id: Some("../escape".into()),
+            ..Default::default()
+        };
+        let state_dir = Path::new("/tmp/vz-tenant-refuse-state");
+        let gvproxy_info = host_gvproxy::HostGvproxyInfo {
+            socket_path: state_dir.join("gvproxy.sock"),
+            pid: 0,
+        };
+        let err = build_supervisor_config(&cfg, "/abs/vmlinux", state_dir, &gvproxy_info)
+            .expect_err("unsafe tenant must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tenant_id") || msg.contains("vm_name"),
+            "expected DNS-label rejection; got {msg}"
+        );
     }
 
     #[test]

@@ -98,6 +98,29 @@ pub struct VmStartConfig {
     pub secret_files: Vec<VmFile>,
     /// Directory containing microvm.nix runner scripts (microvm.nix backend only).
     pub runner_dir: Option<String>,
+    /// Plan 102 Phase 3c — tenant identifier from the admitted
+    /// `ExecutionPlan` (`AdmittedPlan.plan.tenant.0`). When `Some`,
+    /// the libkrun/Vz backends activate the gateway audit substrate
+    /// (bridge factory + chain-signed audit emit per ADR-058).
+    /// `None` keeps the legacy `run_supervisor` path for callers
+    /// without admission (`mvmctl dev` Stage 0 builder, session VMs,
+    /// template restore).
+    pub tenant_id: Option<String>,
+    /// Plan 102 Phase 3c — JSON-encoded `SignedExecutionPlan`
+    /// envelope. Carried as a `String` so `mvm-core` does not depend
+    /// on `mvm-plan` (avoids the `mvm-plan → mvm-libkrun → mvm-core`
+    /// cycle). **The supervisor re-verifies the signature** before
+    /// trusting any decoded field (ADR-041 §"Verification at
+    /// admission"); the host is in the TCB per ADR-002 but the
+    /// supervisor still runs Ed25519 verification. **Do not log
+    /// this value** — the envelope may carry secret bindings, env
+    /// vars, or policy refs that resolve to credentials.
+    pub plan_json: Option<String>,
+    /// Plan 102 Phase 3c — JSON-encoded `PlanArtifact` (bundle pin)
+    /// when `admitted.plan.bundle.is_some()`. `None` when the plan
+    /// has no `.mvmpkg` pin (the common case). Same "do not log"
+    /// rule as `plan_json`.
+    pub bundle_json: Option<String>,
 }
 
 /// A host:guest port mapping, backend-agnostic.
@@ -821,6 +844,12 @@ mod tests {
         assert!(config.volumes.is_empty());
         assert!(config.config_files.is_empty());
         assert!(config.secret_files.is_empty());
+        // Plan 102 Phase 3c — audit substrate fields default to None
+        // so legacy callers (no AdmittedPlan in scope) get the legacy
+        // supervisor path.
+        assert!(config.tenant_id.is_none());
+        assert!(config.plan_json.is_none());
+        assert!(config.bundle_json.is_none());
     }
 
     #[test]
