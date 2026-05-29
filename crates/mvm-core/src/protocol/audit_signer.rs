@@ -159,7 +159,7 @@ mod tests {
     fn sample_append() -> AppendEntryRequest {
         AppendEntryRequest::AppendEntry {
             request_id: "req-001".into(),
-            category: "service_call".into(),
+            category: "plan".into(),
             ts: "2026-05-27T22:30:00Z".into(),
             workload_id: "wl-001".into(),
             tenant_id: "t-001".into(),
@@ -197,7 +197,7 @@ mod tests {
         let bad = serde_json::json!({
             "verb": "delete_entry",
             "request_id": "x",
-            "category": "service_call",
+            "category": "plan",
             "ts": "2026-05-27T00:00:00Z",
             "workload_id": "wl",
             "tenant_id": "t",
@@ -213,7 +213,7 @@ mod tests {
         let bad = serde_json::json!({
             "verb": "append_entry",
             "request_id": "x",
-            "category": "service_call",
+            "category": "plan",
             "ts": "2026-05-27T00:00:00Z",
             "workload_id": "wl",
             "tenant_id": "t",

@@ -42,6 +42,7 @@
 //!   wired in W1b.2)
 
 pub mod canonical;
+pub mod category;
 pub mod chain;
 pub mod config;
 pub mod server;

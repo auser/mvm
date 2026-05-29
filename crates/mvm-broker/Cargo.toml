@@ -2,7 +2,7 @@
 name = "mvm-broker"
 version.workspace = true
 edition.workspace = true
-description = "Host services broker subprocess — hosts host.time.v1 / host.cost.v1 / broker.v1 (Plan 104 W1a; Plan 104 §H-L1.3)"
+description = "Host services broker subprocess — hosts host.time.v1 / host.cost.v1 / host.audit.v1 / broker.v1 (Plan 104; ADR-062)"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

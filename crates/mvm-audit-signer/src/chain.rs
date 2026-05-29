@@ -136,6 +136,12 @@ impl Chain {
 
     /// Append one canonical entry. Returns the new head on success.
     pub fn append(&mut self, mut entry: CanonicalEntry) -> Result<String, AuditSignerErrorCode> {
+        // Allow-list gate (ADR-062): unknown categories are rejected
+        // before any signing work happens. Keeps the chain to a known set
+        // of values so downstream tooling can rely on category meaning.
+        if !crate::category::is_allowed(&entry.category) {
+            return Err(AuditSignerErrorCode::InvalidRequest);
+        }
         // Cross-check the caller's prev_hash matches our in-memory head.
         // If a caller (the audit-signer's own RPC handler) hands us an
         // entry with prev_hash != head we treat it as drift and refuse.
@@ -210,7 +216,7 @@ mod tests {
 
     fn sample_entry(prev: String) -> CanonicalEntry {
         CanonicalEntry {
-            category: "service_call".into(),
+            category: "plan".into(),
             correlation_id: "01HCORR0000000000000000".into(),
             fields: serde_json::json!({"verb": "now"}),
             prev_hash: prev,

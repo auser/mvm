@@ -221,7 +221,7 @@ mod tests {
     fn sample_append(req_id: &str) -> AppendEntryRequest {
         AppendEntryRequest::AppendEntry {
             request_id: req_id.into(),
-            category: "service_call".into(),
+            category: "plan".into(),
             ts: "2026-05-27T22:30:00Z".into(),
             workload_id: "wl-001".into(),
             tenant_id: "t-001".into(),
@@ -304,7 +304,7 @@ mod tests {
         let bad_body = serde_json::to_vec(&serde_json::json!({
             "verb": "append_entry",
             "request_id": "bad",
-            "category": "service_call",
+            "category": "plan",
             "ts": "2026-05-27T00:00:00Z",
             "workload_id": "wl",
             "tenant_id": "t",

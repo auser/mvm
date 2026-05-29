@@ -1381,6 +1381,7 @@ mod tests {
             audit_key_total: 0,
             audit_host_total: 0,
             audit_audit_total: 0,
+            audit_workload_audit_total: 0,
         };
         let resp = AgentResponse::Metrics(snapshot);
         let json = serde_json::to_string(&resp).unwrap();
