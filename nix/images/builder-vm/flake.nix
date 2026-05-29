@@ -174,6 +174,16 @@
         iptables
         e2fsprogs
         util-linux
+        # Plan 107 A2.1 — the host VM spawns one Firecracker
+        # workload microVM per `WorkloadStart` dispatch inside
+        # itself (Approach A, ADR-057). Sourced from the pinned
+        # nixpkgs above — an upstream Nix package, never an
+        # mvm-published prebuilt (ADR-046 source-checkout rule).
+        # mkGuest's symlink loop also lands it at /sbin/firecracker
+        # and /usr/local/bin/firecracker; the `extraFiles` entry
+        # below pins the exact /usr/bin/firecracker path the guest
+        # hardcodes (`FirecrackerVmm` in mvm-host-vm-init).
+        firecracker
         (pinnedCryptsetupFor pkgs) # provides pinned veritysetup
         # Plan 73 Followup B.2 — app-deps install pipeline.
         uv
@@ -302,6 +312,14 @@
             # production build.
             "/sbin/mvm-egress-proxy" =
               "${egressProxy}/bin/mvm-egress-proxy";
+            # Plan 107 A2.1 — pin the exact path the guest's
+            # `FirecrackerVmm` spawns (`/usr/bin/firecracker`).
+            # `firecracker` is also in `packages` above (for the
+            # full closure + the /sbin + /usr/local/bin symlinks
+            # mkGuest adds); this entry guarantees the canonical
+            # /usr/bin path regardless of mkGuest's symlink targets.
+            "/usr/bin/firecracker" =
+              "${pkgs.firecracker}/bin/firecracker";
           };
         };
 
