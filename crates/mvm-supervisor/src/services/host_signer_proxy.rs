@@ -63,19 +63,6 @@ impl HostSignerProxy {
         self.send(&req).await
     }
 
-    /// Sign a JCS-canonical credential bytes for the secrets dispatcher.
-    pub async fn sign_credential(
-        &self,
-        bytes: Vec<u8>,
-        request_id: impl Into<String>,
-    ) -> Result<Result<SignOk, SignErr>, ProxyError> {
-        let req = SignRequest::SignCredential {
-            bytes,
-            request_id: request_id.into(),
-        };
-        self.send(&req).await
-    }
-
     async fn send(&self, req: &SignRequest) -> Result<Result<SignOk, SignErr>, ProxyError> {
         let mut stream = connect(&self.uds_path).await?;
         write_frame(&mut stream, &self.uds_path, req).await?;
@@ -176,33 +163,6 @@ mod tests {
         let captured_req = captured.lock().await.clone().expect("mock must capture");
         assert!(matches!(captured_req, SignRequest::SignPlan { .. }));
         assert_eq!(captured_req.request_id(), "req-001");
-        mock.abort();
-    }
-
-    #[tokio::test]
-    async fn sign_credential_dispatches_with_correct_verb() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("host-signer.sock");
-
-        let response = SignResponse::Ok {
-            request_id: "req-cred".into(),
-            sig_alg: SIG_ALG_ED25519,
-            signature: vec![0u8; 64],
-            signer_pubkey: vec![1u8; 32],
-        };
-        let captured = Arc::new(Mutex::new(None));
-        let mock = spawn_mock(path.clone(), response, captured.clone()).await;
-        tokio::task::yield_now().await;
-
-        let proxy = HostSignerProxy::new(&path);
-        proxy
-            .sign_credential(b"jcs-cred".to_vec(), "req-cred")
-            .await
-            .expect("transport must succeed")
-            .expect("subprocess must respond Ok");
-
-        let captured_req = captured.lock().await.clone().expect("mock must capture");
-        assert!(matches!(captured_req, SignRequest::SignCredential { .. }));
         mock.abort();
     }
 

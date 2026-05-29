@@ -83,7 +83,6 @@ fn dispatch(req: &SignRequest, keystore: &SharedKeystore) -> SignResponse {
     let request_id = req.request_id().to_string();
     let bytes_to_sign: &[u8] = match req {
         SignRequest::SignPlan { bytes, .. } => bytes,
-        SignRequest::SignCredential { bytes, .. } => bytes,
     };
     let result = keystore.sign(bytes_to_sign);
     SignResponse::Ok {
@@ -243,33 +242,6 @@ mod tests {
             }
             other => panic!("expected Ok response, got {:?}", other),
         }
-
-        server_task.abort();
-    }
-
-    #[tokio::test]
-    async fn sign_credential_round_trips_with_distinct_request_id_echo() {
-        let dir = tempdir().unwrap();
-        let path = uds_path(&dir);
-        let listener = UnixListener::bind(&path).unwrap();
-        let keystore = Arc::new(Keystore::generate());
-
-        let server_task = tokio::spawn({
-            let keystore = keystore.clone();
-            async move {
-                let _ = serve_on_listener(listener, keystore, "wl-test".into(), 65_536).await;
-            }
-        });
-        tokio::task::yield_now().await;
-
-        let mut client = ClientStream::connect(&path).await.unwrap();
-        let req = SignRequest::SignCredential {
-            bytes: b"jcs-cred".to_vec(),
-            request_id: "req-cred-42".into(),
-        };
-        write_req(&mut client, &req).await.unwrap();
-        let resp = read_resp(&mut client).await.unwrap();
-        assert_eq!(resp.request_id(), "req-cred-42");
 
         server_task.abort();
     }

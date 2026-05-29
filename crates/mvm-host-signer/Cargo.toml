@@ -11,12 +11,12 @@ authors.workspace = true
 [package.metadata.mvm.architecture]
 substrate_server_category = "per-workload broker subprocess substrate"
 
-# One of the four per-VM subprocesses (mvm-broker, mvm-secrets-dispatcher,
-# mvm-host-signer, mvm-audit-signer). Runs at uid 904. **Sole holder of
-# the host signer key** — the key never enters the supervisor's address
-# space (Plan 104 §H-L1.1). The supervisor delegates plan signing and
-# secrets dispatcher's credential signing to this subprocess over a
-# per-VM UDS.
+# One of the three per-VM subprocesses (mvm-broker, mvm-host-signer,
+# mvm-audit-signer; ADR-062 dropped mvm-secrets-dispatcher). Runs at
+# uid 904. **Sole holder of the host signer key** — the key never
+# enters the supervisor's address space (Plan 104 §H-L1.1). The
+# supervisor delegates plan signing to this subprocess over a per-VM
+# UDS.
 #
 # W1b.1 ships a software in-memory key path (generated at subprocess
 # boot from `OsRng`). The hardware-enclave path (Apple Secure Enclave

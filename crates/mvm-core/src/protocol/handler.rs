@@ -2,18 +2,19 @@
 //! slice).
 //!
 //! Handlers live inside the per-service subprocess (`mvm-broker` for
-//! `host.time.v1` / `host.cost.v1` / `broker.v1`; `mvm-secrets-dispatcher`
-//! for `host.secrets.v1`). The trait is defined in `mvm-core` so each
-//! subprocess can implement it without depending on the others'
-//! runtime crates. The supervisor's UDS proxies invoke handlers across
-//! the process boundary via the [`crate::protocol::broker::ServiceCall`]
-//! envelope; in-process composition (Plan 104 §A5) uses
-//! [`ServiceCallCtx::invoke`] for handler-to-handler calls inside the
-//! same subprocess.
+//! `host.time.v1` / `host.cost.v1` / `host.audit.v1` / `broker.v1`;
+//! ADR-062 dropped the secrets dispatcher). The trait is defined in
+//! `mvm-core` so each subprocess can implement it without depending on
+//! the others' runtime crates. The supervisor's UDS proxies invoke
+//! handlers across the process boundary via the
+//! [`crate::protocol::broker::ServiceCall`] envelope; in-process
+//! composition (Plan 104 §A5) uses [`ServiceCallCtx::invoke`] for
+//! handler-to-handler calls inside the same subprocess.
 //!
-//! See ADR-061 §"Decision" for the four-subprocess architecture this
-//! trait carves the seam for, and Plan 104 §"Capability gating" for
-//! which gates run on the supervisor side vs in the handler subprocess.
+//! See ADR-061 §"Decision" + ADR-062 for the three-subprocess
+//! architecture this trait carves the seam for, and Plan 104
+//! §"Capability gating" for which gates run on the supervisor side vs
+//! in the handler subprocess.
 
 use std::time::Duration;
 

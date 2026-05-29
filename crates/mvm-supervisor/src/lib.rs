@@ -68,11 +68,12 @@ pub mod policy_tool_gate;
 pub mod proxy;
 pub mod reaper;
 pub mod secrets_scanner;
-// Plan 104 W1b.2a — supervisor-side UDS proxy clients for the four
-// broker subprocesses (mvm-broker, mvm-secrets-dispatcher,
-// mvm-host-signer, mvm-audit-signer). Stateless client libraries that
-// open a fresh UDS connection per call; pooling + per-spawn response-
-// signature verification + retry-on-restart land in W1b.2b.
+// Plan 104 W1b.2a — supervisor-side UDS proxy clients for the three
+// broker subprocesses (mvm-broker, mvm-host-signer,
+// mvm-audit-signer; ADR-062 dropped mvm-secrets-dispatcher).
+// Stateless client libraries that open a fresh UDS connection per
+// call; pooling + per-spawn response-signature verification +
+// retry-on-restart land in W1b.2b.
 pub mod services;
 pub mod ssrf_guard;
 pub mod state;

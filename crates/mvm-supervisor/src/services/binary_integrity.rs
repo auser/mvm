@@ -264,9 +264,9 @@ impl IntegrityChecker for SignedBinaryChecker {
 
         // mmap-read the binary. `memmap2` would be the more efficient
         // path; W1b.2b.2 stays dep-light and reads the full file into
-        // memory. mvm-broker / mvm-secrets-dispatcher / mvm-host-signer
-        // / mvm-audit-signer binaries are all small (single-digit MB),
-        // so the read is cheap relative to the spawn cost.
+        // memory. mvm-broker / mvm-host-signer / mvm-audit-signer
+        // binaries are all small (single-digit MB), so the read is
+        // cheap relative to the spawn cost.
         let file_bytes = std::fs::read(binary).map_err(|source| IntegrityError::OpenBinary {
             binary: binary.to_path_buf(),
             source,
