@@ -139,22 +139,32 @@ prompt; live-KVM smoke (cold) green.
 Goal: the host VM can spawn a Firecracker workload microVM inside
 itself on dispatch.
 
-- [ ] **A2.1** Bake Firecracker into the builder-vm rootfs
+- [x] **A2.1** Bake Firecracker into the builder-vm rootfs
       (`nix/images/builder-vm/`). Today the rootfs contains
       busybox + Nix + build tools; W6 adds the Firecracker binary
       from a verified upstream (Nix-checksummed per ADR-046's
       "source-checkout builds never depend on mvm-published
-      artifacts" rule).
-- [ ] **A2.2** Guest-side: `mvm-host-vm-init`'s `WorkloadStart`
-      arm spawns Firecracker with the workload's kernel + rootfs +
-      virtio config (passed in the request payload). The payload
-      shape mirrors `BuildVmPlan` from Plan 98 — kernel path,
-      rootfs path, vsock socket dir, vcpus, memory, kernel cmdline
-      extras.
-- [ ] **A2.3** Per-workload state dir inside the host VM:
-      `/var/lib/mvm/workloads/<workload_id>/` for Firecracker
-      sockets, PID files, console logs. Cleaned up on
-      `WorkloadStop`.
+      artifacts" rule). Shipped: `firecracker` added to
+      `builderPackages` + an `extraFiles` symlink pins the exact
+      `/usr/bin/firecracker` path the guest spawns.
+- [x] **A2.2** Guest-side: `mvm-host-vm-init`'s `WorkloadStart`
+      arm spawns a workload microVM with the workload's kernel +
+      rootfs + virtio config (passed in the request payload). The
+      payload carries kernel path, rootfs path, vsock socket dir,
+      vcpus, memory, kernel cmdline extras (generic microVM
+      concepts, not Firecracker-shaped). **No VMM lock-in**: a
+      `WorkloadVmm` trait (`workload.rs`) isolates the config-file
+      format / binary / argv; `FirecrackerVmm` is the only
+      Firecracker-aware type, so a second backend is a pure
+      addition. `WorkloadFailed` added to the response enum as the
+      fail-closed negative path. Spawns via `firecracker
+      --config-file …`.
+- [x] **A2.3** Per-workload state dir inside the host VM:
+      `/var/lib/mvm/workloads/<workload_id>/` holding `config.json`,
+      `fc.pid`, `fc.stdout.log`, `fc.stderr.log`, and the `v.sock`
+      vsock UDS. Collision-detecting create (fail-closed on a
+      duplicate id), `Drop` cleanup so a panic mid-spawn doesn't
+      leak, explicit cleanup on `WorkloadStop`.
 - [ ] **A2.4** Live smoke on a Linux + nested-KVM CI runner
       (Ubuntu, nested KVM enabled by default on GHA): send
       `WorkloadStart` to the host VM, assert Firecracker boots
