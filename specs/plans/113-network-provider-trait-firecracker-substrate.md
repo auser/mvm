@@ -911,17 +911,9 @@ mod tests {
         }
     }
 
-    fn metrics() -> Arc<FlowCountMetrics> {
-        // SAFETY: tenant env var read at construction. Tests that share
-        // the env var must serialize; this test uses a unique value.
-        unsafe { std::env::set_var("MVM_TENANT", "test-tenant") };
-        let obs = FlowCountMetrics::new();
-        // Downcast Arc<dyn Observer> -> Arc<FlowCountMetrics> for test
-        // introspection. We know the concrete type because we just
-        // constructed it.
-        Arc::clone(&obs)
-            .into_any_arc_unchecked()
-    }
+    // Tests construct FlowCountMetrics directly via struct literal so
+    // they have access to the concrete fields; FlowCountMetrics::new()
+    // returns Arc<dyn Observer> which doesn't expose internals.
 
     #[test]
     fn opened_counter_increments() {
@@ -987,13 +979,6 @@ mod tests {
         assert!(!req.payload_tap);
     }
 }
-```
-
-Note: the `into_any_arc_unchecked` call in the test helper is a placeholder pattern that won't compile. **Remove that test helper** and the `metrics()` function; the other four tests don't need it (they construct the struct directly). Replace the `metrics()` helper with:
-
-```rust
-// (no helper needed — tests construct FlowCountMetrics directly with
-// the concrete struct fields)
 ```
 
 - [ ] **Step 2: Run tests**
@@ -1179,6 +1164,7 @@ async fn signer_task_fans_out_to_observers_before_signing() {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc};
+    use tokio::task::LocalSet;
 
     struct CountObs(AtomicU32);
     impl Observer for CountObs {
@@ -1209,46 +1195,54 @@ async fn signer_task_fans_out_to_observers_before_signing() {
         }
     }
 
-    let (tx, rx) = mpsc::channel::<FlowEvent>(8);
-    let (broadcast_tx, _broadcast_rx) = broadcast::channel::<String>(8);
+    // signer_task uses spawn_local in production (LocalSet runtime);
+    // mirror that here so the test exercises the same shape.
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let (tx, rx) = mpsc::channel::<FlowEvent>(8);
+            let (broadcast_tx, _broadcast_rx) = broadcast::channel::<String>(8);
 
-    let count = Arc::new(CountObs(AtomicU32::new(0)));
-    let signer = Arc::new(CountingSigner(AtomicU32::new(0)));
-    let observers: Vec<Arc<dyn Observer>> = vec![
-        count.clone() as Arc<dyn Observer>,
-        Arc::new(PanicObs) as Arc<dyn Observer>,
-    ];
+            let count = Arc::new(CountObs(AtomicU32::new(0)));
+            let signer = Arc::new(CountingSigner(AtomicU32::new(0)));
+            let observers: Vec<Arc<dyn Observer>> = vec![
+                count.clone() as Arc<dyn Observer>,
+                Arc::new(PanicObs) as Arc<dyn Observer>,
+            ];
 
-    let task = tokio::task::spawn_local(signer_task(
-        rx,
-        Arc::new(test_plan()),
-        None,
-        signer.clone() as Arc<dyn AuditSigner>,
-        broadcast_tx,
-        observers,
-    ));
+            let task = tokio::task::spawn_local(signer_task(
+                rx,
+                Arc::new(test_plan()),
+                None,
+                signer.clone() as Arc<dyn AuditSigner>,
+                broadcast_tx,
+                observers,
+            ));
 
-    tx.send(FlowEvent {
-        flow_id: "f1".into(),
-        direction: FlowDirection::Egress,
-        kind: FlowEventKind::Opened,
-    })
-    .await
-    .unwrap();
-    tx.send(FlowEvent {
-        flow_id: "f1".into(),
-        direction: FlowDirection::Egress,
-        kind: FlowEventKind::Closed { reason: FlowCloseReason::Eof },
-    })
-    .await
-    .unwrap();
-    drop(tx);
-    task.await.unwrap();
+            tx.send(FlowEvent {
+                flow_id: "f1".into(),
+                direction: FlowDirection::Egress,
+                kind: FlowEventKind::Opened,
+            })
+            .await
+            .unwrap();
+            tx.send(FlowEvent {
+                flow_id: "f1".into(),
+                direction: FlowDirection::Egress,
+                kind: FlowEventKind::Closed { reason: FlowCloseReason::Eof },
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            task.await.unwrap();
 
-    // Observer was called twice (open + close), even though the
-    // PanicObs panicked on both events. Signer was called twice too.
-    assert_eq!(count.0.load(Ordering::SeqCst), 2);
-    assert_eq!(signer.0.load(Ordering::SeqCst), 2);
+            // Observer was called twice (open + close), even though
+            // PanicObs panicked on both events. Signer was called
+            // twice too — chain integrity preserved.
+            assert_eq!(count.0.load(Ordering::SeqCst), 2);
+            assert_eq!(signer.0.load(Ordering::SeqCst), 2);
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -2244,21 +2238,171 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 9 — `mvm-jailer-lite` property tests (`#[ignore]`-gated)
+### Task 9 — `mvm-jailer-lite` property tests (`#[ignore]`-gated, Linux runners only)
 
-Same shape as Plan 113 v1 Task 8b. Real code is identical (independent of Path X). Skipping the verbose rewrite here — see the prior commit in the worktree's history or [Plan 113 v1 §Task 8b] for the verbatim test code (the v1 task's tests are correct and don't need revision; they construct `ConfinementSpec::firecracker_bridge` and assert seccomp denies / Landlock denies).
+**Files:**
+- Create: `crates/mvm-jailer-lite/tests/seccomp_property.rs`
+- Create: `crates/mvm-jailer-lite/tests/landlock_property.rs`
 
-If implementing fresh: copy `tests/seccomp_property.rs` and `tests/landlock_property.rs` bodies from Plan 113 v1 §Task 8b (those bodies use only the public `ConfinementSpec` + `confine_self` surface from Task 8, so no Path X changes).
+The tests fork the test binary with an env var to enter "child probe" mode where it applies confinement + attempts allowed and disallowed syscalls. CI lane `jailer-lite-property` (Task 15) runs them on Ubuntu 22.04+ with `--ignored`.
 
-- [ ] **Step 1-4**: Identical to v1 §Task 8b.
-- [ ] **Step 5: Commit**
+- [ ] **Step 1: Create `tests/seccomp_property.rs`**
+
+```rust
+//! Plan 113 / ADR-064 — seccomp property test.
+//!
+//! Parent test forks the test binary with SECCOMP_PROBE=1; child
+//! applies `ConfinementSpec::firecracker_bridge` confinement and
+//! probes one allowed syscall (clock_gettime via Instant::now) and
+//! one disallowed (mkdir). Allowed → clean exit 0. Disallowed →
+//! seccomp Trap raises SIGSYS; child process exits via signal.
+
+#![cfg(target_os = "linux")]
+
+use mvm_jailer_lite::ConfinementSpec;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, Stdio};
+
+const PROBE_ENV: &str = "SECCOMP_PROBE";
+
+#[test]
+#[ignore = "run via `cargo test --test seccomp_property -- --ignored` on Linux >= 5.19"]
+fn seccomp_allows_listed_denies_unlisted() {
+    let child_status = Command::new(std::env::current_exe().expect("current_exe"))
+        .env(PROBE_ENV, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn probe child");
+
+    // Two acceptable outcomes:
+    //   1. exit 0 — the allowed syscall succeeded AND the disallowed
+    //      syscall was blocked at the libc / VFS layer before reaching
+    //      seccomp (returned EACCES; the child path that doesn't
+    //      reach mkdir would exit 0 too).
+    //   2. signal SIGSYS — seccomp Trap fired on the disallowed
+    //      syscall.
+    let ok = child_status.success() || child_status.signal() == Some(libc::SIGSYS);
+    assert!(
+        ok,
+        "child exited unexpectedly: status={:?}, signal={:?}",
+        child_status.code(),
+        child_status.signal()
+    );
+}
+
+#[ctor::ctor]
+fn maybe_run_as_probe_child() {
+    if std::env::var(PROBE_ENV).is_ok() {
+        run_probe();
+        // Probe always exits explicitly; we never return here.
+    }
+}
+
+fn run_probe() {
+    // Create probe dirs the spec needs to bind-mount.
+    std::fs::create_dir_all("/tmp/mvm-seccomp-probe-audit").ok();
+    std::fs::create_dir_all("/tmp/mvm-seccomp-probe-keys").ok();
+    let spec = ConfinementSpec::firecracker_bridge(
+        "/tmp/mvm-seccomp-probe-audit".into(),
+        "/tmp/mvm-seccomp-probe-keys".into(),
+        "/usr/bin/passt".into(),
+    );
+    if let Err(e) = mvm_jailer_lite::confine_self(&spec) {
+        eprintln!("confine_self failed: {e}");
+        std::process::exit(2);
+    }
+
+    // Allowed: clock_gettime (via std::time::Instant)
+    let _ = std::time::Instant::now();
+
+    // Disallowed: mkdir (not in the allowlist)
+    let res = std::fs::create_dir("/tmp/mvm-seccomp-probe-disallowed");
+    // If we reach here, mkdir didn't trigger SIGSYS. That's still
+    // acceptable IF mkdir returned an error (the syscall might have
+    // been intercepted at a different layer). We accept either:
+    //   - mkdir succeeded (unexpected — the test then fails because
+    //     the disallowed syscall produced a directory)
+    //   - mkdir failed (the layer-of-block doesn't matter; the
+    //     observable effect is "mkdir is denied")
+    if res.is_ok() {
+        // Clean up the unexpectedly-created dir so the test is
+        // re-runnable, then exit nonzero so the parent assertion
+        // fails.
+        let _ = std::fs::remove_dir("/tmp/mvm-seccomp-probe-disallowed");
+        std::process::exit(2);
+    }
+    std::process::exit(0);
+}
+```
+
+Note: this uses `ctor` crate for the pre-main hook. Add to `mvm-jailer-lite/Cargo.toml`:
+
+```toml
+[dev-dependencies]
+ctor = "0.2"
+libc = { workspace = true }
+```
+
+- [ ] **Step 2: Create `tests/landlock_property.rs`**
+
+```rust
+//! Plan 113 / ADR-064 — Landlock property test.
+
+#![cfg(target_os = "linux")]
+
+use mvm_jailer_lite::ConfinementSpec;
+
+#[test]
+#[ignore = "run via `cargo test --test landlock_property -- --ignored` on Linux >= 5.19"]
+fn landlock_denies_paths_outside_ruleset() {
+    let audit_dir = "/tmp/mvm-landlock-probe-audit";
+    let keys_dir = "/tmp/mvm-landlock-probe-keys";
+    std::fs::create_dir_all(audit_dir).ok();
+    std::fs::create_dir_all(keys_dir).ok();
+
+    let spec = ConfinementSpec::firecracker_bridge(
+        audit_dir.into(),
+        keys_dir.into(),
+        "/usr/bin/passt".into(),
+    );
+    mvm_jailer_lite::confine_self(&spec).expect("confine_self");
+
+    // Allowed: write inside audit_dir
+    let ok = std::fs::write(format!("{audit_dir}/probe.log"), "ok");
+    assert!(ok.is_ok(), "audit_dir write must succeed: {ok:?}");
+
+    // Denied: write to /tmp (parent of audit_dir, not in ruleset)
+    let denied = std::fs::write("/tmp/mvm-landlock-probe-outside", "nope");
+    assert!(denied.is_err(), "writing outside ruleset must be denied");
+    let err = denied.expect_err("denied write returns error");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "expected EACCES, got {err:?}"
+    );
+}
+```
+
+- [ ] **Step 3: Commit**
 
 ```bash
-git add crates/mvm-jailer-lite/tests/
+cargo fmt --all && cargo clippy -p mvm-jailer-lite --all-targets -- -D warnings
+git add crates/mvm-jailer-lite/tests/ crates/mvm-jailer-lite/Cargo.toml
 git commit -m "test(mvm-jailer-lite): seccomp + Landlock property tests (Plan 113 §Task 9)
 
-Two #[ignore]-gated tests; CI lane jailer-lite-property (Task 13)
-runs them on Ubuntu 22.04+ runners with --ignored.
+Two #[ignore]-gated tests run under CI lane jailer-lite-property
+(Task 15) on Ubuntu 22.04+:
+
+  seccomp_allows_listed_denies_unlisted — ctor pre-main hook
+    detects SECCOMP_PROBE=1 and re-runs the child as a probe.
+    Probe applies confine_self(firecracker_bridge spec); allowed
+    syscall (clock_gettime via Instant::now) succeeds; disallowed
+    (mkdir) gets blocked. Acceptable outcomes: exit 0 with mkdir
+    error, OR SIGSYS signal.
+  landlock_denies_paths_outside_ruleset — same-process test;
+    applies confine_self, writes inside audit_dir (succeeds),
+    writes to /tmp (denied with EACCES).
 
 Plan: specs/plans/113-network-provider-trait-firecracker-substrate.md §Task 9.
 
