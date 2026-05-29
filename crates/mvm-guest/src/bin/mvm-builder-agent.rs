@@ -4,7 +4,7 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::process::{Command, Stdio};
 
 use mvm_guest::builder_agent::{
-    BuilderRequest, BuilderResponse, load_security_policy, validate_build_attr, validate_flake_ref,
+    HostVmRequest, HostVmResponse, load_security_policy, validate_build_attr, validate_flake_ref,
 };
 
 const AF_VSOCK: i32 = 40;
@@ -44,12 +44,12 @@ fn handle_client(fd: RawFd) {
                 if line_trim.is_empty() {
                     continue;
                 }
-                let req = match serde_json::from_str::<BuilderRequest>(line_trim) {
+                let req = match serde_json::from_str::<HostVmRequest>(line_trim) {
                     Ok(req) => req,
                     Err(e) => {
                         write_resp(
                             &mut reader,
-                            BuilderResponse::Err {
+                            HostVmResponse::Err {
                                 message: format!("parse error: {}", e),
                             },
                         );
@@ -58,10 +58,10 @@ fn handle_client(fd: RawFd) {
                 };
 
                 match req {
-                    BuilderRequest::Ping => {
-                        write_resp(&mut reader, BuilderResponse::Pong);
+                    HostVmRequest::Ping => {
+                        write_resp(&mut reader, HostVmResponse::Pong);
                     }
-                    BuilderRequest::Build {
+                    HostVmRequest::Build {
                         flake_ref,
                         attr,
                         timeout_secs,
@@ -72,7 +72,7 @@ fn handle_client(fd: RawFd) {
                         {
                             write_resp(
                                 &mut reader,
-                                BuilderResponse::Err {
+                                HostVmResponse::Err {
                                     message: "build rejected: access.build is disabled by security policy".to_string(),
                                 },
                             );
@@ -83,7 +83,7 @@ fn handle_client(fd: RawFd) {
                         if let Err(e) = validate_flake_ref(&flake_ref) {
                             write_resp(
                                 &mut reader,
-                                BuilderResponse::Err {
+                                HostVmResponse::Err {
                                     message: format!("invalid flake_ref: {}", e),
                                 },
                             );
@@ -94,7 +94,7 @@ fn handle_client(fd: RawFd) {
                         if let Err(e) = validate_build_attr(&attr) {
                             write_resp(
                                 &mut reader,
-                                BuilderResponse::Err {
+                                HostVmResponse::Err {
                                     message: format!("invalid build attr: {}", e),
                                 },
                             );
@@ -105,7 +105,7 @@ fn handle_client(fd: RawFd) {
                         if let Err(e) = run_build(&mut reader, &flake_ref, &attr, timeout) {
                             write_resp(
                                 &mut reader,
-                                BuilderResponse::Err {
+                                HostVmResponse::Err {
                                     message: format!("agent error: {}", e),
                                 },
                             );
@@ -118,7 +118,7 @@ fn handle_client(fd: RawFd) {
     }
 }
 
-fn write_resp(reader: &mut BufReader<std::fs::File>, resp: BuilderResponse) {
+fn write_resp(reader: &mut BufReader<std::fs::File>, resp: HostVmResponse) {
     let writer = reader.get_mut();
     if let Err(e) = writeln!(
         writer,
@@ -147,11 +147,11 @@ fn ensure_mount(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let msg = format!("mount {} -> {} failed: {}", dev, mountpoint, stderr);
-        write_resp(reader, BuilderResponse::Log { line: msg.clone() });
+        write_resp(reader, HostVmResponse::Log { line: msg.clone() });
         return Err(anyhow::anyhow!("{}", msg));
     }
     let msg = format!("mounted {} -> {}", dev, mountpoint);
-    write_resp(reader, BuilderResponse::Log { line: msg });
+    write_resp(reader, HostVmResponse::Log { line: msg });
     Ok(())
 }
 
@@ -212,7 +212,7 @@ fn ensure_nix(reader: &mut BufReader<std::fs::File>) -> anyhow::Result<()> {
 
     write_resp(
         reader,
-        BuilderResponse::Log {
+        HostVmResponse::Log {
             line: "Nix not found, installing (single-user)...".to_string(),
         },
     );
@@ -230,7 +230,7 @@ fn ensure_nix(reader: &mut BufReader<std::fs::File>) -> anyhow::Result<()> {
     for line in &lines[start..] {
         write_resp(
             reader,
-            BuilderResponse::Log {
+            HostVmResponse::Log {
                 line: format!("[nix-install] {}", line),
             },
         );
@@ -249,7 +249,7 @@ fn ensure_nix(reader: &mut BufReader<std::fs::File>) -> anyhow::Result<()> {
     match find_nix_bin() {
         Some(path) => {
             let msg = format!("Nix installed at {}", path);
-            write_resp(reader, BuilderResponse::Log { line: msg });
+            write_resp(reader, HostVmResponse::Log { line: msg });
         }
         None => {
             // Log what we can find in /nix for diagnostics.
@@ -307,7 +307,7 @@ fn run_build(
     let nix_path = nix_path_prefix();
     write_resp(
         reader,
-        BuilderResponse::Log {
+        HostVmResponse::Log {
             line: format!("nix PATH: {}", nix_path),
         },
     );
@@ -349,7 +349,7 @@ fn run_build(
             last_store_path = Some(line.clone());
         }
         log_lines.push(line.clone());
-        write_resp(reader, BuilderResponse::Log { line });
+        write_resp(reader, HostVmResponse::Log { line });
     }
 
     let status = child.wait()?;
@@ -389,7 +389,7 @@ fn run_build(
     if let Err(e) = std::fs::write("/build-out/build.log", log_lines.join("\n")) {
         eprintln!("failed to write build log: {e}");
     }
-    write_resp(reader, BuilderResponse::Ok { out_path });
+    write_resp(reader, HostVmResponse::Ok { out_path });
     Ok(())
 }
 

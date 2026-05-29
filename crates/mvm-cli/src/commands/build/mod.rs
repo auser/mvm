@@ -6,12 +6,12 @@
 pub(super) mod build;
 pub(super) mod compile;
 /// Plan 89 W3 part 5 — `mvmctl persistent-builder` user-facing
-/// verb. Wires the host-side `LibkrunPersistentBuilderVm` and
+/// verb. Wires the host-side `LibkrunPersistentHostVm` and
 /// `PersistentBuilderSupervisor` together via three subcommands
 /// (start / submit / stop) so contributors can exercise the
 /// dispatch path end-to-end without going through `mvmctl dev up`.
 /// Gated on the `builder-vm` feature because the host-side types
-/// it dispatches into (`LibkrunPersistentBuilderVm` etc.) only
+/// it dispatches into (`LibkrunPersistentHostVm` etc.) only
 /// exist with that feature — `mvm-cli`'s default features include
 /// it, so production builds always have this verb.
 #[cfg(feature = "builder-vm")]

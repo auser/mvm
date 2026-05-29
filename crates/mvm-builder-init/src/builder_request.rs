@@ -1,8 +1,8 @@
-//! Plan 89 W3 part 2 — hand-rolled parser for `BuilderRequest`
+//! Plan 89 W3 part 2 — hand-rolled parser for `HostVmRequest`
 //! JSON, the wire-format the persistent builder VM's dispatch loop
 //! reads off vsock.
 //!
-//! Mirror of `mvm_build::builder_protocol::BuilderRequest` on the
+//! Mirror of `mvm_build::builder_protocol::HostVmRequest` on the
 //! host side. Cross-platform on purpose — the parser sees coverage
 //! from `cargo test` on every developer host so the wire shape
 //! stays in lock-step with the host's serde-derived encoding
@@ -66,9 +66,9 @@ pub enum BuilderJob {
     },
 }
 
-/// In-guest mirror of `mvm_build::builder_protocol::BuilderRequest`.
+/// In-guest mirror of `mvm_build::builder_protocol::HostVmRequest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuilderRequest {
+pub enum HostVmRequest {
     Run {
         job_id: String,
         job: BuilderJob,
@@ -85,7 +85,7 @@ pub enum ParseError {
     MissingKind,
     /// `"kind"` was present but neither `"run"` nor `"shutdown"`.
     UnknownKind(String),
-    /// `BuilderRequest::Run` was missing a required field.
+    /// `HostVmRequest::Run` was missing a required field.
     MissingRunField(&'static str),
     /// `Run.job` had neither `"Flake"` nor `"Install"`.
     UnknownJobVariant,
@@ -96,12 +96,12 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotUtf8(e) => write!(f, "BuilderRequest body not UTF-8: {e}"),
-            Self::MissingKind => write!(f, "BuilderRequest missing `kind` discriminator"),
-            Self::UnknownKind(k) => write!(f, "BuilderRequest unknown kind `{k}`"),
-            Self::MissingRunField(name) => write!(f, "BuilderRequest::Run missing `{name}`"),
+            Self::NotUtf8(e) => write!(f, "HostVmRequest body not UTF-8: {e}"),
+            Self::MissingKind => write!(f, "HostVmRequest missing `kind` discriminator"),
+            Self::UnknownKind(k) => write!(f, "HostVmRequest unknown kind `{k}`"),
+            Self::MissingRunField(name) => write!(f, "HostVmRequest::Run missing `{name}`"),
             Self::UnknownJobVariant => {
-                write!(f, "BuilderRequest::Run job is neither Flake nor Install")
+                write!(f, "HostVmRequest::Run job is neither Flake nor Install")
             }
             Self::MissingJobField(name) => write!(f, "BuilderJob missing `{name}`"),
         }
@@ -110,27 +110,27 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parse a JSON-encoded `BuilderRequest` body (no length prefix —
+/// Parse a JSON-encoded `HostVmRequest` body (no length prefix —
 /// the caller has already framed). Tolerant of insignificant
 /// whitespace between JSON tokens because serde's writer may emit
 /// either compact or pretty output (we test against compact, but
 /// don't want to fail closed on pretty just to be safe).
-pub fn parse(bytes: &[u8]) -> Result<BuilderRequest, ParseError> {
+pub fn parse(bytes: &[u8]) -> Result<HostVmRequest, ParseError> {
     let text = std::str::from_utf8(bytes).map_err(ParseError::NotUtf8)?;
     let kind = find_string_value(text, "kind").ok_or(ParseError::MissingKind)?;
     match kind.as_str() {
-        "shutdown" => Ok(BuilderRequest::Shutdown),
+        "shutdown" => Ok(HostVmRequest::Shutdown),
         "run" => parse_run(text),
         other => Err(ParseError::UnknownKind(other.to_string())),
     }
 }
 
-fn parse_run(text: &str) -> Result<BuilderRequest, ParseError> {
+fn parse_run(text: &str) -> Result<HostVmRequest, ParseError> {
     let job_id = find_string_value(text, "job_id").ok_or(ParseError::MissingRunField("job_id"))?;
     let job_dir_relpath = find_string_value(text, "job_dir_relpath")
         .ok_or(ParseError::MissingRunField("job_dir_relpath"))?;
     let job = parse_job(text)?;
-    Ok(BuilderRequest::Run {
+    Ok(HostVmRequest::Run {
         job_id,
         job,
         job_dir_relpath,
@@ -180,7 +180,7 @@ fn contains_object_marker(text: &str, key: &str) -> bool {
 /// by optional whitespace and a `"..."`-delimited string. Doesn't
 /// walk the JSON tree, so if `"key"` appears twice at different
 /// nesting levels the first match wins. Sufficient for the closed
-/// `BuilderRequest` shape: each key (`kind`, `job_id`,
+/// `HostVmRequest` shape: each key (`kind`, `job_id`,
 /// `job_dir_relpath`, `flake_ref`, `attr_path`, `spec_path`) only
 /// appears once in any valid request.
 fn find_string_value(text: &str, key: &str) -> Option<String> {
@@ -254,7 +254,7 @@ mod tests {
     fn parses_shutdown() {
         assert_eq!(
             parse(SAMPLE_SHUTDOWN.as_bytes()).unwrap(),
-            BuilderRequest::Shutdown
+            HostVmRequest::Shutdown
         );
     }
 
@@ -262,7 +262,7 @@ mod tests {
     fn parses_flake_run() {
         let parsed = parse(SAMPLE_FLAKE_RUN.as_bytes()).unwrap();
         match parsed {
-            BuilderRequest::Run {
+            HostVmRequest::Run {
                 job_id,
                 job,
                 job_dir_relpath,
@@ -288,7 +288,7 @@ mod tests {
     fn parses_install_run() {
         let parsed = parse(SAMPLE_INSTALL_RUN.as_bytes()).unwrap();
         match parsed {
-            BuilderRequest::Run { job_id, job, .. } => {
+            HostVmRequest::Run { job_id, job, .. } => {
                 assert_eq!(job_id, "00000000-0000-0000-0000-000000000002");
                 match job {
                     BuilderJob::Install { spec_path } => {
@@ -305,7 +305,7 @@ mod tests {
     fn decodes_escapes_in_string_values() {
         let json = r#"{"kind":"run","job_id":"x","job":{"Flake":{"flake_ref":"line1\nline2\\back\"quote","attr_path":"y"}},"job_dir_relpath":"z"}"#;
         let parsed = parse(json.as_bytes()).unwrap();
-        if let BuilderRequest::Run {
+        if let HostVmRequest::Run {
             job: BuilderJob::Flake { flake_ref, .. },
             ..
         } = parsed
@@ -354,13 +354,13 @@ mod tests {
     }
 
     /// **The cross-validation test.** What the host's serde-derived
-    /// writer (`mvm_build::builder_protocol::BuilderRequest` →
+    /// writer (`mvm_build::builder_protocol::HostVmRequest` →
     /// `mvm_guest::vsock::write_frame`) emits must parse cleanly
     /// via this hand-rolled parser. Any schema drift on either side
     /// trips this test and that's the signal to resync.
     #[test]
     fn parses_what_mvm_build_serializes_with_serde() {
-        use mvm_build::builder_protocol::{BuilderRequest as HostReq, JobId};
+        use mvm_build::builder_protocol::{HostVmRequest as HostReq, JobId};
         use mvm_build::builder_vm::BuilderJob as HostJob;
 
         // Flake run
@@ -375,7 +375,7 @@ mod tests {
         let json = serde_json::to_vec(&req).expect("serialize");
         let parsed = parse(&json).expect("parse");
         match parsed {
-            BuilderRequest::Run {
+            HostVmRequest::Run {
                 job_id,
                 job,
                 job_dir_relpath,
@@ -406,7 +406,7 @@ mod tests {
         };
         let json = serde_json::to_vec(&req).expect("serialize");
         let parsed = parse(&json).expect("parse");
-        if let BuilderRequest::Run {
+        if let HostVmRequest::Run {
             job: BuilderJob::Install { spec_path },
             ..
         } = parsed
@@ -420,6 +420,6 @@ mod tests {
         let req = HostReq::Shutdown {};
         let json = serde_json::to_vec(&req).expect("serialize");
         let parsed = parse(&json).expect("parse");
-        assert_eq!(parsed, BuilderRequest::Shutdown);
+        assert_eq!(parsed, HostVmRequest::Shutdown);
     }
 }

@@ -7,7 +7,7 @@ Vsock protocol definitions and integration management for guest-side agents runn
 | Module | Purpose |
 |--------|---------|
 | `vsock` | Guest control protocol: `GuestRequest`/`GuestResponse`, host-bound protocol: `HostBoundRequest`/`HostBoundResponse` |
-| `builder_agent` | Ephemeral builder VM protocol: `BuilderRequest`/`BuilderResponse` |
+| `builder_agent` | Host-VM dispatch protocol: `HostVmRequest`/`HostVmResponse` |
 | `integrations` | Integration manifest system: `IntegrationManifest`, `IntegrationEntry`, health checks |
 
 ## Wire Protocol

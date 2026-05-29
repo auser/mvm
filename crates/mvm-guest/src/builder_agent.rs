@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// Incoming request from host to the builder agent (guest side, via vsock/serial).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum BuilderRequest {
+pub enum HostVmRequest {
     /// Build a flake attribute with an optional timeout (seconds).
     Build {
         flake_ref: String,
@@ -22,7 +22,7 @@ pub const BUILDER_AGENT_PORT: u32 = 21470;
 
 /// Vsock port used by Plan 89's persistent builder VM dispatch
 /// channel. Separate from [`BUILDER_AGENT_PORT`] (the legacy guest-
-/// listener used by [`BuilderRequest::Build`] / [`BuilderRequest::Ping`]
+/// listener used by [`HostVmRequest::Build`] / [`HostVmRequest::Ping`]
 /// above) because the Plan 89 wire (`mvm_build::builder_protocol`)
 /// is a different protocol with different semantics — the two
 /// channels coexist while the legacy path is in use elsewhere.
@@ -30,13 +30,13 @@ pub const BUILDER_AGENT_PORT: u32 = 21470;
 /// W2 part 2: this port is added to the libkrun builder VM's vsock
 /// config; the host opens the corresponding Unix-socket-proxy at
 /// `<vm_state_dir>/vsock-21471.sock` to receive
-/// [`mvm_build::builder_protocol::BuilderResponse`] frames from the
+/// [`mvm_build::builder_protocol::HostVmResponse`] frames from the
 /// guest. The guest-side send code lands in W2 part 3.
 pub const BUILDER_DISPATCH_PORT: u32 = 21471;
 
 /// Outgoing responses/log frames from the builder agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum BuilderResponse {
+pub enum HostVmResponse {
     /// Build succeeded; artifact root placed in /build-out.
     Ok { out_path: String },
     /// Build failed.
@@ -114,17 +114,17 @@ pub fn load_security_policy() -> Result<Option<mvm_core::security::SecurityPolic
     Ok(Some(policy))
 }
 
-fn log_frame(line: &str) -> BuilderResponse {
-    BuilderResponse::Log {
+fn log_frame(line: &str) -> HostVmResponse {
+    HostVmResponse::Log {
         line: line.to_string(),
     }
 }
 
 /// Run the requested build using nix inside the guest and stage artifacts into /build-out.
-pub fn handle_request(req: BuilderRequest) -> Result<BuilderResponse> {
+pub fn handle_request(req: HostVmRequest) -> Result<HostVmResponse> {
     match req {
-        BuilderRequest::Ping => Ok(BuilderResponse::Pong),
-        BuilderRequest::Build {
+        HostVmRequest::Ping => Ok(HostVmResponse::Pong),
+        HostVmRequest::Build {
             flake_ref,
             attr,
             timeout_secs,
@@ -133,7 +133,7 @@ pub fn handle_request(req: BuilderRequest) -> Result<BuilderResponse> {
 
             let out_mount = Path::new("/build-out");
             if !out_mount.is_dir() {
-                return Ok(BuilderResponse::Err {
+                return Ok(HostVmResponse::Err {
                     message: "/build-out missing or not a directory".into(),
                 });
             }
@@ -172,7 +172,7 @@ pub fn handle_request(req: BuilderRequest) -> Result<BuilderResponse> {
             }
 
             if !output.status.success() {
-                return Ok(BuilderResponse::Err {
+                return Ok(HostVmResponse::Err {
                     message: format!("nix build failed (exit {}): {}", output.status, build_cmd),
                 });
             }
@@ -200,12 +200,12 @@ pub fn handle_request(req: BuilderRequest) -> Result<BuilderResponse> {
                 .output()
                 .with_context(|| "failed to copy build artifacts")?;
             if !copy_out.status.success() {
-                return Ok(BuilderResponse::Err {
+                return Ok(HostVmResponse::Err {
                     message: format!("failed to copy artifacts: exit {}", copy_out.status),
                 });
             }
 
-            Ok(BuilderResponse::Ok { out_path })
+            Ok(HostVmResponse::Ok { out_path })
         }
     }
 }
@@ -216,13 +216,13 @@ mod tests {
 
     #[test]
     fn serde_round_trip() {
-        let req = BuilderRequest::Build {
+        let req = HostVmRequest::Build {
             flake_ref: ".".into(),
             attr: "packages.aarch64-linux.tenant-worker".into(),
             timeout_secs: Some(123),
         };
         let json = serde_json::to_string(&req).unwrap();
-        let back: BuilderRequest = serde_json::from_str(&json).unwrap();
+        let back: HostVmRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
 

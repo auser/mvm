@@ -107,7 +107,7 @@ pub struct SessionHelloAck {
 /// (`SecurityPolicy::dev_defaults`).
 ///
 /// **Builder uses a different protocol.** `mvm-builder-agent`'s wire
-/// type is `BuilderRequest`, not `GuestRequest`; the `Builder`
+/// type is `HostVmRequest`, not `GuestRequest`; the `Builder`
 /// profile is reserved for any future `GuestRequest` variant that
 /// only makes sense during a build. No current variant is
 /// `BuilderOnly`, so the value is wire-stable but unused for the
@@ -124,7 +124,7 @@ pub enum AgentProfile {
     Dev,
     /// Builder-VM agent. Reserved for `BuilderOnly`-classified verbs
     /// when the builder protocol moves to `GuestRequest`; today the
-    /// builder agent speaks `BuilderRequest` exclusively.
+    /// builder agent speaks `HostVmRequest` exclusively.
     Builder,
 }
 

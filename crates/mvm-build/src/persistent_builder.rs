@@ -8,11 +8,11 @@
 //! inside an active `mvmctl dev` session — submit a
 //! [`crate::builder_vm::BuilderJob`] via [`Self::submit`]; the
 //! supervisor serializes it to a
-//! [`crate::builder_protocol::BuilderRequest::Run`], writes the
+//! [`crate::builder_protocol::HostVmRequest::Run`], writes the
 //! frame over the socket, then reads back streamed
-//! [`crate::builder_protocol::BuilderResponse::StderrChunk`] frames
+//! [`crate::builder_protocol::HostVmResponse::StderrChunk`] frames
 //! followed by a terminating
-//! [`crate::builder_protocol::BuilderResponse::Result`].
+//! [`crate::builder_protocol::HostVmResponse::Result`].
 //!
 //! ## Scope of this PR (W3 part 1)
 //!
@@ -23,7 +23,7 @@
 //!   driving the wire end-to-end via `UnixListener::pair`-style
 //!   mocks in `crates/mvm-build/tests/persistent_builder_supervisor.rs`.
 //! - **Out:** spawning the actual libkrun VM
-//!   ([`crate::libkrun_builder::LibkrunPersistentBuilderVm`] lands
+//!   ([`crate::libkrun_builder::LibkrunPersistentHostVm`] lands
 //!   in W3 part 2 alongside builder-init's dispatch-loop emit);
 //!   `mvmctl dev up` auto-start of the supervisor (W3 part 3);
 //!   per-job namespace isolation (W3 part 4); per-dispatch audit
@@ -33,8 +33,8 @@
 //!
 //! Per Plan 89 §Concurrency, V1 is one in-flight dispatch per
 //! supervisor. The dispatch mutex guards the socket so two
-//! concurrent submits don't interleave their `BuilderRequest` /
-//! `BuilderResponse` frames on the same connection. V2+ parallel
+//! concurrent submits don't interleave their `HostVmRequest` /
+//! `HostVmResponse` frames on the same connection. V2+ parallel
 //! dispatch (per-job overlay namespaces + per-job vsock conns) is
 //! an explicit non-goal of this plan.
 
@@ -45,9 +45,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::builder_protocol::{
-    BootTimingsWire, BuilderRequest, BuilderResponse, JobId, JobTimings,
-};
+use crate::builder_protocol::{BootTimingsWire, HostVmRequest, HostVmResponse, JobId, JobTimings};
 use crate::builder_vm::BuilderJob;
 
 /// Plan 89 W3 part 14 — host-side hook the persistent dispatch
@@ -75,11 +73,11 @@ use crate::builder_vm::BuilderJob;
 /// security-scan F5 calls out:
 ///
 /// - [`Self::dispatched`] — fires after the supervisor writes
-///   the `BuilderRequest::Run` frame and before it starts
+///   the `HostVmRequest::Run` frame and before it starts
 ///   collecting responses. Records the start of the
 ///   `job_id`-tagged sub-chain.
 /// - [`Self::completed`] — fires after a successful
-///   `BuilderResponse::Result` (exit_code is whatever the build
+///   `HostVmResponse::Result` (exit_code is whatever the build
 ///   produced; non-zero exits are still "completed" from the
 ///   dispatch supervisor's POV).
 /// - [`Self::failed`] — fires when the supervisor surfaces a
@@ -129,7 +127,7 @@ const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The completed outcome of one dispatched job. Mirrors the wire
-/// shape of [`BuilderResponse::Result`] plus an in-process
+/// shape of [`HostVmResponse::Result`] plus an in-process
 /// accumulation of the stderr chunks that streamed in before the
 /// terminating Result.
 #[derive(Debug, Clone)]
@@ -172,7 +170,7 @@ pub enum PersistentBuilderError {
     JobIdMismatch { request: JobId, response: JobId },
 
     /// Guest closed the connection before sending a terminating
-    /// [`BuilderResponse::Result`]. Could mean kernel panic, OOM
+    /// [`HostVmResponse::Result`]. Could mean kernel panic, OOM
     /// kill of the build process, or a logic bug in the dispatch
     /// loop. Distinguished from [`Self::SocketUnreachable`] because
     /// the *connection* was established and partial output was
@@ -192,7 +190,7 @@ pub enum PersistentBuilderError {
 /// — the libkrun-managed Unix socket that proxies to AF_VSOCK port
 /// [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`] inside the
 /// guest. The owner of the persistent VM (W3 part 2 will spawn it
-/// from `LibkrunPersistentBuilderVm`) constructs this supervisor
+/// from `LibkrunPersistentHostVm`) constructs this supervisor
 /// once the VM is up, then hands the result to whatever submits
 /// jobs (W3 part 3 wires `mvmctl build` to it from inside a dev
 /// session).
@@ -255,7 +253,7 @@ impl PersistentBuilderSupervisor {
 
     /// Dispatch one [`BuilderJob`] into the persistent VM and
     /// block until the guest sends back a terminating
-    /// [`BuilderResponse::Result`]. Holds the dispatch mutex for
+    /// [`HostVmResponse::Result`]. Holds the dispatch mutex for
     /// the duration (V1 = serialized).
     ///
     /// `job_dir_relpath` is the path inside the `/job` virtio-fs
@@ -274,11 +272,11 @@ impl PersistentBuilderSupervisor {
 
         let job_id = JobId::new();
         // Snapshot the job + relpath for the audit emit before
-        // moving them into the BuilderRequest::Run variant; the
+        // moving them into the HostVmRequest::Run variant; the
         // dispatch loop then consumes the request.
         let job_for_audit = job.clone();
         let relpath_for_audit = job_dir_relpath.clone();
-        let request = BuilderRequest::Run {
+        let request = HostVmRequest::Run {
             job_id,
             job,
             job_dir_relpath,
@@ -314,8 +312,8 @@ impl PersistentBuilderSupervisor {
         }
     }
 
-    /// Send a [`BuilderRequest::Shutdown`] to the guest's dispatch
-    /// loop and wait for the matching [`BuilderResponse::Bye`].
+    /// Send a [`HostVmRequest::Shutdown`] to the guest's dispatch
+    /// loop and wait for the matching [`HostVmResponse::Bye`].
     /// Consumes `self` because the supervisor is one-shot after
     /// shutdown — the VM will power off and the socket goes away.
     pub fn shutdown(self) -> Result<(), PersistentBuilderError> {
@@ -324,7 +322,7 @@ impl PersistentBuilderSupervisor {
             .lock()
             .map_err(|_| PersistentBuilderError::MutexPoisoned)?;
 
-        let request = BuilderRequest::Shutdown {};
+        let request = HostVmRequest::Shutdown {};
         let mut stream = self.connect()?;
         mvm_guest::vsock::write_frame(&mut stream, &request)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -346,7 +344,7 @@ impl PersistentBuilderSupervisor {
 
     fn dispatch(
         &self,
-        request: &BuilderRequest,
+        request: &HostVmRequest,
         request_job_id: JobId,
     ) -> Result<DispatchOutcome, PersistentBuilderError> {
         let started = std::time::Instant::now();
@@ -366,7 +364,7 @@ impl PersistentBuilderSupervisor {
             }
             let response = read_next_response(&mut stream, self.frame_read_timeout)?;
             match response {
-                Some(BuilderResponse::StderrChunk { job_id, line }) => {
+                Some(HostVmResponse::StderrChunk { job_id, line }) => {
                     if job_id != request_job_id {
                         return Err(PersistentBuilderError::JobIdMismatch {
                             request: request_job_id,
@@ -375,7 +373,7 @@ impl PersistentBuilderSupervisor {
                     }
                     stderr_chunks.push(line);
                 }
-                Some(BuilderResponse::Result {
+                Some(HostVmResponse::Result {
                     job_id,
                     exit_code,
                     stderr_tail,
@@ -397,9 +395,24 @@ impl PersistentBuilderSupervisor {
                         job_timings,
                     });
                 }
-                Some(BuilderResponse::Bye {}) => {
+                Some(HostVmResponse::Bye {}) => {
                     // Bye in the middle of a dispatch is unexpected —
                     // treat as premature EOF.
+                    return Err(PersistentBuilderError::PrematureEof {
+                        chunks: stderr_chunks.len(),
+                    });
+                }
+                Some(HostVmResponse::WorkloadStarted { .. })
+                | Some(HostVmResponse::WorkloadStopped { .. })
+                | Some(HostVmResponse::WorkloadStatusReport { .. }) => {
+                    // Plan 107 A1: workload responses on the build-job
+                    // dispatch path are a protocol violation. The
+                    // guest-side workload arm is `unimplemented!()`
+                    // until A2.2, so this branch cannot fire today;
+                    // when A2 lands, workload responses will flow on a
+                    // dedicated channel (A3 vsock-proxy hop), not this
+                    // one. Treat as premature EOF for now — the host
+                    // can't recover from a wire mismatch.
                     return Err(PersistentBuilderError::PrematureEof {
                         chunks: stderr_chunks.len(),
                     });
@@ -415,15 +428,15 @@ impl PersistentBuilderSupervisor {
     }
 }
 
-/// Read the next [`BuilderResponse`] from `stream`. Returns
+/// Read the next [`HostVmResponse`] from `stream`. Returns
 /// `Ok(None)` on clean EOF and `Err(_)` on any I/O or framing
 /// failure. Module-private because the supervisor is the only
 /// caller that needs the "Option-on-EOF" semantics.
 fn read_next_response(
     stream: &mut UnixStream,
     _read_timeout: Duration,
-) -> Result<Option<BuilderResponse>, PersistentBuilderError> {
-    match mvm_guest::vsock::read_frame::<BuilderResponse>(stream) {
+) -> Result<Option<HostVmResponse>, PersistentBuilderError> {
+    match mvm_guest::vsock::read_frame::<HostVmResponse>(stream) {
         Ok(resp) => Ok(Some(resp)),
         Err(e) => {
             let src = e.source();
@@ -542,7 +555,7 @@ pub fn artifact_dir_for(session_job_dir: &Path, job_id: &str) -> PathBuf {
 /// Stage a per-dispatch cmd.sh + output subdir under
 /// `<session_job_dir>/<job_id>/`. Returns the relative path
 /// (just `<job_id>`) that the host passes as
-/// `BuilderRequest::Run::job_dir_relpath` and the guest dispatch
+/// `HostVmRequest::Run::job_dir_relpath` and the guest dispatch
 /// loop resolves under `/job/`. cmd.sh:
 ///
 /// 1. Runs `nix build` against `<flake_ref>#<attr>`, captures the
@@ -818,7 +831,7 @@ impl PersistentBuilderVm {
 /// create the out/ subdir (mirror of [`stage_flake_dispatch_job`]'s
 /// convention) and copy the caller's install spec into
 /// `<job_id>/install_spec.json`. Returns the `job_id` the host passes
-/// as `BuilderRequest::Run::job_dir_relpath`.
+/// as `HostVmRequest::Run::job_dir_relpath`.
 #[cfg(feature = "builder-vm")]
 fn stage_install_dispatch_job(
     session_job_dir: &Path,

@@ -14,7 +14,7 @@ use std::os::unix::net::UnixListener;
 use std::time::Duration;
 
 use mvm_build::builder_protocol::{
-    BootTimingsWire, BuilderResponse, BuilderResponseRead, JobId, JobTimings,
+    BootTimingsWire, HostVmResponse, HostVmResponseRead, JobId, JobTimings,
 };
 use mvm_build::libkrun_builder::spawn_vsock_response_listener;
 
@@ -31,13 +31,13 @@ fn spawn_vsock_response_listener_decodes_guest_response() {
     // at the path libkrun would create — that's what the host-side
     // spawn_vsock_response_listener's retry loop connects to. From
     // a separate thread, accept the connection and write a framed
-    // BuilderResponse. The listener helper's receiver should yield
+    // HostVmResponse. The listener helper's receiver should yield
     // Frame(...).
     let scratch = tempfile::tempdir().expect("tempdir");
     let socket_path = socket_path_in(scratch.path());
     let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
 
-    let response = BuilderResponse::Result {
+    let response = HostVmResponse::Result {
         job_id: JobId::default(),
         exit_code: 0,
         stderr_tail: "ok".to_string(),
@@ -76,7 +76,7 @@ fn spawn_vsock_response_listener_decodes_guest_response() {
     guest_thread.join().expect("guest thread");
 
     match received {
-        BuilderResponseRead::Frame(got) => assert_eq!(got, expected),
+        HostVmResponseRead::Frame(got) => assert_eq!(got, expected),
         other => panic!("expected Frame, got {other:?}"),
     }
 }
@@ -104,7 +104,7 @@ fn spawn_vsock_response_listener_yields_empty_eof_when_no_send() {
     guest_thread.join().expect("guest thread");
 
     match received {
-        BuilderResponseRead::EmptyEof => {}
+        HostVmResponseRead::EmptyEof => {}
         other => panic!("expected EmptyEof, got {other:?}"),
     }
 }

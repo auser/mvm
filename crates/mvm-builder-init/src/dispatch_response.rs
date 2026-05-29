@@ -1,5 +1,5 @@
 //! Plan 89 W2 part 3 — hand-rolled JSON for the
-//! `BuilderResponse::Result` wire frame builder-init sends right
+//! `HostVmResponse::Result` wire frame builder-init sends right
 //! before reboot.
 //!
 //! ## Why hand-roll
@@ -7,9 +7,9 @@
 //! `mvm-builder-init` keeps a ≤ 1.5 MiB rootfs size budget
 //! (Plan 72 §W3) and deliberately does not pull `serde_json`
 //! (`Cargo.toml` comment at the deps section). The host-side
-//! consumer (`mvm_build::builder_protocol::BuilderResponse::Result`)
+//! consumer (`mvm_build::builder_protocol::HostVmResponse::Result`)
 //! is a typed serde enum; this module mirrors its wire shape
-//! exactly so the host's `serde_json::from_slice::<BuilderResponse>`
+//! exactly so the host's `serde_json::from_slice::<HostVmResponse>`
 //! parses what we emit. The `builder_response_matches_typed_serde`
 //! test below uses `mvm-build` as a dev-dep to pin the two sides
 //! together — if anyone tweaks either struct, that test breaks
@@ -17,7 +17,7 @@
 //!
 //! ## Single-shot caveats
 //!
-//! `BuilderResponse::Result` carries a `job_id: JobId(Uuid)` and a
+//! `HostVmResponse::Result` carries a `job_id: JobId(Uuid)` and a
 //! `job_timings: JobTimings { dispatch_ms, build_ms, teardown_ms }`.
 //! In single-shot mode there is no incoming dispatch with an id and
 //! no remote-dispatch round-trip to time, so:
@@ -25,7 +25,7 @@
 //! - `job_id` is the nil UUID
 //!   (`00000000-0000-0000-0000-000000000000`). The host's
 //!   single-shot caller knows to ignore it; persistent dispatch
-//!   (W3) will populate it from the `BuilderRequest::Run` it
+//!   (W3) will populate it from the `HostVmRequest::Run` it
 //!   correlates against.
 //! - `dispatch_ms` and `teardown_ms` are `0`. Only `build_ms`
 //!   carries a meaningful value, measured by the caller as
@@ -39,21 +39,21 @@ use crate::boot_timings::BootTimings;
 pub(crate) const NIL_JOB_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Owned snapshot of the data needed to hand-roll a
-/// `BuilderResponse::Result` JSON frame. The producer (the linux
+/// `HostVmResponse::Result` JSON frame. The producer (the linux
 /// module's `run` path for single-shot, or the W3 dispatch loop)
 /// gathers these fields after the inner build returns.
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchResponse {
-    /// UUID-string echoed from the incoming `BuilderRequest::Run`.
+    /// UUID-string echoed from the incoming `HostVmRequest::Run`.
     /// Single-shot callers pass [`NIL_JOB_ID`]; persistent
     /// dispatch echoes the host-generated id from
-    /// `BuilderRequest::Run::job_id`.
+    /// `HostVmRequest::Run::job_id`.
     pub job_id: String,
     pub exit_code: i32,
     pub stderr_tail: String,
     /// Cold-boot phase timings. `Some` on the first response a
     /// persistent VM emits (matches the host-side
-    /// `BuilderResponse::Result::boot_timings: Option<...>`
+    /// `HostVmResponse::Result::boot_timings: Option<...>`
     /// semantics); `None` on subsequent dispatches in the same
     /// session — there's no second cold boot to time. Single-shot
     /// always passes `Some`.
@@ -62,7 +62,7 @@ pub(crate) struct DispatchResponse {
 }
 
 impl DispatchResponse {
-    /// Render as the exact wire JSON `mvm_build::builder_protocol::BuilderResponse::Result`
+    /// Render as the exact wire JSON `mvm_build::builder_protocol::HostVmResponse::Result`
     /// deserializes from. Field order matches the serde-derived
     /// internally-tagged enum encoding (`"kind"` first, then the
     /// variant's struct fields in declaration order).
@@ -86,22 +86,22 @@ impl DispatchResponse {
     }
 }
 
-/// Plan 89 W3 part 3 — wire JSON for `BuilderResponse::Bye`,
-/// the dispatch loop's acknowledgement of `BuilderRequest::Shutdown`.
+/// Plan 89 W3 part 3 — wire JSON for `HostVmResponse::Bye`,
+/// the dispatch loop's acknowledgement of `HostVmRequest::Shutdown`.
 /// Static body; no fields to escape.
 pub(crate) fn bye_json() -> &'static str {
     r#"{"kind":"bye"}"#
 }
 
-/// Plan 89 W3 part 9 — wire JSON for `BuilderResponse::StderrChunk`,
+/// Plan 89 W3 part 9 — wire JSON for `HostVmResponse::StderrChunk`,
 /// one frame per stderr line the dispatch loop streams back to the
 /// host while a build is running. Matches the serde-derived shape in
-/// `mvm_build::builder_protocol::BuilderResponse::StderrChunk`
+/// `mvm_build::builder_protocol::HostVmResponse::StderrChunk`
 /// (`{"kind":"stderr_chunk","job_id":"...","line":"..."}`); the
 /// cross-validation test below pins it.
 ///
 /// `line` must already have its trailing `\n` stripped — the host's
-/// `mvm_build::builder_protocol::BuilderResponse::StderrChunk` docs
+/// `mvm_build::builder_protocol::HostVmResponse::StderrChunk` docs
 /// commit to that.
 pub(crate) fn stderr_chunk_json(job_id: &str, line: &str) -> String {
     let mut out = String::with_capacity(64 + job_id.len() + line.len());
@@ -232,11 +232,11 @@ mod tests {
 
     #[test]
     fn bye_json_matches_typed_builder_response_bye() {
-        let typed: mvm_build::builder_protocol::BuilderResponse =
+        let typed: mvm_build::builder_protocol::HostVmResponse =
             serde_json::from_str(bye_json()).expect("parse");
         assert!(matches!(
             typed,
-            mvm_build::builder_protocol::BuilderResponse::Bye {}
+            mvm_build::builder_protocol::HostVmResponse::Bye {}
         ));
     }
 
@@ -248,10 +248,10 @@ mod tests {
         let job_id = "01234567-89ab-cdef-0123-456789abcdef";
         let line = "[mvm] nix build: 12/47 derivations";
         let json = stderr_chunk_json(job_id, line);
-        let typed: mvm_build::builder_protocol::BuilderResponse =
-            serde_json::from_str(&json).expect("must parse as typed BuilderResponse");
+        let typed: mvm_build::builder_protocol::HostVmResponse =
+            serde_json::from_str(&json).expect("must parse as typed HostVmResponse");
         match typed {
-            mvm_build::builder_protocol::BuilderResponse::StderrChunk {
+            mvm_build::builder_protocol::HostVmResponse::StderrChunk {
                 job_id: got_id,
                 line: got_line,
             } => {
@@ -278,7 +278,7 @@ mod tests {
     }
 
     /// **The cross-validation test.** Hand-rolled JSON must
-    /// deserialize as `mvm_build::builder_protocol::BuilderResponse`
+    /// deserialize as `mvm_build::builder_protocol::HostVmResponse`
     /// with `Result` variant carrying the expected fields. Bumps
     /// either struct's shape (renames, additions, type changes)
     /// trip this test, which is the signal to re-sync.
@@ -292,10 +292,10 @@ mod tests {
             build_ms: 1234,
         };
         let json = resp.to_json();
-        let typed: mvm_build::builder_protocol::BuilderResponse =
-            serde_json::from_str(&json).expect("must parse as typed BuilderResponse");
+        let typed: mvm_build::builder_protocol::HostVmResponse =
+            serde_json::from_str(&json).expect("must parse as typed HostVmResponse");
         match typed {
-            mvm_build::builder_protocol::BuilderResponse::Result {
+            mvm_build::builder_protocol::HostVmResponse::Result {
                 job_id,
                 exit_code,
                 stderr_tail,
