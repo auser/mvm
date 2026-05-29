@@ -61,6 +61,68 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// boot for the same Nix-built rootfs layout.
 const DEFAULT_CMDLINE: &str = "console=hvc0 root=/dev/vda rw init=/init";
 
+/// Plan 112 Phase 3c — build the supervisor config for one VM, lifting
+/// the audit-substrate resolution into the shared `audit_substrate`
+/// module so libkrun and Vz share one source of truth (and the future
+/// `NetworkProvider` trait extraction is mechanical).
+///
+/// **Do not log** `config.plan_json` or `config.bundle_json` — they
+/// may carry secret bindings, env vars, or policy refs that resolve
+/// to credentials. They're opaque transport bytes; the supervisor
+/// re-verifies the signed envelope before trusting any decoded field.
+fn build_supervisor_config(config: &VmStartConfig, state_dir: &Path) -> Result<SupervisorConfig> {
+    let kernel = config
+        .kernel_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("libkrun backend requires a kernel path"))?;
+    let vcpus = u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX);
+    let krun = KrunContext::new(&config.name, kernel, &config.rootfs_path)
+        .with_resources(vcpus, config.memory_mib)
+        .with_cmdline(DEFAULT_CMDLINE)
+        .with_vsock_socket_dir(state_dir.to_string_lossy().into_owned())
+        .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+
+    // Plan 112 Phase 3c — resolve the audit substrate (paths + tenant
+    // validation). When the producer threaded an AdmittedPlan in
+    // (`tenant_id` Some), the AuditSubstrate carries the five resolved
+    // paths; otherwise it's all-None and the supervisor takes the
+    // legacy `run_supervisor` path.
+    let substrate =
+        crate::audit_substrate::compute_audit_substrate(&config.name, config.tenant_id.as_deref())?;
+
+    // Parse the signed-plan + bundle envelopes from VmStartConfig.
+    // mvm_libkrun::SupervisorConfig carries them as Option<serde_json::Value>
+    // so the supervisor can re-verify the envelope without depending on
+    // mvm-plan at the parse boundary.
+    let plan = match config.plan_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| anyhow!("parse VmStartConfig.plan_json as JSON: {e}"))?,
+        ),
+        None => None,
+    };
+    let bundle = match config.bundle_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| anyhow!("parse VmStartConfig.bundle_json as JSON: {e}"))?,
+        ),
+        None => None,
+    };
+
+    Ok(SupervisorConfig {
+        krun,
+        vm_state_dir: state_dir.to_string_lossy().into_owned(),
+        pid_file_name: None,
+        tenant_id: substrate.tenant_id,
+        audit_dir: substrate.audit_dir,
+        gateway_audit_socket: substrate.gateway_audit_socket,
+        gateway_events_socket: substrate.gateway_events_socket,
+        signing_key_path: substrate.signing_key_path,
+        plan,
+        bundle,
+    })
+}
+
 impl VmBackend for LibkrunBackend {
     fn name(&self) -> &str {
         "libkrun"
@@ -91,11 +153,9 @@ impl VmBackend for LibkrunBackend {
             );
         }
 
-        let kernel = config
-            .kernel_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("libkrun backend requires a kernel path"))?;
-
+        // Note: the kernel-path requirement check now lives in
+        // `build_supervisor_config` (which the helper invokes); we still
+        // bail early if it's missing, just via the helper.
         let supervisor_path = resolve_supervisor_path()?;
         let state_dir = vm_state_dir(&config.name);
         std::fs::create_dir_all(&state_dir)
@@ -115,33 +175,7 @@ impl VmBackend for LibkrunBackend {
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
         let vcpus = u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX);
-        let krun = KrunContext::new(&config.name, kernel, &config.rootfs_path)
-            .with_resources(vcpus, config.memory_mib)
-            .with_cmdline(DEFAULT_CMDLINE)
-            .with_vsock_socket_dir(state_dir.to_string_lossy().into_owned())
-            .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
-
-        let cfg = SupervisorConfig {
-            krun,
-            vm_state_dir: state_dir.to_string_lossy().into_owned(),
-            pid_file_name: None,
-            // Plan 102 W6.A commit 6: audit-substrate fields. Set to
-            // None for now — backend orchestrator population
-            // (sourcing tenant_id from ExecutionPlan, gateway sockets
-            // from mvm_data_dir()) lands alongside the
-            // run_supervisor_with_bridge wire-up (Plan 102 W6.A.5
-            // Phase 3).
-            tenant_id: None,
-            audit_dir: None,
-            gateway_audit_socket: None,
-            gateway_events_socket: None,
-            signing_key_path: None,
-            // Plan 102 W6.A.5 plan/bundle fields — populated by the
-            // same Phase 3 wire-up that fills the audit-substrate
-            // paths.
-            plan: None,
-            bundle: None,
-        };
+        let cfg = build_supervisor_config(config, &state_dir)?;
         let pid_file = cfg.pid_file();
         // Remove any stale PID file from a previous crashed supervisor
         // so the wait-loop below can detect the new one unambiguously.
@@ -498,6 +532,74 @@ mod tests {
         // else holds because libkrun matches Firecracker's L2 properties.
         assert_eq!(profile.dropped_claims(), vec![3]);
         assert!(profile.na_claims().is_empty());
+    }
+
+    #[test]
+    fn build_supervisor_config_maps_substrate_into_supervisor_config() {
+        // Plan 112 Phase 3c — when the producer threaded an admitted plan,
+        // build_supervisor_config maps the resolved AuditSubstrate fields
+        // into SupervisorConfig + parses plan_json/bundle_json as JSON.
+        let config = VmStartConfig {
+            name: "test-vm".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_path: Some("/tmp/vmlinux".into()),
+            cpus: 1,
+            memory_mib: 256,
+            tenant_id: Some("acme".into()),
+            plan_json: Some("{\"k\":\"v\"}".into()),
+            bundle_json: None,
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = build_supervisor_config(&config, tmp.path()).expect("build");
+        assert_eq!(cfg.tenant_id.as_deref(), Some("acme"));
+        assert!(cfg.audit_dir.is_some());
+        assert!(cfg.gateway_audit_socket.is_some());
+        assert!(cfg.gateway_events_socket.is_some());
+        assert!(cfg.signing_key_path.is_some());
+        assert!(cfg.plan.is_some());
+        assert!(cfg.bundle.is_none());
+    }
+
+    #[test]
+    fn build_supervisor_config_no_tenant_keeps_substrate_none() {
+        // Plan 112 Phase 3c — no admission ⇒ all five substrate fields
+        // None ⇒ supervisor takes the legacy `run_supervisor` path.
+        let config = VmStartConfig {
+            name: "dev-vm".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_path: Some("/tmp/vmlinux".into()),
+            cpus: 1,
+            memory_mib: 256,
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = build_supervisor_config(&config, tmp.path()).expect("build");
+        assert!(cfg.tenant_id.is_none());
+        assert!(cfg.audit_dir.is_none());
+        assert!(cfg.gateway_audit_socket.is_none());
+        assert!(cfg.gateway_events_socket.is_none());
+        assert!(cfg.signing_key_path.is_none());
+        assert!(cfg.plan.is_none());
+        assert!(cfg.bundle.is_none());
+    }
+
+    #[test]
+    fn build_supervisor_config_refuses_unsafe_tenant() {
+        // Plan 112 Phase 3c — defense-in-depth: tenant_id passes through
+        // the DNS-label allowlist in audit_substrate; build_supervisor_config
+        // propagates the error.
+        let config = VmStartConfig {
+            name: "evil-vm".into(),
+            rootfs_path: "/tmp/rootfs.ext4".into(),
+            kernel_path: Some("/tmp/vmlinux".into()),
+            cpus: 1,
+            memory_mib: 256,
+            tenant_id: Some("../escape".into()),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(build_supervisor_config(&config, tmp.path()).is_err());
     }
 
     #[test]
