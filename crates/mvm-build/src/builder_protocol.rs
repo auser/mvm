@@ -29,7 +29,7 @@
 //!   ([`HostVmResponseRead::EmptyEof`] / [`HostVmResponseRead::Timeout`])
 //!   so the legacy file-based result path remains the fallback while
 //!   the guest-side send code is unwired.
-//! - **W2 part 3 (next):** modify `mvm-builder-init` to send
+//! - **W2 part 3 (next):** modify `mvm-host-vm-init` to send
 //!   [`HostVmResponse::Result`] on exit, wire the host's
 //!   single-shot path (`LibkrunBuilderVm::run_build`) to call
 //!   [`read_host_vm_response_from_socket`] before falling back to
@@ -303,8 +303,8 @@ pub struct JobTimings {
     pub teardown_ms: u64,
 }
 
-/// Wire-shape mirror of `mvm-builder-init`'s `BootTimings` struct
-/// (`crates/mvm-builder-init/src/boot_timings.rs`). The init crate
+/// Wire-shape mirror of `mvm-host-vm-init`'s `BootTimings` struct
+/// (`crates/mvm-host-vm-init/src/boot_timings.rs`). The init crate
 /// is binary-only and keeps its struct `pub(crate)`; this mirror
 /// lives in a publicly-importable spot so the host's response
 /// deserializer doesn't depend on builder-init internals. The two
@@ -423,7 +423,7 @@ pub fn read_host_vm_response(stream: &mut std::os::unix::net::UnixStream) -> Hos
 /// Write one framed [`HostVmResponse`] to a `UnixStream`. Mirror
 /// of [`read_host_vm_response`] — exists so unit tests of the
 /// reader can produce real wire bytes via the same framing
-/// `mvm-builder-init` will use in W2 part 3 (with the
+/// `mvm-host-vm-init` will use in W2 part 3 (with the
 /// host-vs-builder-init split, the actual guest emit will hand-roll
 /// the JSON to keep builder-init's dep tree small). The pair-test
 /// using this writer + the reader is the regression we want to lock
@@ -760,9 +760,9 @@ mod tests {
     #[test]
     fn boot_timings_wire_parses_builder_init_json_shape() {
         // Lock-step compatibility: this JSON is the exact wire-shape
-        // `mvm-builder-init`'s `BootTimings::to_json` emits (see the
+        // `mvm-host-vm-init`'s `BootTimings::to_json` emits (see the
         // `to_json_emits_all_fields_in_stable_order` test in
-        // `crates/mvm-builder-init/src/boot_timings.rs`). If anyone
+        // `crates/mvm-host-vm-init/src/boot_timings.rs`). If anyone
         // changes either side, this test fails and that's the
         // signal to re-sync the structs.
         let init_json = "{\"init_start_ms\":0,\

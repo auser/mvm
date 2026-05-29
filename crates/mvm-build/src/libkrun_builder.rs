@@ -35,7 +35,7 @@
 //!    `LibkrunBackend::start` which returns after the PID file
 //!    appears — the builder is a one-shot).
 //! 9. Read `<job_dir>/result` (JSON: `{exit_code, stderr_tail}`)
-//!    that `mvm-builder-init` wrote.
+//!    that `mvm-host-vm-init` wrote.
 //! 10. Validate the artifact dir now contains `rootfs.ext4` (and
 //!     optionally `vmlinux`); return `BuilderArtifacts`.
 //!
@@ -114,7 +114,7 @@ pub const GUEST_WORK_DIR: &str = "/work";
 pub const GUEST_OUT_DIR: &str = "/out";
 
 /// Where the persistent Nix store lives inside the builder VM. The
-/// `mvm-builder-init` PID-1 (Plan 72 W3) bind-mounts the virtio-blk
+/// `mvm-host-vm-init` PID-1 (Plan 72 W3) bind-mounts the virtio-blk
 /// device at this path before exec-ing the build script.
 pub const GUEST_NIX_DIR: &str = "/nix";
 
@@ -250,7 +250,7 @@ pub struct LibkrunBuilderVm {
     /// builder VM image in `~/.cache/mvm/builder-vm/<arch>/`.
     ///
     /// This is the Stage 0 escape from the chicken-and-egg on source
-    /// checkouts: a local dev image that contains `/sbin/mvm-builder-init`
+    /// checkouts: a local dev image that contains `/sbin/mvm-host-vm-init`
     /// can build the real builder VM image without downloading a
     /// published builder-VM artifact.
     pub image_override: Option<BuilderVmImage>,
@@ -703,7 +703,7 @@ impl BuilderVm for LibkrunBuilderVm {
 
         // 6. Stage the per-build job dir. Flake jobs get
         //    `cmd.sh`; install jobs get `install_spec.json`.
-        //    `mvm-builder-init` (Plan 72 W3 + Plan 73 Followup
+        //    `mvm-host-vm-init` (Plan 72 W3 + Plan 73 Followup
         //    B.2) dispatches based on which file it sees.
         let job_id = unique_job_id();
         let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
@@ -731,7 +731,7 @@ impl BuilderVm for LibkrunBuilderVm {
         })?;
 
         // Route the guest's serial console to a per-VM log file so
-        // failures of the in-VM cmd.sh / mvm-builder-init produce a
+        // failures of the in-VM cmd.sh / mvm-host-vm-init produce a
         // readable transcript. Without this, libkrun discards the
         // hvc0 output silently and "supervisor running, then exits 1"
         // is the only observable signal.
@@ -1313,7 +1313,7 @@ fn spawn_supervisor_and_wait(
 }
 
 /// Plan 89 W2 part 4 — spawn a background thread that reads the
-/// `HostVmResponse::Result` frame `mvm-builder-init` sends over
+/// `HostVmResponse::Result` frame `mvm-host-vm-init` sends over
 /// AF_VSOCK port [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`]
 /// right before reboot (W2 part 3). Returns a `Receiver` the caller
 /// drains after the supervisor exits via [`log_vsock_response_outcome`].
@@ -1682,13 +1682,13 @@ fn path_to_str<'a>(p: &'a Path, field: &str) -> Result<&'a str, BuilderVmError> 
 // ============================================================
 
 /// Filename of the marker the host stages under `<job_dir>/` to
-/// tell `mvm-builder-init` to enter its dispatch loop (W3 part 3)
+/// tell `mvm-host-vm-init` to enter its dispatch loop (W3 part 3)
 /// instead of running the single-shot `cmd.sh` / `install_spec`
 /// flow. Same key as the path the guest checks.
 pub const DISPATCH_SOCK_MARKER: &str = "dispatch.sock.marker";
 
 /// Plan 89 W3 part 4 — spawn the long-lived builder VM that
-/// `mvm-builder-init`'s W3 part 3 dispatch loop runs inside.
+/// `mvm-host-vm-init`'s W3 part 3 dispatch loop runs inside.
 ///
 /// Mirrors the config surface of [`LibkrunBuilderVm`] but
 /// produces a different shape of dispatch: instead of running a
@@ -1852,7 +1852,7 @@ impl LibkrunPersistentHostVm {
 }
 
 /// Stage `<job_dir>/<DISPATCH_SOCK_MARKER>` so the in-guest
-/// `mvm-builder-init` enters its W3 part 3 dispatch loop instead
+/// `mvm-host-vm-init` enters its W3 part 3 dispatch loop instead
 /// of the single-shot cmd.sh / install_spec flow. The marker
 /// body is intentionally empty — its mere existence is the
 /// signal.
@@ -1934,7 +1934,7 @@ impl PersistentVmHandle {
     /// Block until the supervisor child exits. Normal way to
     /// reach this is the supervisor sending `HostVmRequest::Shutdown`,
     /// the guest dispatch loop processing it + replying `Bye`,
-    /// then `mvm-builder-init` calling `reboot(RB_POWER_OFF)`,
+    /// then `mvm-host-vm-init` calling `reboot(RB_POWER_OFF)`,
     /// then libkrun's `krun_start_enter` returning, then the
     /// supervisor exiting `main`. Consumes the child; subsequent
     /// calls return [`BuilderVmError::ExtractionFailed`].
@@ -2233,7 +2233,7 @@ mod tests {
     fn stage_job_dir_install_copies_spec_into_job_dir() {
         // Plan 73 Followup B.2: install jobs stage
         // `<job_dir>/install_spec.json` rather than `cmd.sh`. The
-        // guest's `mvm-builder-init` probes for that filename and
+        // guest's `mvm-host-vm-init` probes for that filename and
         // dispatches through the install pipeline.
         let scratch = TempDir::new().unwrap();
         let job_dir = scratch.path().join("job-1");

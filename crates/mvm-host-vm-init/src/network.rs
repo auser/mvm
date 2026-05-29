@@ -7,7 +7,7 @@
 //! the in-VM proxy is reachable from `localhost:8443`) and
 //! outbound traffic owned by the proxy's uid are allowed out.
 //!
-//! Called from `mvm-builder-init`'s boot sequence after the
+//! Called from `mvm-host-vm-init`'s boot sequence after the
 //! basic `setup_network()`. Failure is **fatal** — without the
 //! lockdown, the builder VM's egress allowlist is unenforced and
 //! ADR-002's Claim 9 transitive trust onto the builder VM has no
@@ -18,7 +18,7 @@ use std::process::Command;
 /// Dedicated uid the in-VM `mvm-egress-proxy` runs under. The
 /// iptables `--uid-owner` rule keys off this value, so it must
 /// match the uid the proxy actually executes as
-/// (`crates/mvm-builder-init/src/proxy.rs` passes the same
+/// (`crates/mvm-host-vm-init/src/proxy.rs` passes the same
 /// constant to `Command::uid` before exec). Picked between
 /// `mk-guest.nix`'s `entrypointUid` (default 1000) and
 /// `agentUid` (default 1900) to avoid collisions.

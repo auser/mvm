@@ -103,7 +103,7 @@ fi
 #
 # Size cap: 14 GiB. The original 4 GiB assumed a ~600 MB closure
 # (builder-VM rootfs only). With Plan 95's slim-kernel + the Rust
-# binaries (`mvm-builder-init`, `mvm-egress-proxy`) building in the
+# binaries (`mvm-host-vm-init`, `mvm-egress-proxy`) building in the
 # same VM, the working set runs:
 #   kernel intermediates (~3 GiB) +
 #   rustc-wrapper substitute closure (~2 GiB) +
@@ -172,7 +172,7 @@ echo "stage0-init: building ${FLAKE_REF}" >&2
 #
 # --max-jobs 1 caps derivation parallelism inside Stage 0. With
 # Alpine nix's default `max-jobs = auto`, four heavy derivations
-# (mvm-builder-init, mvm-egress-proxy, mvm-guest-agent, the slim
+# (mvm-host-vm-init, mvm-egress-proxy, mvm-guest-agent, the slim
 # Linux kernel) run concurrently and the combined working set
 # exceeds the 16 GiB guest RAM / 14 GiB `/nix` tmpfs envelope —
 # SIGKILL at `HOSTCC scripts/basic/fixdep`. libkrun_builder.rs:92-99

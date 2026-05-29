@@ -2,7 +2,7 @@
 //! (Plan 73 Followup B.2, ADR-047).
 //!
 //! The host stages a JSON spec at `/job/install_spec.json` and
-//! `mvm-builder-init`, at PID 1, parses it and dispatches the
+//! `mvm-host-vm-init`, at PID 1, parses it and dispatches the
 //! per-language install protocol. This module is cross-platform on
 //! purpose — the install-spec shape is part of the host↔guest wire
 //! contract and the parser sees coverage from `cargo test` on every

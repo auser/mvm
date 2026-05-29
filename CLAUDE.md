@@ -229,7 +229,7 @@ the source gap analysis is at
 11. **Every application-dep volume is hash-locked, attestation-checked,
    CVE-scanned, SBOM-enumerated, and bound to the workload's audit
    chain.** ADR-047 / Plan 73 Followups A + B.1/B.2/B.3 + C + D wire
-   this end-to-end: the builder VM (`mvm-builder-init` +
+   this end-to-end: the builder VM (`mvm-host-vm-init` +
    `LibkrunBuilderVm::run_build` Install arm) installs deps into a
    sealed volume at `~/.mvm/volumes/deps/<volume_hash>/` carrying
    `content/`, `sbom.cdx.json`, `fetch.log`, `cve.json`, and a

@@ -51,7 +51,7 @@ use crate::proxy::{PROXY_URL, ProxyLifecycle};
 /// (`mvm_sdk::compile::deps_audit::FILE_CONTENT_DIR`) so the host
 /// can rename `<job_dir>` straight into a sealed volume without
 /// shuffling files. Mirrors that constant explicitly rather than
-/// re-exporting because `mvm-builder-init` doesn't depend on
+/// re-exporting because `mvm-host-vm-init` doesn't depend on
 /// `mvm-sdk` (kept tiny per Plan 72 §W3 size budget).
 pub const CONTENT_SUBDIR: &str = "content";
 pub const SBOM_FILENAME: &str = "sbom.cdx.json";
@@ -87,7 +87,7 @@ pub struct InstallReport {
 
 impl InstallReport {
     /// Hand-rolled JSON serializer — matches the style of
-    /// `mvm-builder-init::linux::write_result`. Keeps `serde_json`
+    /// `mvm-host-vm-init::linux::write_result`. Keeps `serde_json`
     /// out of the init binary's closure.
     pub fn to_json(&self) -> String {
         format!(
@@ -478,7 +478,7 @@ fn run_sbom(
     };
     if !runner.is_available(program, extra_path) {
         eprintln!(
-            "mvm-builder-init: SBOM tool `{program}` not on PATH — writing CycloneDX empty stub. \
+            "mvm-host-vm-init: SBOM tool `{program}` not on PATH — writing CycloneDX empty stub. \
              B.2.x will hard-gate this once the builder VM flake guarantees the tool."
         );
         let _ = fs::write(sbom_path, SBOM_EMPTY_STUB);
@@ -489,13 +489,13 @@ fn run_sbom(
         Ok(0) => true,
         Ok(code) => {
             eprintln!(
-                "mvm-builder-init: SBOM tool `{program}` exited {code} — writing CycloneDX stub"
+                "mvm-host-vm-init: SBOM tool `{program}` exited {code} — writing CycloneDX stub"
             );
             let _ = fs::write(sbom_path, SBOM_EMPTY_STUB);
             false
         }
         Err(e) => {
-            eprintln!("mvm-builder-init: SBOM tool spawn failed: {e}");
+            eprintln!("mvm-host-vm-init: SBOM tool spawn failed: {e}");
             let _ = fs::write(sbom_path, SBOM_EMPTY_STUB);
             false
         }
@@ -534,7 +534,7 @@ fn run_cve(
     };
     if !runner.is_available(program, extra_path) {
         eprintln!(
-            "mvm-builder-init: CVE tool `{program}` not on PATH — writing empty-results stub. \
+            "mvm-host-vm-init: CVE tool `{program}` not on PATH — writing empty-results stub. \
              B.2.x will hard-gate this once the builder VM flake guarantees the tool."
         );
         let _ = fs::write(cve_path, CVE_EMPTY_STUB);
@@ -551,7 +551,7 @@ fn run_cve(
         // termination) propagates as a stub fallback.
         Ok(_code) => cve_path.is_file(),
         Err(e) => {
-            eprintln!("mvm-builder-init: CVE tool spawn failed: {e}");
+            eprintln!("mvm-host-vm-init: CVE tool spawn failed: {e}");
             let _ = fs::write(cve_path, CVE_EMPTY_STUB);
             false
         }

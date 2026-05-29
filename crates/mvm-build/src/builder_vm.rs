@@ -168,7 +168,7 @@ pub enum BuilderArtifacts {
         /// `mvm_sdk::compile::deps_audit::verify_sealed_volume` to
         /// derive the canonical `volume_hash`.
         volume_dir: PathBuf,
-        /// JSON sidecar emitted by `mvm-builder-init` next to the
+        /// JSON sidecar emitted by `mvm-host-vm-init` next to the
         /// volume describing the install outcome (exit code,
         /// installer stderr tail, timings). Shape pinned by
         /// Followup B.2.

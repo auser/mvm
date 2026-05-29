@@ -99,25 +99,35 @@ in lockstep means:
   rebuilt — `mvmctl dev up` users see a fail-closed rebuild prompt
   on first run after upgrade.
 
-- [ ] **A1.3.crate** Rename crate dir + `Cargo.toml` `package.name`
+- [x] **A1.3.crate** Rename crate dir + `Cargo.toml` `package.name`
       + `[[bin]] name` + workspace members entry. Update
       `mvm_builder_init` → `mvm_host_vm_init` across all Rust
-      imports (~30 call sites).
-- [ ] **A1.3.stage0** Update the Stage 0 byte-scan constants +
-      kernel cmdline + rootfs path everywhere — seven sites in
-      `apple_container.rs` plus any other `/sbin/mvm-builder-init`
-      literal in the tree.
-- [ ] **A1.3.nix** Update Nix flakes that copy the binary into
+      imports.
+- [x] **A1.3.stage0** Update the Stage 0 byte-scan constants +
+      kernel cmdline + rootfs path everywhere — 15 sites in
+      `apple_container.rs`, plus `BUILDER_INIT_PATH` const renamed
+      to `HOST_VM_INIT_PATH`, plus `stage0/init.sh`.
+- [x] **A1.3.nix** Update Nix flakes that copy the binary into
       the rootfs: `nix/lib/mk-guest.nix`,
       `nix/images/builder/flake.nix`,
-      `nix/images/builder-vm/flake.nix`.
-- [ ] **A1.3.ci** Update `.github/workflows/ci.yml` paths.
-- [ ] **A1.3.docs** Update `CLAUDE.md` and any spec docs that
-      reference the active surface (not historical specs).
-- [ ] **A1.3.guest-arm** Guest-side dispatch loop branches on
+      `nix/images/builder-vm/flake.nix`,
+      `nix/images/builder-vm/kernel/`.
+- [x] **A1.3.ci** Update `.github/workflows/ci.yml` paths.
+- [x] **A1.3.docs** Update `CLAUDE.md`, public docs
+      (`builder-vm.md`, `guest-agent.md`), scripts
+      (`plan-89-baseline.sh`, `test-app-deps-ci-gate.sh`), and the
+      `plan-89-baseline` fixture flake. Historical spec docs left
+      untouched intentionally — they describe behaviour at the
+      time they were written.
+- [x] **A1.3.guest-arm** Guest-side dispatch loop branches on
       request kind: Nix builds (existing arm, unchanged behaviour)
-      vs. workload spawn (new arm, stubbed with `unimplemented!()`
-      until A2.2 fills it in).
+      vs. workload spawn — `WorkloadStart`/`WorkloadStop`/
+      `WorkloadStatus` parse via the local `HostVmRequest` mirror
+      in `mvm-host-vm-init/src/builder_request.rs`; dispatch loop
+      arms in `main.rs` panic with `unimplemented!()` carrying the
+      received `workload_id`, so a future host-side regression
+      that accidentally sends a Workload* before A2.2 lands is
+      caught loudly at boot rather than silently dropped.
 
 Exit (A1b): `cargo test --workspace` green; `mvmctl dev up` boots
 a freshly-built rootfs through the renamed binary; cached

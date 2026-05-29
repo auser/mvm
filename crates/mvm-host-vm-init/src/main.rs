@@ -1,4 +1,4 @@
-//! mvm-builder-init — PID 1 for the libkrun builder VM.
+//! mvm-host-vm-init — PID 1 for the libkrun builder VM.
 //!
 //! Plan 72 W3 (`specs/plans/72-builder-vm-via-libkrun.md`). Tiny
 //! static-linked init that mounts the essentials, brings up the
@@ -105,7 +105,7 @@ fn main() -> ExitCode {
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!(
-            "mvm-builder-init is Linux-only (PID 1 for the libkrun \
+            "mvm-host-vm-init is Linux-only (PID 1 for the libkrun \
              builder VM). On a developer host this binary is a no-op; \
              mkGuest cross-compiles the real init for \
              <arch>-unknown-linux-musl. See \
@@ -451,7 +451,7 @@ mod linux {
     const INSTALL_SPEC_FILENAME: &str = "install_spec.json";
 
     pub fn run() -> ExitCode {
-        eprintln!("mvm-builder-init: pid 1 starting");
+        eprintln!("mvm-host-vm-init: pid 1 starting");
 
         // The Linux kernel doesn't pass a PATH to PID 1, so without
         // this every `Command::new("iptables")` /
@@ -488,7 +488,7 @@ mod linux {
         // every subsequent phase needs /proc, /sys, /dev to be
         // readable.
         if let Err(e) = mount_pseudofs() {
-            eprintln!("mvm-builder-init: mount_pseudofs failed: {e}");
+            eprintln!("mvm-host-vm-init: mount_pseudofs failed: {e}");
             write_result(2, &format!("mount_pseudofs failed: {e}"));
             stamp(&timings, |t| {
                 t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
@@ -526,7 +526,7 @@ mod linux {
             let timings = Arc::clone(&timings);
             std::thread::spawn(move || {
                 if let Err(e) = setup_network() {
-                    eprintln!("mvm-builder-init: setup_network warning (non-fatal): {e}");
+                    eprintln!("mvm-host-vm-init: setup_network warning (non-fatal): {e}");
                     // Leave network_ready_ms = None — the JSON
                     // signals "offline build" downstream.
                     return;
@@ -539,7 +539,7 @@ mod linux {
 
         // Track A on the main thread.
         if let Err(e) = setup_nix_store(&timings, anchor) {
-            eprintln!("mvm-builder-init: setup_nix_store failed: {e}");
+            eprintln!("mvm-host-vm-init: setup_nix_store failed: {e}");
             // Drain the other tracks so their threads don't get
             // orphaned across the reboot syscall.
             let _ = track_b.join();
@@ -594,11 +594,11 @@ mod linux {
             // signal still distinguishes the two contexts.
             if egress_error_indicates_no_netfilter(&e) {
                 eprintln!(
-                    "mvm-builder-init: egress lockdown SKIPPED (kernel lacks netfilter — \
+                    "mvm-host-vm-init: egress lockdown SKIPPED (kernel lacks netfilter — \
                      Stage 0 / libkrunfw-bundled-kernel context): {e}"
                 );
             } else {
-                eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
+                eprintln!("mvm-host-vm-init: egress lockdown FAILED (fatal): {e}");
                 write_result(2, &format!("egress lockdown failed: {e}"));
                 return power_off();
             }
@@ -612,7 +612,7 @@ mod linux {
         // install_spec flows exactly.
         let dispatch_marker = format!("{JOB_DIR}/dispatch.sock.marker");
         if Path::new(&dispatch_marker).exists() {
-            eprintln!("mvm-builder-init: dispatch marker detected, entering W3 dispatch loop");
+            eprintln!("mvm-host-vm-init: dispatch marker detected, entering W3 dispatch loop");
             stamp(&timings, |t| {
                 t.job_start_ms = Some(BootTimings::ms_since(anchor))
             });
@@ -624,7 +624,7 @@ mod linux {
                 Ok(t) => Some(t.clone()),
                 Err(_) => {
                     eprintln!(
-                        "mvm-builder-init: dispatch: timings mutex poisoned, omitting boot_timings"
+                        "mvm-host-vm-init: dispatch: timings mutex poisoned, omitting boot_timings"
                     );
                     None
                 }
@@ -643,7 +643,7 @@ mod linux {
         // existing cmd.sh flake-build flow.
         let install_spec_path = format!("{JOB_DIR}/{INSTALL_SPEC_FILENAME}");
         if Path::new(&install_spec_path).exists() {
-            eprintln!("mvm-builder-init: install spec detected, routing through install pipeline");
+            eprintln!("mvm-host-vm-init: install spec detected, routing through install pipeline");
             stamp(&timings, |t| {
                 t.job_start_ms = Some(BootTimings::ms_since(anchor))
             });
@@ -690,7 +690,7 @@ mod linux {
             Ok(t) => t.clone(),
             Err(_) => {
                 eprintln!(
-                    "mvm-builder-init: boot-timings mutex poisoned; \
+                    "mvm-host-vm-init: boot-timings mutex poisoned; \
                      skipping vsock dispatch send"
                 );
                 stamp(&timings, |t| {
@@ -797,7 +797,7 @@ mod linux {
     fn open_dispatch_listener_fd(accept_timeout_secs: Option<i64>) -> Option<i32> {
         let listen_fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if listen_fd < 0 {
-            eprintln!("mvm-builder-init: vsock: socket() failed");
+            eprintln!("mvm-host-vm-init: vsock: socket() failed");
             return None;
         }
         let addr = SockAddrVm {
@@ -815,13 +815,13 @@ mod linux {
             )
         };
         if rc < 0 {
-            eprintln!("mvm-builder-init: vsock: bind() failed on port {BUILDER_DISPATCH_PORT}");
+            eprintln!("mvm-host-vm-init: vsock: bind() failed on port {BUILDER_DISPATCH_PORT}");
             unsafe { close(listen_fd) };
             return None;
         }
         let rc = unsafe { listen(listen_fd, 1) };
         if rc < 0 {
-            eprintln!("mvm-builder-init: vsock: listen() failed");
+            eprintln!("mvm-host-vm-init: vsock: listen() failed");
             unsafe { close(listen_fd) };
             return None;
         }
@@ -840,7 +840,7 @@ mod linux {
                 )
             };
             if rc < 0 {
-                eprintln!("mvm-builder-init: vsock: setsockopt SO_RCVTIMEO failed (continuing)");
+                eprintln!("mvm-host-vm-init: vsock: setsockopt SO_RCVTIMEO failed (continuing)");
             }
         }
         Some(listen_fd)
@@ -888,7 +888,7 @@ mod linux {
         let frame_len = u32::from_be_bytes(len_buf);
         if frame_len > MAX_DISPATCH_BODY_BYTES {
             eprintln!(
-                "mvm-builder-init: dispatch: frame too large ({frame_len} > \
+                "mvm-host-vm-init: dispatch: frame too large ({frame_len} > \
                  {MAX_DISPATCH_BODY_BYTES})"
             );
             return None;
@@ -907,7 +907,7 @@ mod linux {
         };
         let Some(conn_fd) = accept_one(listen_fd) else {
             eprintln!(
-                "mvm-builder-init: vsock send: no host connection within {ACCEPT_TIMEOUT_SECS}s \
+                "mvm-host-vm-init: vsock send: no host connection within {ACCEPT_TIMEOUT_SECS}s \
                  (single-shot path; W2 part 4 wired the host receiver)"
             );
             unsafe { close(listen_fd) };
@@ -916,7 +916,7 @@ mod linux {
         let mut conn = adopt_conn_fd(conn_fd);
         let json = payload.to_json();
         if !write_frame(&mut conn, json.as_bytes()) {
-            eprintln!("mvm-builder-init: vsock send: write failed mid-frame");
+            eprintln!("mvm-host-vm-init: vsock send: write failed mid-frame");
         }
         drop(conn);
         unsafe { close(listen_fd) };
@@ -950,16 +950,16 @@ mod linux {
         // outer `mvmctl dev down` signals shutdown via a
         // `HostVmRequest::Shutdown` frame on a fresh connection.
         let Some(listen_fd) = open_dispatch_listener_fd(None) else {
-            eprintln!("mvm-builder-init: dispatch loop: listener setup failed");
+            eprintln!("mvm-host-vm-init: dispatch loop: listener setup failed");
             return 1;
         };
-        eprintln!("mvm-builder-init: dispatch loop ready on AF_VSOCK port {BUILDER_DISPATCH_PORT}");
+        eprintln!("mvm-host-vm-init: dispatch loop ready on AF_VSOCK port {BUILDER_DISPATCH_PORT}");
         loop {
             let Some(conn_fd) = accept_one(listen_fd) else {
                 // accept() failed with no timeout configured —
                 // typically a kernel-level error (e.g. EMFILE). Log
                 // and continue; another accept will likely succeed.
-                eprintln!("mvm-builder-init: dispatch loop: accept failed (retrying)");
+                eprintln!("mvm-host-vm-init: dispatch loop: accept failed (retrying)");
                 continue;
             };
             // One File owns the conn fd for both the read (request)
@@ -968,13 +968,13 @@ mod linux {
             // its mvm_guest::vsock::read_frame.
             let mut conn = adopt_conn_fd(conn_fd);
             let Some(body) = read_frame(&mut conn) else {
-                eprintln!("mvm-builder-init: dispatch loop: read failed on conn (ignoring)");
+                eprintln!("mvm-host-vm-init: dispatch loop: read failed on conn (ignoring)");
                 continue;
             };
             let request = match crate::builder_request::parse(&body) {
                 Ok(req) => req,
                 Err(e) => {
-                    eprintln!("mvm-builder-init: dispatch loop: parse failed: {e}");
+                    eprintln!("mvm-host-vm-init: dispatch loop: parse failed: {e}");
                     continue;
                 }
             };
@@ -992,19 +992,44 @@ mod linux {
                         cold_boot_timings.take(),
                     );
                     if !write_frame(&mut conn, response.as_bytes()) {
-                        eprintln!("mvm-builder-init: dispatch loop: write Result failed mid-frame");
+                        eprintln!("mvm-host-vm-init: dispatch loop: write Result failed mid-frame");
                     }
                 }
                 crate::builder_request::HostVmRequest::Shutdown => {
-                    eprintln!("mvm-builder-init: dispatch loop: shutdown requested");
+                    eprintln!("mvm-host-vm-init: dispatch loop: shutdown requested");
                     let bye = crate::dispatch_response::bye_json();
                     if !write_frame(&mut conn, bye.as_bytes()) {
                         eprintln!(
-                            "mvm-builder-init: dispatch loop: write Bye failed (continuing to shutdown)"
+                            "mvm-host-vm-init: dispatch loop: write Bye failed (continuing to shutdown)"
                         );
                     }
                     drop(conn);
                     break;
+                }
+                // Plan 107 A1b — workload arms reach the guest-side
+                // dispatcher but the Firecracker-in-guest spawn path
+                // doesn't exist yet (A2.2). Until A2.2 lands, the
+                // host-side dispatch path (PersistentBuilderSupervisor
+                // in mvm-build/persistent_builder.rs) only sends `Run`
+                // and `Shutdown` requests, so these arms are
+                // unreachable in production. If a future host slice
+                // accidentally sends a Workload* before the guest is
+                // ready, panic loudly so the regression is caught at
+                // boot rather than silently dropped on the floor.
+                crate::builder_request::HostVmRequest::WorkloadStart { workload_id } => {
+                    unimplemented!(
+                        "mvm-host-vm-init: WorkloadStart received for workload_id={workload_id}; Firecracker-in-guest spawn path lands in Plan 107 A2.2"
+                    );
+                }
+                crate::builder_request::HostVmRequest::WorkloadStop { workload_id } => {
+                    unimplemented!(
+                        "mvm-host-vm-init: WorkloadStop received for workload_id={workload_id}; Firecracker-in-guest stop path lands in Plan 107 A2.2"
+                    );
+                }
+                crate::builder_request::HostVmRequest::WorkloadStatus { workload_id } => {
+                    unimplemented!(
+                        "mvm-host-vm-init: WorkloadStatus received for workload_id={workload_id}; Firecracker-in-guest status path lands in Plan 107 A2.2"
+                    );
                 }
             }
             // Conn drops at end of iteration; the host's read on
@@ -1085,7 +1110,7 @@ mod linux {
         fn drop(&mut self) {
             if let Err(e) = std::fs::remove_dir_all(&self.path) {
                 eprintln!(
-                    "mvm-builder-init: dispatch loop: failed to clean up {path}: {e}",
+                    "mvm-host-vm-init: dispatch loop: failed to clean up {path}: {e}",
                     path = self.path
                 );
             }
@@ -1121,7 +1146,7 @@ mod linux {
             &crate::network::SystemIptables,
             crate::network::PROXY_UID,
         ) {
-            eprintln!("mvm-builder-init: dispatch loop: iptables baseline re-apply failed: {e}");
+            eprintln!("mvm-host-vm-init: dispatch loop: iptables baseline re-apply failed: {e}");
             let response = crate::dispatch_response::DispatchResponse {
                 job_id,
                 exit_code: 126,
@@ -1168,7 +1193,7 @@ mod linux {
                         }
                         Err(e) => {
                             eprintln!(
-                                "mvm-builder-init: dispatch loop: failed to create scratch for {job_id}: {e}"
+                                "mvm-host-vm-init: dispatch loop: failed to create scratch for {job_id}: {e}"
                             );
                             (None, None)
                         }
@@ -1190,7 +1215,7 @@ mod linux {
                                 // fail loudly back in the
                                 // dispatch loop.
                                 eprintln!(
-                                    "mvm-builder-init: dispatch loop: write StderrChunk failed"
+                                    "mvm-host-vm-init: dispatch loop: write StderrChunk failed"
                                 );
                             }
                         },
@@ -1293,15 +1318,15 @@ mod linux {
         let snapshot = match timings.lock() {
             Ok(t) => t.clone(),
             Err(_) => {
-                eprintln!("mvm-builder-init: boot-timings mutex poisoned; skipping JSON write");
+                eprintln!("mvm-host-vm-init: boot-timings mutex poisoned; skipping JSON write");
                 return;
             }
         };
         let json = snapshot.to_json();
-        eprintln!("mvm-builder-init: boot-timings={json}");
+        eprintln!("mvm-host-vm-init: boot-timings={json}");
         let path = format!("{JOB_DIR}/boot-timings.json");
         if let Err(e) = std::fs::write(&path, format!("{json}\n")) {
-            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+            eprintln!("mvm-host-vm-init: failed to write {path}: {e}");
         }
     }
 
@@ -1339,7 +1364,7 @@ mod linux {
         let bytes = match std::fs::read(spec_path) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("mvm-builder-init: read {spec_path}: {e}");
+                eprintln!("mvm-host-vm-init: read {spec_path}: {e}");
                 write_install_failure_at(out_dir, 2, &format!("read install spec: {e}"));
                 return;
             }
@@ -1347,7 +1372,7 @@ mod linux {
         let spec = match parse(&bytes) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("mvm-builder-init: parse {spec_path}: {e}");
+                eprintln!("mvm-host-vm-init: parse {spec_path}: {e}");
                 write_install_failure_at(out_dir, 2, &format!("parse install spec: {e}"));
                 return;
             }
@@ -1359,7 +1384,7 @@ mod linux {
         // the host's mkdir hasn't reached the guest's view of the
         // virtio-fs share yet).
         if let Err(e) = std::fs::create_dir_all(out_dir) {
-            eprintln!("mvm-builder-init: create_dir_all {out_dir}: {e}");
+            eprintln!("mvm-host-vm-init: create_dir_all {out_dir}: {e}");
             // Fall through; write_install_failure_at will try to
             // write into the dir and the host will see whatever
             // partial state results.
@@ -1369,7 +1394,7 @@ mod linux {
         // Plan 73 Followup B.2.x: the production proxy lifecycle
         // spawns `mvm-egress-proxy` from PATH. The builder VM
         // flake installs the binary at `/sbin/mvm-egress-proxy`
-        // (alongside `/sbin/mvm-builder-init`), which is on the
+        // (alongside `/sbin/mvm-host-vm-init`), which is on the
         // kernel's default PATH for PID 1.
         let mut proxy = ChildProxyLifecycle::default_binary();
         let ctx = InstallContext {
@@ -1384,7 +1409,7 @@ mod linux {
             Ok(r) => r,
             Err(InstallError::InstallerMissing { program }) => {
                 eprintln!(
-                    "mvm-builder-init: installer `{program}` not on PATH — builder VM is missing required tools"
+                    "mvm-host-vm-init: installer `{program}` not on PATH — builder VM is missing required tools"
                 );
                 write_install_failure_at(
                     out_dir,
@@ -1394,7 +1419,7 @@ mod linux {
                 return;
             }
             Err(InstallError::Io(why)) => {
-                eprintln!("mvm-builder-init: install pipeline IO: {why}");
+                eprintln!("mvm-host-vm-init: install pipeline IO: {why}");
                 write_install_failure_at(out_dir, 2, &format!("install pipeline IO: {why}"));
                 return;
             }
@@ -1409,7 +1434,7 @@ mod linux {
         // serde_json into the init binary's closure.
         let path = format!("{out_dir}/{RESULT_FILENAME}");
         if let Err(e) = std::fs::write(&path, format!("{}\n", report.to_json())) {
-            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+            eprintln!("mvm-host-vm-init: failed to write {path}: {e}");
         }
     }
 
@@ -1438,10 +1463,10 @@ mod linux {
         // dispatch out_dir doesn't exist yet), at least try /job so
         // the host has *somewhere* to pick up the failure signal.
         if let Err(e) = std::fs::write(&path, format!("{body}\n")) {
-            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+            eprintln!("mvm-host-vm-init: failed to write {path}: {e}");
             let fallback = format!("{JOB_DIR}/{RESULT_FILENAME}");
             if let Err(e2) = std::fs::write(&fallback, format!("{body}\n")) {
-                eprintln!("mvm-builder-init: failed to write {fallback}: {e2}");
+                eprintln!("mvm-host-vm-init: failed to write {fallback}: {e2}");
             }
         }
     }
@@ -1477,7 +1502,7 @@ mod linux {
         // `/run` tmpfs makes `install_egress_lockdown` bail with
         // "Read-only file system" at the first `iptables -A` call.
         // mkGuest's /init does the equivalent for the dev image's
-        // boot path; we replicate it here for the mvm-builder-init
+        // boot path; we replicate it here for the mvm-host-vm-init
         // path (Plan 86).
         mount_fs_idempotent("tmpfs", "/run", "tmpfs")?;
         // `/dev/pts` is required by nix's build-sandbox setup: it
@@ -1512,7 +1537,7 @@ mod linux {
         std::fs::create_dir_all(NIX_STORE_MOUNT)
             .map_err(|e| format!("create {NIX_STORE_MOUNT}: {e}"))?;
         if let Some(reason) = nix_store_dev_needs_format(NIX_STORE_DEV)? {
-            eprintln!("mvm-builder-init: formatting {NIX_STORE_DEV} ({reason})");
+            eprintln!("mvm-host-vm-init: formatting {NIX_STORE_DEV} ({reason})");
             format_ext4(NIX_STORE_DEV)?;
         }
         mount_fs(NIX_STORE_DEV, NIX_STORE_MOUNT, "ext4")?;
@@ -1530,7 +1555,7 @@ mod linux {
             Ok(()) => {}
             Err(e) => {
                 eprintln!(
-                    "mvm-builder-init: overlay /nix setup failed ({e}); falling back to seed copy"
+                    "mvm-host-vm-init: overlay /nix setup failed ({e}); falling back to seed copy"
                 );
                 seed_nix_store(timings, anchor)?;
                 std::fs::create_dir_all(NIX_TARGET)
@@ -1554,7 +1579,7 @@ mod linux {
         // unparseable manifest still boots — at most regresses to
         // the pre-fix substituter race.
         if let Err(e) = load_seeded_nix_db(timings, anchor) {
-            eprintln!("mvm-builder-init: load_seeded_nix_db warning (non-fatal): {e}");
+            eprintln!("mvm-host-vm-init: load_seeded_nix_db warning (non-fatal): {e}");
         }
 
         Ok(())
@@ -1597,7 +1622,7 @@ mod linux {
         // surfaces as a normal file-not-found inside cmd.sh.
         for (tag, target) in VIRTIOFS_MOUNTS {
             if let Err(e) = mount_virtiofs(tag, target) {
-                eprintln!("mvm-builder-init: virtio-fs '{tag}' -> {target} failed: {e}");
+                eprintln!("mvm-host-vm-init: virtio-fs '{tag}' -> {target} failed: {e}");
             }
         }
         stamp(timings, |t| {
@@ -1612,10 +1637,10 @@ mod linux {
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => eprintln!(
-                "mvm-builder-init: modprobe {module} exited {} (continuing)",
+                "mvm-host-vm-init: modprobe {module} exited {} (continuing)",
                 s.code().unwrap_or(-1)
             ),
-            Err(e) => eprintln!("mvm-builder-init: spawn modprobe {module}: {e} (continuing)"),
+            Err(e) => eprintln!("mvm-host-vm-init: spawn modprobe {module}: {e} (continuing)"),
         }
     }
 
@@ -1632,7 +1657,7 @@ mod linux {
         if fallback.is_file() {
             if let Err(e) = std::fs::copy(fallback, "/run/resolv.conf") {
                 eprintln!(
-                    "mvm-builder-init: copy /etc/resolv.conf.fallback -> \
+                    "mvm-host-vm-init: copy /etc/resolv.conf.fallback -> \
                      /run/resolv.conf: {e} (continuing — udhcpc may fix it)"
                 );
             }
@@ -1652,7 +1677,7 @@ mod linux {
         // ioctl ourselves before spawning udhcpc.
         if let Err(e) = bring_iface_up("eth0") {
             eprintln!(
-                "mvm-builder-init: bring_iface_up eth0 failed: {e} \
+                "mvm-host-vm-init: bring_iface_up eth0 failed: {e} \
                  (continuing — udhcpc will surface a clearer error \
                  if the link is genuinely absent)"
             );
@@ -1978,7 +2003,7 @@ mod linux {
         );
         let path = format!("{JOB_DIR}/result");
         if let Err(e) = std::fs::write(&path, body) {
-            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+            eprintln!("mvm-host-vm-init: failed to write {path}: {e}");
         }
     }
 
@@ -2020,14 +2045,14 @@ mod linux {
     /// `mount_fs` that treats EBUSY as success. libkrun's kernel
     /// pre-mounts some of `/proc`, `/sys`, `/dev` depending on
     /// cmdline + initramfs config; without this tolerance,
-    /// mvm-builder-init bails on its first such call instead of
+    /// mvm-host-vm-init bails on its first such call instead of
     /// reaching the user's cmd.sh.
     fn mount_fs_idempotent(source: &str, target: &str, fstype: &str) -> Result<(), String> {
         match mount_fs(source, target, fstype) {
             Ok(()) => Ok(()),
             Err(e) if e.contains("EBUSY") => {
                 eprintln!(
-                    "mvm-builder-init: {target} ({fstype}) already mounted (EBUSY) — continuing"
+                    "mvm-host-vm-init: {target} ({fstype}) already mounted (EBUSY) — continuing"
                 );
                 Ok(())
             }
@@ -2099,7 +2124,7 @@ mod linux {
             return Ok(());
         }
 
-        eprintln!("mvm-builder-init: seeding {NIX_STORE_MOUNT} from {NIX_TARGET} (first boot)");
+        eprintln!("mvm-host-vm-init: seeding {NIX_STORE_MOUNT} from {NIX_TARGET} (first boot)");
         let status = Command::new("/bin/cp")
             .args([
                 "-aR",
@@ -2155,7 +2180,7 @@ mod linux {
         }
 
         eprintln!(
-            "mvm-builder-init: loading seeded paths into nix DB from {NIX_PATH_REGISTRATION}"
+            "mvm-host-vm-init: loading seeded paths into nix DB from {NIX_PATH_REGISTRATION}"
         );
         let manifest = std::fs::File::open(NIX_PATH_REGISTRATION)
             .map_err(|e| format!("open {NIX_PATH_REGISTRATION}: {e}"))?;
@@ -2175,7 +2200,7 @@ mod linux {
         // non-fatal — worst case we re-run the idempotent load.
         if let Err(e) = std::fs::write(NIX_DB_LOADED_MARKER, b"") {
             eprintln!(
-                "mvm-builder-init: could not write {NIX_DB_LOADED_MARKER}: {e} \
+                "mvm-host-vm-init: could not write {NIX_DB_LOADED_MARKER}: {e} \
                  (continuing — next boot will re-load the DB)"
             );
         }
@@ -2348,7 +2373,7 @@ mod linux {
         match reboot(RebootMode::RB_POWER_OFF) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("mvm-builder-init: reboot syscall failed: {e}");
+                eprintln!("mvm-host-vm-init: reboot syscall failed: {e}");
                 ExitCode::FAILURE
             }
         }

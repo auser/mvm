@@ -16,7 +16,7 @@
 #
 #   2. Hand-seal a sealed deps volume via
 #      `seal_volume(content + sbom + fetch_log + cve)` using the wire
-#      shape `mvm-builder-init::install::seal` produces inside the
+#      shape `mvm-host-vm-init::install::seal` produces inside the
 #      builder VM (Followup B.2). The host driver doing the sealing
 #      is `crates/mvm-build/tests/app_deps_orchestrator.rs::seal_into_cache`
 #      — we re-use that test path via a dedicated example bin so the

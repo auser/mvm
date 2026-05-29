@@ -8,7 +8,7 @@
 //! thin wrapper that constructs an [`allowlist::Allowlist`],
 //! binds the proxy with [`proxy::start`], and waits for SIGTERM.
 //!
-//! See `crates/mvm-builder-init/src/install.rs` for the consumer:
+//! See `crates/mvm-host-vm-init/src/install.rs` for the consumer:
 //! `run_install` spawns the proxy + sets `HTTPS_PROXY` /
 //! `HTTP_PROXY` on the installer's env before invoking `uv` /
 //! `pnpm`.

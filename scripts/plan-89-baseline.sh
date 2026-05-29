@@ -2,7 +2,7 @@
 # Plan 89 W1 — cold-boot telemetry baseline harness.
 #
 # Runs N cold-boot `mvmctl build` invocations against a small flake,
-# parses each run's `boot-timings.json` (written by `mvm-builder-init`
+# parses each run's `boot-timings.json` (written by `mvm-host-vm-init`
 # at `<job_dir>/boot-timings.json`), and emits a markdown summary at
 # `specs/notes/plan-89-baseline.md`.
 #
@@ -13,7 +13,7 @@
 # and check the summary in.
 #
 # Why the default flake is the W1 fixture, not a real image build:
-# `mvm-builder-init` writes boot-timings.json BEFORE exec'ing
+# `mvm-host-vm-init` writes boot-timings.json BEFORE exec'ing
 # cmd.sh — so the boot fan-out we want to measure
 # (init_start_ms → job_start_ms) is captured regardless of whether
 # the inner `nix build` succeeds. The fixture flake at

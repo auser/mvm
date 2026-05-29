@@ -426,11 +426,11 @@ fn stage_flake_cmd_sh(job_dir: &std::path::Path, flake_ref: &str, attr: &str) ->
          # store-path symlinks (those point into the in-guest\n\
          # /nix/store and don't resolve on the host).\n\
          if [ ! -f \"$STORE_PATH/vmlinux\" ]; then\n\
-             echo 'mvm-builder-init: nix output missing vmlinux' >&2\n\
+             echo 'mvm-host-vm-init: nix output missing vmlinux' >&2\n\
              exit 4\n\
          fi\n\
          if [ ! -f \"$STORE_PATH/rootfs.ext4\" ]; then\n\
-             echo 'mvm-builder-init: nix output missing rootfs.ext4' >&2\n\
+             echo 'mvm-host-vm-init: nix output missing rootfs.ext4' >&2\n\
              exit 4\n\
          fi\n\
          cp -L \"$STORE_PATH/vmlinux\" \"$OUT_DIR/vmlinux\"\n\
