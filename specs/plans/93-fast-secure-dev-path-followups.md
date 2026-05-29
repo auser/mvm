@@ -108,25 +108,38 @@ existing caches; the next `mvmctl dev up` pays one cold Stage 0.
 The existing fingerprint-mismatch UI surface already explains
 the diagnosis to the user.
 
-#### Tests
-
-- Editing `crates/mvm-builder-init/src/foo.rs` changes the
-  fingerprint.
-- Editing `crates/mvm-builder-init/README.md` (or any non-`src`
-  file) does NOT change the fingerprint.
-- Deterministic walk: same fingerprint twice in a row.
-
 ### Critical files
 
 - `crates/mvm-cli/src/commands/env/apple_container.rs` —
   `builder_vm_source_fingerprint`, Stage 0 audit emits.
 - Tests under existing `builder_vm_bootstrap_tests` mod.
 
-### Verification
+### Ship checklist (Phase 0 / PR-A)
 
-- `cargo test -p mvm-cli --lib -- builder_vm_bootstrap_tests`
-- `cargo test --workspace` — 0 failures.
-- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+Code changes:
+
+- [ ] Extend `builder_vm_source_fingerprint` to include workspace
+      `Cargo.lock` + `crates/mvm-builder-init/{Cargo.toml,src/**}` +
+      `crates/mvm-egress-proxy/{Cargo.toml,src/**}` via a
+      deterministic sorted walk.
+- [ ] Add `flavor=current` field to `stage0_boot` /
+      `stage0_cache_promoted` audit detail strings.
+
+Tests:
+
+- [ ] Editing `crates/mvm-builder-init/src/foo.rs` changes the
+      fingerprint.
+- [ ] Editing `crates/mvm-builder-init/README.md` (or any non-`src`
+      file) does NOT change the fingerprint.
+- [ ] Deterministic walk: same fingerprint twice in a row.
+
+Verification:
+
+- [ ] `cargo test -p mvm-cli --lib -- builder_vm_bootstrap_tests`
+      passes (including the new tests).
+- [ ] `cargo test --workspace` — 0 failures.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+      clean.
 
 PR-A is ~150-250 lines, ships in 1-2 days.
 
@@ -189,6 +202,26 @@ load-bearing one for the user's "no LONG dev cycles" target;
 levers 1 and 3 are cleanup that makes the dev shell smaller and
 the cold case better.
 
+### Ship checklist (Phase 1)
+
+- [ ] Lever 1 — split monolithic dev shell into `dev-minimal`
+      and `dev-compile` flake outputs; default `dev shell` uses
+      `dev-minimal`.
+- [ ] Lever 2a — host cross-compile pipeline:
+      `rust-toolchain.toml` + `.cargo/config.toml` + cross
+      sysroot resolution (pinned upstream, hash-verified,
+      fetched lazily — same trust shape as Plan 91's Alpine).
+- [ ] Lever 2b — bind-mount the host-cross-compiled workspace
+      binary into a running dev shell, with cargo-incremental
+      detection so the bind-mount refreshes on edit.
+- [ ] Lever 2c — reproducibility regression CI lane: build
+      same source from two macOS runners, assert byte-identical
+      artifacts.
+- [ ] Lever 3 — confirm the persistent `/nix` virtio-blk image
+      survives `dev up`/`dev down` cycles with the dev-compile
+      flake's closure; document the cold-fetch + warm-reuse
+      contract in the dev-shell flake's README.
+
 ## Phase 2 — sub-200 ms runtime microvm launch
 
 Decoupled entirely from Stage 0 + dev shell. Lives in
@@ -225,33 +258,52 @@ Multi-week, multi-PR. Needs a benchmark harness
 measurable before any lever lands. Without measurement we'll
 optimise the wrong thing.
 
+### Ship checklist (Phase 2)
+
+- [ ] Benchmark harness lands first — `mvmctl bench
+      microvm-launch` (or equivalent) measures cold launch
+      wall-clock with sub-millisecond precision, persists
+      results for regression tracking. Every other Phase 2
+      item blocks on this.
+- [ ] Lever 1 — kernel cmdline trim + initrd elimination on the
+      runtime path. Document the minimum cmdline contract.
+- [ ] Lever 2 — guest agent startup parallelism + host-side
+      vsock pre-bind; measure handshake roundtrip via the
+      benchmark harness.
+- [ ] Lever 3 — warm pool of pre-spawned libkrun supervisors
+      with `mvmctl up --warm-pool-size N` (defaults to 0 =
+      off; document RAM cost per warm guest).
+- [ ] Lever 4 — VMM-side memory ballooning at boot so commits
+      are deferred until the guest is "ready".
+- [ ] Sub-200 ms cold launch demonstrated end-to-end on an
+      M-series macOS runner via the benchmark harness.
+
 ## Phase 3 — DX polish (distributed)
 
 These ride alongside the implementation of Phases 0-2 rather
 than landing as a standalone phase.
 
-- **Stage 0 progress feedback** (in Plan 91): one-line progress
-  per step (`Fetching Alpine minirootfs … 0.4 s`,
-  `apk add nix-bin … 1.8 s`, `nix build … 12.3 s`). Cheap; makes
-  perceived speed match actual speed.
-- **`mvmctl cache info`** reports vendored-blob ages,
-  cross-target cache size, assembled rootfs age, last Stage 0
-  fingerprint.
-- **`mvmctl doctor`** reports last Stage 0 timestamp,
-  fingerprint, hit/miss outcome. Diagnoses "why did Stage 0 fire
-  again?" without grep-ing the audit log.
-- **Public docs** at `public/src/content/docs/contributing/`:
-  the new Stage 0 model (Plan 91), edit-rebuild semantics
-  (Phase 1), triage paths. Currently the only docs are inline
-  doc comments.
-- **CI nightly** that runs the cross-compile pipeline (Phase 1
-  lever 2) on two different macOS runners and asserts
-  byte-identical artifacts. Catches reproducibility regressions
-  early.
-- **Vendored-blob audit kind** (`LocalAuditKind::VendorBlobFetched`):
-  emitted on every download + SHA/PGP verify event. Forward-compat
-  with Plan 91 (which already needs an audit event for the Alpine
-  fetch).
+### Ship checklist (Phase 3)
+
+- [ ] **Stage 0 progress feedback** (folded into Plan 91 ship):
+      one-line progress per step (`Fetching Alpine minirootfs …
+      0.4 s`, `apk add nix-bin … 1.8 s`, `nix build … 12.3 s`).
+      Cheap; makes perceived speed match actual speed.
+- [ ] **`mvmctl cache info`** reports vendored-blob ages,
+      cross-target cache size, assembled rootfs age, last
+      Stage 0 fingerprint.
+- [ ] **`mvmctl doctor`** reports last Stage 0 timestamp,
+      fingerprint, hit/miss outcome. Diagnoses "why did Stage 0
+      fire again?" without grep-ing the audit log.
+- [ ] **Public docs** at `public/src/content/docs/contributing/`:
+      the new Stage 0 model (Plan 91), edit-rebuild semantics
+      (Phase 1), triage paths.
+- [ ] **CI reproducibility lane** (Phase 1 lever 2c, surfaced
+      here for visibility): nightly cross-compile from two
+      macOS runners with byte-identity assertion.
+- [ ] **`LocalAuditKind::VendorBlobFetched`** audit kind:
+      emitted on every download + SHA/PGP verify event.
+      Forward-compat with Plan 91's Alpine fetch.
 
 ## Reproducibility (Phase 1 lever 2)
 
@@ -294,6 +346,35 @@ rebuild, not a security issue.
 | 14 | Reproducibility for cross-compile | Phase 1 lever 2 |
 | 15 | Layer 2 dev-shell rebuild bottleneck | Phase 1 |
 | 16 | Vendored-blob audit | Phase 3 (forward-compat with Plan 91) |
+
+## Success criteria
+
+User-facing targets that drive this plan. Each is ticked when
+measurable via either the Phase 2 benchmark harness
+(`mvmctl bench microvm-launch`) or a documented manual
+procedure on an M-series macOS host.
+
+- [ ] **Warm `mvmctl dev up` ≤ 5 s.** Contributor with a
+      populated builder VM cache and a populated host cargo
+      cache. Measured wall-clock from `mvmctl dev up` invocation
+      to dev-shell prompt.
+- [ ] **Cold `mvmctl dev up` from a fresh checkout ≤ 30 s.**
+      Plan 93 contributes via Phase 1; Plan 91 (Alpine Stage 0)
+      and Plan 92/95 (slim kernel) are co-load-bearing. This
+      target is the headline "fast dev machine" goal.
+- [ ] **Cold runtime microvm launch ≤ 200 ms.** Measured on a
+      cold libkrun guest with the minimum cmdline + no initrd;
+      Phase 2's headline goal.
+- [ ] **No LONG dev cycles.** A contributor edit to any
+      workspace crate reaches the running dev shell in < 10 s
+      via Phase 1 lever 2's host cross-compile + bind-mount
+      path. No dev-shell rebuild required for our own code
+      edits.
+- [ ] **No security regressions.** PR-A's fingerprint widening
+      catches Cargo source edits. No Phase 1 / 2 / 3 path
+      introduces a download bypassing hash + signature
+      verification. Vendored-blob audit kind in Phase 3 makes
+      every supply-chain fetch auditable.
 
 ## Process notes
 
