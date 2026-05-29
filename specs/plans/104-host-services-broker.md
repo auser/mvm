@@ -1,9 +1,15 @@
 # Plan 104 — Host Services Broker over vsock
 
-Companion ADRs: [`specs/adrs/059-host-services-broker.md`](../adrs/059-host-services-broker.md) (original two-process design — merged) + [`specs/adrs/061-host-services-broker-hardening.md`](../adrs/061-host-services-broker-hardening.md) (four-subprocess hardening — this PR's companion ADR; supersedes ADR-059's architecture and security-model sections)
-Follow-up plan (sketched at end): host-logging + workload-audit — plan number TBD (Plan 103 is contested by an egress-secret-detection proposal; re-verify before claiming a number)
+Companion ADRs: [`specs/adrs/059-host-services-broker.md`](../adrs/059-host-services-broker.md) (original two-process design — merged) + [`specs/adrs/061-host-services-broker-hardening.md`](../adrs/061-host-services-broker-hardening.md) (four-subprocess hardening — merged) + **[`specs/adrs/062-host-services-broker-rescope-drop-secrets.md`](../adrs/062-host-services-broker-rescope-drop-secrets.md) (rescope — drop secrets, add `host.audit.v1`; current source of truth as of 2026-05-28)**
+Follow-up plan (sketched at end): host-logging — plan number TBD
 Cross-repo mvmd dependency: `../mvmd/specs/plans/52-host-services-cross-vm-endpoints.md` + `../mvmd/specs/adrs/0023-mvmd-host-services-delegation.md`
 Tracking sprint: **Sprint 57** in `specs/SPRINT.md` (Sprint 56 = symmetric trust boundary + claim 10).
+
+> **Rescope banner (2026-05-28 — ADR-062).** This plan was drafted around `host.secrets.v1` as the load-bearing forcing function. Project-direction review on 2026-05-28 dropped `host.secrets.v1` and `mvm-secrets-dispatcher` from v1 scope (see [ADR-062](../adrs/062-host-services-broker-rescope-drop-secrets.md) for the decision rationale). The architecture is now **3 subprocesses** (`mvm-broker`, `mvm-host-signer`, `mvm-audit-signer`), the broker hosts **`host.audit.v1` as a workload-callable service** in place of secrets, and the W1a–W1b.2b.3 hardening infrastructure (already merged via PRs #478, #480, #481, #482, #483, #486) is preserved unchanged.
+>
+> Where this plan still describes `host.secrets.v1`, `mvm-secrets-dispatcher`, the 4-subprocess architecture, the ADR-049 SDK matrix (W7), or the secret-specific S22/S24/S25/S26/S28 threats: those sections are **superseded by ADR-062** in their secrets-specific specifics. The non-secrets reasoning in those sections (process isolation patterns, hardening layers, audit chain integrity, mvmd cross-VM delegation, hardware enclave host signer in W8) stays valid and is the basis for the remaining work.
+>
+> W5 (`host.secrets.v1` implementation) is deleted from the build sequence. W7 (ADR-049 SDK matrix) is deleted. A new sibling of W3 (call it W3-audit) adds the `host.audit.v1` handler.
 
 > **Plan-numbering note (2026-05-26).** This plan was first drafted as Plan 97 / ADR-056, then 98 / 057, then Plan 98 / ADR-059, and finally **Plan 104 / ADR-059** because `98-vz-builder-vm.md` and `103-w6a-implementation-tracker.md` landed on `origin/main` mid-conversation (taking Plan 98 and Plan 103 respectively). Per the saved "spec numbering chaos" guidance, re-verify ALL numbers with `gh pr list` + `git fetch && git log --diff-filter=A -- specs/plans/104-*.md` *immediately* before opening the implementation PR. **Do not propose explicit Claim 10/11 numbers in ADR-059** — Sprint 56 holds Claim 10 already. Let ADR-059 assign claim numbers against ADR-002's live list at write time.
 
@@ -353,21 +359,17 @@ Each wave is independently mergeable and leaves `cargo test --workspace && cargo
   - [ ] Implement `host.cost.v1::tenant` verb
   - [ ] Per-tenant catalog intersection at admission (§A7)
   - [ ] Tests: positive aggregation against mock client, cross-tenant authz denial, mvmd-unavailable → `ServiceErrorCode::Unavailable` (no stale data), forged workload-id rejected, malformed mvmd response rejected, tenant catalog intersection refuses out-of-catalog binding
-- [ ] **W5 — `host.secrets.v1` inside the secrets-dispatcher subprocess** *(no mvmd dep; ADR-049 implementation; security-gated review per H-L9.5)*
-  - [ ] Implement `HostSecretsV1Handler` per ADR-049 §"Substitution flow" — **inside `crates/mvm-secrets-dispatcher/`, NOT in mvm-supervisor**
-  - [ ] Wire the supervisor's `secrets_proxy.rs` to forward gates-1-4-passed calls to the subprocess; subprocess does gate 5 + dispatch + response-sign (H-L4.2)
-  - [ ] Audit subentries flow from subprocess back to supervisor over UDS; supervisor routes to `mvm-audit-signer` (H-L1.2); audit-signer chain-signs and appends
-  - [ ] Destination-URL match against `allowed_destinations` using `subtle::ConstantTimeEq` (H-L4.5)
-  - [ ] Signed-credential generation (JCS-canonical bytes via `serde_jcs` per H-L11.2; Ed25519 v1, P-256 reserved for W8)
-  - [ ] `audit_durability() = PerCall`
-  - [ ] **Delete** `KeystoreReleaser`, `NoopKeystoreReleaser`, `LiveKeystoreReleaser` stubs (no shim)
-  - [ ] Plumb existing `ExecutionPlan.secrets` field as handler's policy blob
-  - [ ] `zeroize::Zeroize` impl on secret-bearing payload types
-  - [ ] Inter-call memory-state hygiene (no leak from call N to call N+1)
-  - [ ] **Seccomp policy compliance tests** (H-L3.3): assert denied syscalls return EPERM (`process_vm_readv`, `ptrace`, `kcmp`, `pidfd_open`, `userfaultfd`, `bpf`, `perf_event_open`)
-  - [ ] **Side-channel / timing audit** (H-L9.4): run `dudect` or `CTGrind` against secret-handling code paths; document results in PR description
-  - [ ] **Latency floor** (S26): pad response to `BROKER_SECRETS_LATENCY_FLOOR_MS=5` regardless of cache state
-  - [ ] Tests: positive substitution, destination-deny, expired grant, unknown grant, replay, audit-subentry shape (JCS-canonical), ADR-049 hostile-guest matrix (raw socket bypass, substitution replay, library bypass), inter-call state hygiene, latency floor holds warm + cold, hostile-subprocess test stub returns wrong-signature response and supervisor rejects (H-L9.1)
+- [x] **W5 — `host.secrets.v1` inside the secrets-dispatcher subprocess** — **DELETED by ADR-062 (2026-05-28).** `host.secrets.v1` and `mvm-secrets-dispatcher` are dropped from v1 scope. The subprocess scaffold merged via PR #480 is removed in PR C of the rescope sequence. The seccomp + side-channel + latency-floor hardening rationale was secrets-specific; nothing of equivalent shape applies to the remaining (broker / host-signer / audit-signer) subprocesses, all of which already have their own hardening waves.
+- [ ] **W3-audit — `host.audit.v1` (workload-emitted audit entries)** *(no mvmd dep; new in ADR-062)*
+  - [ ] Define `EventCategory::WorkloadAudit` variant in `mvm-audit-signer`'s allowed-category list, distinct from `ServiceCall` / `Admission`
+  - [ ] Implement `HostAuditV1Handler` in `crates/mvm-broker/src/handlers/host_audit.rs`
+  - [ ] Verbs: `emit` (single entry) + `emit_batch` (≤100 entries, ≤256 KiB total per call)
+  - [ ] Per-record cap: `BROKER_AUDIT_RECORD_BYTES = 4096`
+  - [ ] Rate limit: token-bucket `BROKER_AUDIT_TOKENS_PER_SEC = 20` per workload (handler-specific, in addition to broker-wide)
+  - [ ] `audit_durability() = PerCall` (fsync before response)
+  - [ ] Handler dispatch forwards each entry to `AuditSignerProxy::append_entry` with `category = "workload_audit"`
+  - [ ] Cross-workload attribution check: `category = WorkloadAudit` + `workload_id` matches `ctx.workload_id` (refuse with `ServiceErrorCode::BadRequest` if mismatched)
+  - [ ] Tests: positive emit + chain-head advances, emit_batch up to cap, record-too-large rejected with `ServiceErrorCode::BadRequest`, batch-too-large rejected, rate-limit triggers `ServiceErrorCode::RateLimitExceeded`, workload-id mismatch refused, chain verifier displays `WorkloadAudit` category distinctly from `ServiceCall`
 - [ ] **W6 — Fuzz + CI** *(no mvmd dep)*
   - [ ] Add `crates/mvm-guest/fuzz/fuzz_service_call.rs` per ADR-002 §W4.2
   - [ ] Wire into existing `cargo-fuzz` lane (≥5min/PR)
@@ -377,14 +379,7 @@ Each wave is independently mergeable and leaves `cargo test --workspace && cargo
   - [ ] Add `xtask check-no-mutable-handler-state` lint (see §Security S14)
   - [ ] Confirm `prod-agent-no-exec` still passes
   - [ ] Cross-backend test matrix: broker handshake + at least one handler call on each of libkrun / Firecracker / Apple Container / vz
-- [ ] **W7 — ADR-049 §W3 SDK matrix** *(no mvmd dep; can split per language)*
-  - [ ] Python: `requests.Session.send`, `httpx.Client.send`/`AsyncClient.send`, `aiohttp.ClientSession._request`, `urllib3`
-  - [ ] TypeScript: `fetch` polyfill, `axios.interceptors.request`, `node:http(s).request` patch
-  - [ ] Rust: `reqwest_middleware::Middleware`, `tower::Layer` for hyper, `tonic::Interceptor`
-  - [ ] `register_substitution_handler` extension point in all three
-  - [ ] Built-in `aws` credential adapter (SigV4) in all three
-  - [ ] Deterministic S3 `ListBuckets` SigV4 tests proving placeholders resolve before signing
-  - [ ] ADR-049's hostile-guest tests in all three SDKs
+- [x] **W7 — ADR-049 §W3 SDK matrix** — **DELETED by ADR-062 (2026-05-28).** The per-language credential-substitution hook libraries (Python / TypeScript / Rust) are no longer needed: `host.secrets.v1` is dropped, no `mvm-secret://` placeholder exists, no SDK has anything to substitute. ADR-049's hostile-guest matrix is similarly moot.
 - [ ] **W8 — Hardware-enclave host signer** *(largest new wave; security-gated review per H-L9.5; macOS-SE + Linux-TPM in parallel)*
   - [ ] macOS: Apple Secure Enclave integration in `crates/mvm-host-signer` via `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave` (P-256); Swift bridge
   - [ ] Linux: TPM 2.0 integration via `tpm2-tss` (RSA-2048 or ECDSA-P256 depending on TPM capability)
@@ -771,13 +766,13 @@ The two new claims are locked at numbers **12** and **13** per the parallel `wor
 
 > **Claim 12.** Every host-side service the broker exposes is bound to a signed `ExecutionPlan.services` binding, enforced before handler dispatch, and audited via the chain-signed log. A tampered binding fails plan verification; an unbound call is refused with an audited deny.
 
-> **Claim 13.** No raw secret value crosses the broker channel. `host.secrets.v1` returns destination-bound, time-bound signed credentials only. Raw secret bytes never leave the supervisor's address space.
+> **Claim 13** *(rewritten 2026-05-28 by ADR-062 — the prior wording about "no raw secret value crosses the broker channel" is superseded; secrets are no longer an mvm responsibility)*. Every workload-emitted audit entry (via `host.audit.v1`) is chain-signed by `mvm-audit-signer` under the `WorkloadAudit` category, distinguishable from supervisor-emitted entries in the audit chain. An entry whose bytes are tampered with after signing fails `mvmctl audit verify`; an entry claiming a workload id the caller doesn't own is refused at admission.
 >
-> *Implementation note.* Under ADR-059's original two-process design (general broker in-process, secrets dispatcher subprocess), "supervisor's address space" includes the in-process broker. Under ADR-061's four-subprocess hardening (the design this Plan 104 fold-in encodes), raw secrets live only in `mvm-secrets-dispatcher` (uid 902) + transit through `mvm-host-signer` (uid 904) for credential issuance — both isolated from the supervisor's address space. The wording reads through because the four-subprocess set is a strict tightening of "supervisor's address space" rather than an expansion.
+> *Implementation note.* The W3-audit handler in `mvm-broker` is the sole emitter; the supervisor's `AuditSignerProxy::append_entry` is the sole forwarder. `mvm-audit-signer`'s existing chain-integrity invariants (Plan 104 §H-L5.1 / §H-L5.2) cover the rest. Tests: `workload_audit_entries_chain_signed_with_workload_audit_category` + `workload_audit_entry_workload_id_mismatch_refused` + `audit_chain_verifier_distinguishes_workload_from_system_entries`.
 
 ### Surfaces that don't expand
 
-- New host subprocesses in v1: `mvm-host-signer` (uid 904), `mvm-audit-signer` (uid 905), `mvm-broker` (uid 903), `mvm-secrets-dispatcher` (uid 902). All per-VM, supervised by the per-VM supervisor, killed via parent-death signal. See §"Hardening posture" for the rationale (TCB minimization across four discrete process boundaries).
+- New host subprocesses in v1: `mvm-host-signer` (uid 904), `mvm-audit-signer` (uid 905), `mvm-broker` (uid 903). ~~`mvm-secrets-dispatcher` (uid 902)~~ — **dropped by ADR-062 (2026-05-28)**. All per-VM, supervised by the per-VM supervisor, killed via parent-death signal. See §"Hardening posture" for the rationale (TCB minimization across **three** discrete process boundaries — the fourth-process reasoning specific to secrets-credential isolation is no longer applicable).
 - Trust boundary narrowed (see §"Hardening posture, threat model expansion"). ADR-002's "malicious host" out-of-scope clause is preserved for *physical* attacks (cold-boot, DMA, hardware tampering) but narrowed for *software* insider attacks under the Layer-1/2/5 hardening.
 - Egress policy unchanged — broker is host↔guest only.
 - `prod-agent-no-exec` unchanged — no broker verb is code-execution-shaped.
@@ -1385,3 +1380,4 @@ Resolved above in §C7 — the chain entry format must be (1) append-only canoni
 - **Subprocess-restart accumulation attack (G12).** Considered and dismissed: no traffic encryption to decrypt; per-spawn keys give attacker no cryptographic leverage. Named in ADR-059 §"Considered and rejected threats" so a future reader doesn't re-litigate.
 - **Supervisor split (admission verifier + IPC router as separate processes).** Deferred to v2. v1 supervisor remains the single launcher + IPC router + admission controller.
 - **Workload-to-workload services (peer discovery, mesh).** Out of scope; `host.peers.v1` is future-only.
+- **Runtime secret substitution / `host.secrets.v1` / managed-credential service (ADR-062).** Dropped from v1. Workloads bring their own secret material via env vars, file mounts, in-cloud IMDS, vault sidecars, etc. mvm's stance is "launch + audit the workload"; credential delivery is not in mvm's name. If the need re-emerges, a future ADR designs a fresh path rather than picking up where ADR-049 left off.

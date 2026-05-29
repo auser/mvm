@@ -118,8 +118,10 @@ both. Claim 11 (app-dep audit pipeline — claim 9 in
 `CLAUDE.md::Security model` because CLAUDE.md numbers from the core
 8 + the SDK-port follow-on) was added by ADR-047 / Plan 73
 Followups A + B.1/B.2/B.3 + C + D. Claims 12 and 13 (host services
-broker — binding-gated dispatch + no raw secret over broker channel)
-were added by Plan 104 / ADR-059.
+broker — binding-gated dispatch + workload audit-entry attribution)
+were added by Plan 104 / ADR-059, with Claim 13 rewritten by ADR-062
+when `host.secrets.v1` was dropped from v1 scope and `host.audit.v1`
+took its place as the load-bearing workload service.
 
 | # | Claim | Primary layer | Workstream | CI gate |
 |---|---|---|---|---|
@@ -183,7 +185,7 @@ only — the CI gate is the source of truth, not the framework code.
 | 10 | T1071 (Application Layer Protocol — data exfiltration channel), T1041 (Exfiltration Over C2 Channel) | D3FEND: Network Traffic Filtering, Outbound Traffic Filtering · CREF: Privilege Restriction (deny-all default; egress is an explicit opt-in) |
 | 11 | T1195.001 (Compromise Software Dependencies and Development Tools — app-layer variant), T1565.001 (Stored Data Manipulation — deps volume variant) | D3FEND: Software Composition Analysis, Executable Integrity · CREF: Substantiated Integrity (hash-locked + SBOM + attestation + CVE-scanned sealed volume bound to audit chain) |
 | 12 | T1574 (Hijack Execution Flow — capability-granting variant), T1078 (Valid Accounts — unauthorized service invocation) | D3FEND: Authorization · CREF: Substantiated Integrity (signed binding gate → enforced dispatch → chain-signed audit on every call) |
-| 13 | T1552 (Unsecured Credentials), T1071 (Application Layer Protocol — credential exfiltration variant) | D3FEND: Credential Hardening, Outbound Traffic Filtering · CREF: Privilege Restriction (destination-bound + time-bound signed credentials; raw secret bytes never leave the supervisor's address space; process-level isolation via the `mvm-secrets-dispatcher` subprocess) |
+| 13 | T1078 (Valid Accounts — unauthorized audit attribution), T1565 (Data Manipulation — audit-chain variant) | D3FEND: Authentication, Authorization · CREF: Substantiated Integrity (workload-emitted entries chain-signed under distinct `WorkloadAudit` category; workload-id mismatch refused at admission; chain verifier displays category alongside entry so operators can tell workload-asserted from supervisor-observed) |
 
 The cold-state guarantee (per-workload fresh boot, no warm pools — see
 CLAUDE.md and the `mvmctl run` lifecycle) is not in the seven-claim

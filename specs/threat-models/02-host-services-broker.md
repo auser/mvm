@@ -83,20 +83,20 @@ For each service below, the STRIDE table notes which adversary class the threat 
 | COST-I2 | I | G | Cost numeric values quantize-leak workload behavior to a multi-step attacker | Considered low-impact for v1; future plan may quantize values to coarse units |
 | COST-D1 | D | N | mvmd slow → blocks broker thread | Per-handler call timeout (`host.cost.v1::tenant=150ms`); circuit breaker after 5 failures (S13) |
 
-### `host.secrets.v1` (signed-credential issuance per ADR-049)
+### `host.audit.v1` (workload-emitted audit entries — new in ADR-062)
+
+> **Note.** This section replaces the previous `host.secrets.v1` table. `host.secrets.v1` and the entire `SECRET-*` threat set are dropped by [ADR-062](../adrs/062-host-services-broker-rescope-drop-secrets.md). `host.audit.v1` becomes the load-bearing workload-callable service in its place.
 
 | ID | STRIDE | Adv. | Threat | Mitigation |
 | --- | --- | --- | --- | --- |
-| SECRET-S1 | S | G | Guest replays a stolen signed credential to a different destination | Credentials destination-bound (ADR-049 §"Substitution flow"); supervisor verifies destination-URL match against `allowed_destinations` with `subtle::ConstantTimeEq` (H-L4.5) |
-| SECRET-S2 | S | G | Guest spoofs a substitution placeholder in an outbound HTTP request to extract a credential it shouldn't have | gvproxy/passt detects `mvm-secret://` token pattern in outbound HTTP bytes and **drops the frame**; emits `secret.substitute.bypass_detected` audit (S25) |
-| SECRET-T1 | T | I | Insider tampers with `~/.mvm/keys/host-signer.ed25519` to mint forged credentials | On enclave-equipped hosts (H-L2.1) the key is in HW; key extraction is impossible. On non-enclave hosts the key file is mode 0600 + `chattr +i` once written; TPM monotonic counter (H-L2.2) detects rollback |
-| SECRET-R1 | R | G | Guest denies having received a particular credential | Every `host.secrets.v1` call emits a chain-signed audit entry with `(service, verb, outcome, correlation_id)` and a `destination_url_hash` (no raw URL or credential bytes) |
-| SECRET-I1 | I | G | Raw secret value leaks across the broker channel | **Architectural impossibility:** `host.secrets.v1` never returns raw secret bytes. Returns only destination-bound, time-bound signed credentials. Tested by `host_secrets_v1_signed_payload_jcs_roundtrip` (W5) |
-| SECRET-I2 | I | I | Insider extracts in-flight grant table from `mvm-secrets-dispatcher` memory | Per-workload cgroup + namespace + seccomp + mlock (X-I4); `Zeroize` on all secret-bearing types; inter-call memory hygiene tested |
-| SECRET-I3 | I | G | Guest uses first-call cold-cache vs subsequent-call warm-cache latency oracle on grant presence | Latency floor `BROKER_SECRETS_LATENCY_FLOOR_MS=5` applied regardless of cache state (S26) |
-| SECRET-I4 | I | G | Composing handler (e.g., `host.config.v1` via `ctx.invoke`) accidentally embeds secret in its own response | `xtask check-handler-composition` lint refuses build on any field assigned from a composed-`host.secrets.v1` result (S24) |
-| SECRET-D1 | D | G | Guest exhausts session-key rotation budget | Per-call ephemeral session key rotates every `BROKER_SESSION_REKEY_CALLS=1000` (H-L4.3); rate limit applies to rotation as to any call |
-| SECRET-E1 | E | I | Insider runs a stub `mvm-secrets-dispatcher` that passes cosign-verify but returns wrong-but-well-formed responses | Subprocess response signing (H-L4.2): every response is signed by the subprocess's per-spawn ephemeral key; supervisor verifies. Stub would need to also forge the response signature — closed by `hostile_subprocess_test_each_kind_rejected` (W6 / H-L9.1) |
+| AUDIT-S1 | S | G | Guest emits an entry claiming a workload id it doesn't own (impersonation) | Handler refuses with `ServiceErrorCode::BadRequest` when entry's `workload_id` ≠ `ctx.workload_id`; supervisor-assigned `workload_id` (H-L4.6) is the authoritative source |
+| AUDIT-S2 | S | G | Guest forges a `workload_audit` entry that looks like a `Admission` (system-asserted) entry | New `EventCategory::WorkloadAudit` variant is *distinct* from `Admission` and `ServiceCall`; `mvm-audit-signer`'s category allow-list pins the variant to the handler that produced it; `mvmctl audit verify` displays category alongside entry |
+| AUDIT-T1 | T | G | Guest tampers with an emitted entry after signing | **Architectural impossibility:** chain entries are signed by `mvm-audit-signer` before append; tamper fails `mvmctl audit verify` per chain integrity (X-T2) |
+| AUDIT-R1 | R | G | Guest denies having emitted a particular entry | Every `host.audit.v1` call emits a chain-signed entry with `(workload_id, correlation_id, ts, fields)`; the chain ties the workload id to the entry cryptographically |
+| AUDIT-I1 | I | G | Entry leaks sensitive workload-internal state through `fields` | The chain entry's `fields` are workload-controlled — they can include whatever the workload chooses. Plan 104 §H-L5.6 (PII invariant) applies to *system-asserted* `correlation_id`s; workload-emitted `fields` are workload's responsibility. **Operator-facing tooling should display a privacy warning** when filtering by `WorkloadAudit` category. |
+| AUDIT-D1 | D | G | Guest fills the chain with garbage entries to obscure forensics or exhaust audit storage | Per-handler rate limit (`BROKER_AUDIT_TOKENS_PER_SEC=20`); per-record cap (4 KiB); per-batch cap (100 entries / 256 KiB); per-workload lifetime quota (§S12); tenant-level cap (§H-L6.3); audit-log rotation policy (§H-L6.2) keeps chain bounded |
+| AUDIT-D2 | D | G | Guest's `emit_batch` triggers `mvm-audit-signer` crash via malformed bytes | Per-record JSON schema validation in handler before batch forward; batch is rejected with `ServiceErrorCode::BadRequest` if any record fails. Audit-signer's own envelope parse (X-E1 equivalent) is the second line of defense |
+| AUDIT-E1 | E | G | Guest exploits handler parser bug to inject a non-`WorkloadAudit` category entry | Handler signature pins `category = WorkloadAudit` literal at call-time; the category field is *not* forwarded from workload input. CI lint asserts the handler doesn't accept a workload-supplied `category`. Tested by `host_audit_v1_workload_cannot_set_category` |
 
 ### `broker.v1` (introspection: `list_services`)
 
