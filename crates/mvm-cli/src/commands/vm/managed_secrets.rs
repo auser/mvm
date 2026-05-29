@@ -39,10 +39,7 @@ fn lower_app_secret_bindings(app: &App) -> Vec<SecretBinding> {
     secrets
 }
 
-fn lower_env_map(
-    env: &std::collections::BTreeMap<String, EnvValue>,
-    out: &mut Vec<SecretBinding>,
-) {
+fn lower_env_map(env: &std::collections::BTreeMap<String, EnvValue>, out: &mut Vec<SecretBinding>) {
     for value in env.values() {
         let EnvValue::SecretRef { reference } = value else {
             continue;
@@ -74,7 +71,10 @@ mod tests {
     use mvm_ir::{Image, Resources, Source};
     use std::collections::BTreeMap;
 
-    fn app_with_envs(app_env: BTreeMap<String, EnvValue>, ep_env: BTreeMap<String, EnvValue>) -> App {
+    fn app_with_envs(
+        app_env: BTreeMap<String, EnvValue>,
+        ep_env: BTreeMap<String, EnvValue>,
+    ) -> App {
         App {
             name: "app".into(),
             source: Source::LocalPath {

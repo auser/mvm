@@ -61,9 +61,9 @@ use std::path::PathBuf;
 
 use mvm_ir::{App, Workload};
 
+use super::managed_secrets::lower_app_secrets;
 use super::plan_admission::{InMemoryNonceLedger, SystemClock, admit_for_run};
 use super::plan_builder::SynthesisInput;
-use super::managed_secrets::lower_app_secrets;
 use crate::commands::build::sandbox_record::{auto_exec_record_script, script_language_from_path};
 
 use super::exec::{RunArgs, RunMode};
