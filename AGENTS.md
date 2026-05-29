@@ -172,6 +172,25 @@ Rules:
 
 **NEVER** use `.unwrap()` in production code. Always use `.expect("descriptive message")` instead, so that if a panic occurs, the error message explains what went wrong and where. `.unwrap()` is only acceptable in test code (`#[cfg(test)]` modules and `tests/` directories).
 
+## No Placeholders in Plans or Code
+
+**NEVER** write placeholders in plans, ADRs, or code that ships. This includes:
+
+- Literal `TBD`, `TODO: fill in`, `<PLACEHOLDER>`, `PLACEHOLDER_*` strings in checked-in files
+- "Engineer adapts this to existing code" / "Concrete diff depends on existing structure" markers in plans
+- Stub function bodies that exist only to silence the compiler (`let _ = (a, b);` followed by an explanatory comment)
+- Schema entries marked "the reviewer must fill in the real value"
+- Pseudo-code or "shape sketches" inside a plan that's supposed to ship to execution
+
+Rules:
+
+- **Before writing a plan task that touches existing code**, read the existing file with the Read tool and use what you find. Every code block in the plan is the real, complete code that goes into the commit.
+- **When you don't know a value** (e.g., a SHA256 of a binary you can't execute), either compute it before writing the plan (via WebSearch / curl / etc.) or refactor the plan so the value isn't needed until execution time **and** the executing task spells out exactly how to compute it (the command, the source, the verification).
+- **When the surrounding code structure is genuinely unknown** (e.g., a refactor of a file you haven't read), **stop and read it** before continuing the plan. Don't write "engineer adapts" — read it yourself.
+- **For configs/fixtures that need operator-supplied values at install time** (not at code-write time), use a `Result::Err("missing operator config; see <docs>")` shape, not a placeholder string in a checked-in default file. The error message itself documents the gap.
+
+Why this rule exists: placeholders push the work that hasn't been done onto the next reader (a subagent, a future contributor, or the reviewer). They look like progress but they're not. Plans that ship with placeholders are plans that aren't actually plans — they're outlines pretending to be plans.
+
 ## Documentation
 
 Documentation is a **first-class deliverable**. Every code change that touches user-facing behavior MUST include corresponding doc updates in the same commit or PR. Stale docs are bugs.
