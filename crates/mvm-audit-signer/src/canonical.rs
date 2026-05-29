@@ -56,7 +56,7 @@ mod tests {
 
     fn sample(prev_hash: String) -> CanonicalEntry {
         CanonicalEntry {
-            category: "service_call".into(),
+            category: "plan".into(),
             correlation_id: "01HCORR0000000000000000".into(),
             fields: serde_json::json!({
                 "service": "host.time.v1",

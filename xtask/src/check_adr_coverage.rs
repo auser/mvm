@@ -47,6 +47,12 @@ fn parse_adr_filename(name: &str) -> Option<(u32, String)> {
 /// In-code reference pattern: `ADR-N`, `ADR-NN`, or `ADR-NNN`.
 /// Matches `ADR-002`, `ADR-013`, `ADR-7`, etc. Case-sensitive on
 /// `ADR` so we don't pick up `adr-`-prefixed filenames.
+///
+/// mvm ADR numbers are 1–3 digits. Cross-repo references like
+/// `ADR-0023` (the mvmd convention is 4-digit) are *not* mvm ADRs;
+/// matching those would surface false-positive "broken refs" against
+/// mvm's `specs/adrs/` directory. Cap the digit run at 3 to reject
+/// the 4-digit mvmd form cleanly.
 fn extract_adr_refs(body: &str) -> Vec<u32> {
     let mut out = Vec::new();
     let bytes = body.as_bytes();
@@ -57,7 +63,10 @@ fn extract_adr_refs(body: &str) -> Vec<u32> {
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if j > i + 4
+            let width = j - (i + 4);
+            // Reject zero-digit (`ADR-` followed by no digit) and 4+
+            // digit runs (mvmd's `ADR-NNNN` form is not an mvm ADR).
+            if (1..=3).contains(&width)
                 && let Ok(s) = std::str::from_utf8(&bytes[i + 4..j])
                 && let Ok(n) = s.parse::<u32>()
             {
@@ -356,6 +365,23 @@ mod tests {
         let body = "ADR-002 §W4.3 / ADR-013§\"Boot budget\"";
         let refs = extract_adr_refs(body);
         assert_eq!(refs, vec![2, 13]);
+    }
+
+    #[test]
+    fn extract_adr_refs_rejects_four_digit_mvmd_form() {
+        // mvmd uses 4-digit ADR numbers (e.g. `ADR-0023` for mvmd's
+        // host-services-delegation ADR). Cross-repo references to
+        // mvmd ADRs are NOT mvm ADRs and must not be reported as
+        // broken mvm references.
+        let body = "see mvmd ADR-0023 for the cross-VM trust model";
+        let refs = extract_adr_refs(body);
+        assert!(refs.is_empty(), "4-digit ADR refs must be skipped");
+
+        // Mixed: mvm ADR-013 alongside mvmd ADR-0007 — only the
+        // 3-digit mvm form should land in the output.
+        let mixed = "ADR-013 plus mvmd ADR-0007 in the same line";
+        let refs = extract_adr_refs(mixed);
+        assert_eq!(refs, vec![13]);
     }
 
     /// Build the literal `ADR-N` token at runtime so this source file

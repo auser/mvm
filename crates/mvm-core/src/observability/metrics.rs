@@ -80,6 +80,7 @@ pub struct Metrics {
     pub audit_key_total: AtomicU64,
     pub audit_host_total: AtomicU64,
     pub audit_audit_total: AtomicU64,
+    pub audit_workload_audit_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -136,6 +137,7 @@ impl Metrics {
             audit_key_total: AtomicU64::new(0),
             audit_host_total: AtomicU64::new(0),
             audit_audit_total: AtomicU64::new(0),
+            audit_workload_audit_total: AtomicU64::new(0),
         }
     }
 
@@ -187,6 +189,7 @@ impl Metrics {
             audit_key_total: self.audit_key_total.load(Ordering::Relaxed),
             audit_host_total: self.audit_host_total.load(Ordering::Relaxed),
             audit_audit_total: self.audit_audit_total.load(Ordering::Relaxed),
+            audit_workload_audit_total: self.audit_workload_audit_total.load(Ordering::Relaxed),
         }
     }
 
@@ -450,6 +453,12 @@ impl Metrics {
             s.audit_audit_total,
             "Audit events in the `audit` category (meta-events about the audit stream)",
         );
+        write_metric(
+            &mut out,
+            "mvm_audit_workload_audit_total",
+            s.audit_workload_audit_total,
+            "Audit events in the `workload_audit` category (workload-emitted via `host.audit.v1`)",
+        );
 
         out
     }
@@ -533,6 +542,8 @@ pub struct MetricsSnapshot {
     pub audit_host_total: u64,
     #[serde(default)]
     pub audit_audit_total: u64,
+    #[serde(default)]
+    pub audit_workload_audit_total: u64,
 }
 
 #[cfg(test)]

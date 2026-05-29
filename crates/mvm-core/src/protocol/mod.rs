@@ -3,6 +3,7 @@
 pub mod audit_signer;
 pub mod broker;
 pub mod handler;
+pub mod host_audit;
 pub mod host_signer;
 #[allow(clippy::module_inception)]
 pub mod protocol;

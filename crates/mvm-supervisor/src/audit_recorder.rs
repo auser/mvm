@@ -85,6 +85,11 @@ pub enum EventCategory {
     /// Used by `mvmctl audit verify` results, chain-rotation
     /// announcements, etc.
     Audit,
+    /// Workload-emitted audit entries via `host.audit.v1` (Plan 104
+    /// §host.audit.v1, ADR-062). Distinct from system-emitted
+    /// categories so the chain verifier can compute workload-asserted
+    /// vs system-asserted entry rates separately.
+    WorkloadAudit,
 }
 
 impl EventCategory {
@@ -103,6 +108,7 @@ impl EventCategory {
             Self::Key => "key",
             Self::Host => "host",
             Self::Audit => "audit",
+            Self::WorkloadAudit => "workload_audit",
         }
     }
 
@@ -262,6 +268,7 @@ impl Recorder {
             EventCategory::Key => &m.audit_key_total,
             EventCategory::Host => &m.audit_host_total,
             EventCategory::Audit => &m.audit_audit_total,
+            EventCategory::WorkloadAudit => &m.audit_workload_audit_total,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
