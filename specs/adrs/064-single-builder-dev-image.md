@@ -1,11 +1,17 @@
-# ADR-064 — Single builder/dev image with host-built mvm binaries
+# ADR-064 — Single builder/dev image with mvmctl-embedded Linux binaries
 
-**Status:** Proposed (2026-05-29).
+**Status:** Proposed (2026-05-29). Refactored 2026-05-29 to embed the
+Linux binaries in `mvmctl` itself (`build.rs` + `include_bytes!`)
+rather than invoking cargo at `dev up` runtime. See §Decision.
 **Supersedes:** the dev-image-vs-builder-VM-image split established by
 ADR-046 §"Two artifact layers, two acquisition paths" — see §Migration.
 **Related (do not change in this ADR):** the SDK end-user transparency
 story (`crates/mvm-sdk/src/compile/flake.rs`, ADR-0007), and ADR-046's
 source-checkout invariant (preserved unchanged here).
+**Concurrent work to track:** Plan 107 A1a/A1b — `mvm-builder-init` is
+being renamed to `mvm-host-vm-init` (commit `58c737dd` merged, PR
+#506 open for the crate rename). ADR-064 names match whichever lands
+first; the implementation plan should adopt the final name.
 
 ## Context
 
@@ -66,53 +72,64 @@ the underlying shape instead.
    dev image to bootstrap from. Only the Alpine + libkrunfw Stage 0
    path remains.
 
-2. **mvm's own Linux binaries become inputs to the flake, produced by
-   host cargo.** A new contract:
+2. **mvm's Linux binaries are embedded in `mvmctl` at *its own build
+   time*, not at `dev up` runtime.** A new contract, all compile-time:
 
-   - **Single source of truth: `nix/lib/mvm-host-binaries.nix`** — a
-     small Nix attrset declaring each binary mvm needs in a Linux
-     image and where it lives:
+   - **`crates/mvm-cli/build.rs` cross-compiles the Linux binaries
+     during `cargo build` of mvm-cli.** For each entry in a Rust
+     manifest constant (`crates/mvm-cli/src/host_binaries/
+     manifest.rs`), the build script invokes `cargo zigbuild --target
+     aarch64-unknown-linux-gnu --release -p <cargo_package>` (or
+     plain `cargo build` when the build host *is* aarch64-linux) and
+     writes the binary to `$OUT_DIR/mvm-host-bins/<name>`. The paths
+     are baked into mvmctl as `include_bytes!` byte arrays plus a
+     precomputed SHA-256 content hash.
+
+   - **Runtime is just extraction, never compilation.** On the first
+     use per mvmctl process, mvmctl extracts each embedded binary to
+     `~/.cache/mvm/host-bins/<content-hash>/<name>` (idempotent: a
+     fresh mvmctl process with the same binary content hits the
+     existing dir; a different mvmctl version writes a different dir).
+     mvmctl sets `MVM_HOST_BIN_DIR` to that dir before invoking the
+     in-VM nix build. **No runtime cargo invocation. No runtime
+     manifest parsing. No `target/` lookup.** mvmctl is a true
+     single-binary unit of distribution.
+
+   - **The flake-side view: `nix/lib/mvm-host-binaries.nix`.** A small
+     Nix attrset, parallel to `workspace-filter.nix`. Same set of
+     entries as the Rust manifest, declaring each binary's
+     `install_path` and `mode`:
      ```nix
      {
        mvm-builder-init = {
-         cargo_package = "mvm-builder-init";
          install_path = "/sbin/mvm-builder-init";
          mode = "0755";
        };
        mvm-egress-proxy = {
-         cargo_package = "mvm-egress-proxy";
          install_path = "/sbin/mvm-egress-proxy";
          mode = "0755";
        };
      }
      ```
-     Pure data, parseable from Nix natively (the flake's primary
-     consumer). The Rust side (mvmctl / mvm-build) does **not** parse
-     the Nix file at runtime — CLAUDE.md forbids mvmctl from invoking
-     host Nix in any form. Instead, a small mirrored constant lives
-     alongside the host-binaries module in Rust, and a CI lane
-     (`xtask check-mvm-host-binaries-mirror` or similar) asserts the
-     two stay in sync. The file is small (a handful of entries) and
-     changes only when an mvm binary is added or renamed, so the
-     mirror discipline is cheap.
+     The flake reads this attrset natively, iterates entries under
+     `--impure` using `MVM_HOST_BIN_DIR` to locate the extracted
+     binaries, and generates `extraFiles` mechanically — no
+     hand-written per-binary entries.
 
-   - **Two consumers, no manual sync.** mvmctl reads the manifest,
-     runs `cargo zigbuild --target aarch64-unknown-linux-gnu --release
-     -p <cargo_package>` per entry (or plain `cargo build` for native
-     Linux contributors), stages outputs to a content-addressed temp
-     dir, exposes the dir path. The flake reads the same manifest,
-     iterates entries under `--impure` using `MVM_HOST_BIN_DIR` to
-     find the staged binaries, and generates the corresponding
-     `extraFiles` entries automatically — no per-binary `extraFiles`
-     lines hand-written.
+   - **CI invariant: the Rust manifest and the Nix attrset stay in
+     sync.** A small xtask (`xtask check-mvm-host-binaries-sync`)
+     parses both and asserts the entries match by name and
+     `install_path`. Cheap because the manifest is small and changes
+     rarely.
 
    - **No `rustPlatform.buildRustPackage` for mvm's binaries** in the
      builder-VM flake (or in the deleted dev-image flake). The
      `fetchCrate` path stops being on `dev up`'s critical path
      entirely, regardless of what crates.io's data-access policy does.
 
-   - **Contributor toolchain delta:** one `brew install zig` (the
-     dependency `cargo-zigbuild` needs). Probed by `mvmctl doctor`
+   - **Contributor toolchain delta:** `brew install zig` plus
+     `cargo install cargo-zigbuild` — needed at `cargo build`-of-
+     mvmctl time, not at `dev up` runtime. Probed by `mvmctl doctor`
      with install hints, same surface as the existing libkrun trio.
      Native Linux contributors require nothing new.
 
@@ -124,7 +141,9 @@ the underlying shape instead.
 
 ## Why cargo zigbuild
 
-Three reasons, in order of how much each actually matters:
+Three reasons, in order of how much each actually matters. (These
+apply whether zigbuild runs at mvmctl-build-time or at runtime; the
+embedding choice in §Decision doesn't change the tool.)
 
 1. **Crates with C in `build.rs` actually compile.** `ring`,
    `aws-lc-rs`, `openssl-sys`, etc. typically fail under Homebrew's
@@ -132,12 +151,13 @@ Three reasons, in order of how much each actually matters:
    own multi-arch C toolchain with a real glibc sysroot.
 2. **Single Homebrew install (`brew install zig`), no Docker.** Uses
    cargo's native `target/` directory, so incremental compile shares
-   state with the contributor's normal `cargo build`. Second `dev up`
-   rebuilds only what they edited.
+   state with the contributor's normal `cargo build`. Editing
+   `mvm-builder-init` source triggers an incremental cross-compile
+   inside `build.rs`, not a full rebuild.
 3. **Explicit glibc version pinning.** `--target aarch64-unknown-linux-
-   gnu.2.17` lets us pin the glibc version to match what nixpkgs's
-   base userland ships, avoiding the "binary requires newer glibc
-   than the rootfs has" foot-gun.
+   gnu.2.17` lets us pin the glibc version to match what the rootfs
+   ships, avoiding the "binary requires newer glibc than the rootfs
+   has" foot-gun.
 
 Alternatives considered:
 
@@ -145,10 +165,14 @@ Alternatives considered:
   from cargo's, Docker dependency on macOS contributors.
 - **Hand-rolled Homebrew cross-toolchain** — high per-contributor
   setup tax, breaks on C-in-`build.rs` crates, no glibc sysroot.
-- **Build inside a Linux container/VM** — slower inner loop (separate
-  target/), pushes complexity into mvmctl, runs against the
-  responsibility split established here (the dev/builder VM's job is
-  *building microVMs*, not recompiling mvm).
+- **Cargo at `dev up` runtime instead of `mvm-cli`'s `build.rs`** —
+  the rejected earlier draft. Conflates mvmctl's orchestration
+  responsibility with build-system orchestration; introduces a
+  runtime dependency on cargo + zigbuild even after mvmctl is built;
+  makes mvmctl-the-binary not a self-contained unit.
+- **Build inside a Linux container/VM** — slower inner loop, runs
+  against the responsibility split established here (the dev/builder
+  VM's job is *building microVMs*, not recompiling mvm).
 - **Cargo inside the builder VM, bootstrap-staged** — recreates the
   Stage 0 chicken-and-egg shape in a new place.
 
@@ -156,14 +180,24 @@ Alternatives considered:
 
 ### Layers (with sharp boundaries)
 
-- **Host (mvmctl + cargo)** — produces mvm's Linux binaries. Inputs:
-  workspace source, `Cargo.lock`, `mvm-host-binaries.nix`. Outputs:
-  staged binary dir, content-addressed.
-- **Stage 0 (libkrun + libkrunfw kernel + Alpine + nix)** — unchanged
-  in role. New inputs: the staged binary dir (mounted at `/mvm-bins`
-  via virtio-fs) and `MVM_HOST_BIN_DIR=/mvm-bins` in env. Output:
-  builder-VM image artifacts (`vmlinux` + `rootfs.ext4` + cmdline.txt
-  + manifest.json). The flake never compiles Rust.
+- **mvmctl build time (`cargo build` of mvm-cli)** — `build.rs`
+  cross-compiles each entry in the host-binaries manifest via
+  `cargo zigbuild`. Outputs land in `$OUT_DIR/mvm-host-bins/<name>`
+  and are baked into the mvmctl binary via `include_bytes!` plus a
+  precomputed SHA-256. From the artifact perspective: the mvmctl
+  binary now contains everything it needs to run a builder/dev VM.
+- **mvmctl runtime (host)** — On first use per process, extracts the
+  embedded binaries to `~/.cache/mvm/host-bins/<content-hash>/`
+  (idempotent). Sets `MVM_HOST_BIN_DIR` for downstream use. **No
+  cargo invocation. No `target/` lookup. No manifest parsing.**
+- **Stage 0 (libkrun + libkrunfw kernel + Alpine + nix)** —
+  unchanged in role. New inputs: the extracted binary dir mounted at
+  `/mvm-bins` via virtio-fs, and `MVM_HOST_BIN_DIR=/mvm-bins` in env.
+  Output: builder-VM image artifacts (`vmlinux` + `rootfs.ext4` +
+  cmdline.txt + manifest.json). The flake never compiles Rust.
+  Rootfs assembly uses `mkfs.ext4 -d <staged-dir>` (pattern borrowed
+  from pve-microvm — see §References) so the final image is built
+  from a populated directory tree in one step.
 - **Builder VM (the produced image)** — one image, two attrs as
   defined in §Decision.
 
@@ -174,56 +208,61 @@ today's shape.
 
 1. User runs `mvmctl dev up` (always interactive).
 2. mvmctl detects source-checkout mode (workspace + flake present).
-3. **mvmctl parses `nix/lib/mvm-host-binaries.nix`** to get the cargo
-   packages to build and their install paths.
-4. **mvmctl runs `cargo zigbuild --target aarch64-unknown-linux-gnu
-   --release -p <pkg>`** (or `cargo build` for native Linux) per
-   entry. Outputs land in the host's `target/aarch64-unknown-linux-
-   gnu/release/`. Cargo's incremental compile means second `dev up`
-   rebuilds only changed crates.
-5. **mvmctl stages binaries into a content-addressed dir** at
-   `~/.cache/mvm/host-bins/<hash>/{mvm-builder-init, mvm-egress-proxy}`.
-   The hash is one of the cache keys for the builder-VM image.
-6. mvmctl boots Stage 0 with two virtio-fs shares: `/work` (workspace)
-   and **`/mvm-bins`** (the staged dir from step 5).
-7. Stage 0 runs `nix build path:/work/nix/images/builder-vm#packages.
+3. **mvmctl extracts the embedded Linux binaries to
+   `~/.cache/mvm/host-bins/<content-hash>/`** if not already there.
+   The hash is part of the mvmctl binary; identical mvmctl binaries
+   produce identical extractions and reuse the same dir.
+4. mvmctl boots Stage 0 with two virtio-fs shares: `/work`
+   (workspace) and **`/mvm-bins`** (the extracted dir from step 3).
+5. Stage 0 runs `nix build path:/work/nix/images/builder-vm#packages.
    <system>.dev --impure` (`.default` for non-`dev` commands).
    `MVM_HOST_BIN_DIR=/mvm-bins` set in env.
-8. **The flake reads `mvm-host-binaries.nix`, iterates entries, and
+6. **The flake reads `mvm-host-binaries.nix`, iterates entries, and
    generates `extraFiles` entries pointing at `/mvm-bins/<name>` with
    the declared `install_path` and `mode`.** No `rustPlatform`. No
    `fetchCrate`.
-9. Nix produces `vmlinux` + `rootfs.ext4`; Stage 0 powers down.
-10. mvmctl extracts to `~/.cache/mvm/builder-vm/<system>/`, keyed on
-    (workspace SHA, host-bins hash, flake SHA).
-11. mvmctl boots the dev VM via whichever backend the host selects
-    (libkrun / Vz / Apple Container per the existing
-    `MVM_BUILDER_BACKEND` rules).
-12. mvmctl opens a PTY-over-vsock console into the running VM.
+7. Nix produces `vmlinux` + `rootfs.ext4` (assembled via
+   `mkfs.ext4 -d`); Stage 0 powers down.
+8. mvmctl extracts to `~/.cache/mvm/builder-vm/<system>/`, keyed on
+   (workspace SHA, mvmctl host-bin content hash, flake SHA).
+9. mvmctl boots the dev VM via whichever backend the host selects
+   (libkrun / Vz / Apple Container per the existing
+   `MVM_BUILDER_BACKEND` rules).
+10. mvmctl opens a PTY-over-vsock console into the running VM.
 
 For `mvmctl build`, `mvmctl run`, and other non-`dev` commands: same
-path, but step 7 targets `packages.<system>.default`, step 11 boots
-headless, no step 12.
+path, but step 5 targets `packages.<system>.default`, step 9 boots
+headless, no step 10.
 
 ### Cache invalidation
 
-- `mvm-host-binaries.nix` changes → host-bins hash changes → cache key
+- **mvmctl binary changes** (e.g., because `mvm-builder-init` source
+  changed and `build.rs` re-cross-compiled) → embedded content hash
+  changes → cache key changes → rebuild.
+- `mvm-host-binaries.nix` changes → flake re-bakes → cache key
   changes → rebuild.
-- Source files in a configured cargo package change → cargo's
-  incremental detection rebuilds → host-bins hash changes → cache
-  key changes → flake re-bakes (most of the closure stays cached in
-  the persistent `/nix-store`).
 - Workspace SHA changes elsewhere → cache key changes → rebuild.
-- Nothing changed → cargo no-op, mvmctl boots straight from cache.
+- Nothing changed → mvmctl boots straight from cache; extraction is
+  a no-op (target dir already exists).
 
 ## Component-level diff
 
 ### New
 
-- `nix/lib/mvm-host-binaries.nix` — manifest (see §Decision).
-- A small Rust module in `crates/mvm-build/` that parses the manifest,
-  invokes cargo (zigbuild on macOS, native on Linux), stages outputs,
-  computes the content-addressed hash, returns the dir path.
+- `nix/lib/mvm-host-binaries.nix` — flake-side attrset (the manifest's
+  Nix view). Single purpose, pure data.
+- `crates/mvm-cli/build.rs` — orchestrates the cross-compile during
+  `cargo build` of mvm-cli. Invokes `cargo zigbuild` per manifest
+  entry, computes SHA-256 of each output, writes both bytes and
+  hashes into `$OUT_DIR/mvm-host-bins/`.
+- `crates/mvm-cli/src/host_binaries/` — small module: `manifest.rs`
+  declares the Rust-side manifest constant; `embedded.rs` exposes
+  the `include_bytes!`'d binaries + their hashes; `extract.rs`
+  handles the idempotent extraction to `~/.cache/mvm/host-bins/
+  <hash>/`.
+- `xtask check-mvm-host-binaries-sync` — CI lane asserting the Rust
+  manifest and `nix/lib/mvm-host-binaries.nix` agree on name set and
+  `install_path`.
 
 ### Modified
 
@@ -234,107 +273,161 @@ headless, no step 12.
     `--impure`; generates `extraFiles` mechanically.
   - The `dev` attr adds `bashInteractive`, `cargo`, Rust toolchain,
     editor, motd, PTY-over-vsock console wiring.
+  - Rootfs assembly: explicit `mkfs.ext4 -d <staged-dir>` (or the
+    nixpkgs equivalent if `mkGuest` already does this internally —
+    confirm during implementation; either way the assembly step is
+    legible in the flake, not buried).
 - `nix/lib/workspace-filter.nix` — drops `nix/images/builder` from
   its list of consumers (3 → 2).
-- `crates/mvm-cli/src/commands/env/apple_container.rs` — collapses the
-  source-checkout dispatch: the `find_dev_image_flake` /
+- `crates/mvm-cli/src/commands/env/apple_container.rs` — collapses
+  the source-checkout dispatch: the `find_dev_image_flake` /
   `ensure_source_checkout_dev_image` /
-  `resolve_source_checkout_dev_image` branches go away (no separate
-  dev image flake to find). `cmd_dev_libkrun` / `cmd_dev_vz` call
-  into the new host-binaries module before invoking nix, and target
-  the `dev` attr.
-- `crates/mvm-build/src/pipeline/dev_build.rs` — `dev_build_with_
-  builder_vm` mounts the staged binary dir and passes
-  `MVM_HOST_BIN_DIR` into the in-VM nix invocation.
-- `crates/mvm-cli/src/doctor.rs` — adds a probe for `cargo-zigbuild`
-  on macOS contributors with an install hint
-  (`brew install zig` + `cargo install cargo-zigbuild`, or the
-  appropriate equivalents). Native Linux contributors pass trivially.
-- `CLAUDE.md` "Host dependencies (macOS)" — adds the zigbuild
-  requirement for source-checkout contributors.
+  `resolve_source_checkout_dev_image` branches go away.
+  `cmd_dev_libkrun` / `cmd_dev_vz` call into
+  `host_binaries::ensure_extracted()` (cheap on warm runs) before
+  invoking nix, and target the `dev` attr.
+- `crates/mvm-build/src/pipeline/dev_build.rs` —
+  `dev_build_with_builder_vm` mounts the host-bin dir from
+  `host_binaries::ensure_extracted()` and passes `MVM_HOST_BIN_DIR`
+  into the in-VM nix invocation.
+- `crates/mvm-cli/src/doctor.rs` — adds a build-time probe report
+  for `zig` and `cargo-zigbuild` on macOS contributors with install
+  hints (these are needed for `cargo build` of mvm-cli, not for `dev
+  up`). Native Linux contributors pass trivially. The doctor also
+  reports the embedded-binary content hashes (one-line each) so
+  contributors can sanity-check what their mvmctl carries.
+- `CLAUDE.md` "Host dependencies (macOS)" — adds `zig` and
+  `cargo-zigbuild` as build-time deps for source-checkout
+  contributors. Clarifies these are not needed at `dev up` runtime.
 
 ### Deleted
 
 - `nix/images/builder/flake.nix` — gone.
-- The four `rustPlatform.buildRustPackage` call sites for `mvm-
-  builder-init` / `mvm-egress-proxy` across the builder-vm and
+- The four `rustPlatform.buildRustPackage` call sites for
+  `mvm-builder-init` / `mvm-egress-proxy` across the builder-vm and
   builder flakes.
 - `find_dev_image_flake`, `ensure_source_checkout_dev_image`,
-  `resolve_source_checkout_dev_image`, `bootstrap_builder_vm_image_
-  via_dev_image_stage0` in `apple_container.rs`.
+  `resolve_source_checkout_dev_image`,
+  `bootstrap_builder_vm_image_via_dev_image_stage0` in
+  `apple_container.rs`.
 - The `mvmBuilderInitFor` helper duplicated between the two flakes —
   only one consumer survives, and it's not `rustPlatform`-based.
 
 ### Touched only mechanically
 
-- Tests referencing the deleted flake or dispatch helpers — updated to
-  the single-flake shape or removed if redundant.
+- Tests referencing the deleted flake or dispatch helpers — updated
+  to the single-flake shape or removed if redundant.
 - `nix/images/runtime-overlay/flake.nix` — left intact (out of scope;
   it still uses `rustPlatform` for `mvm-runner` and the guest agent).
-  The mechanism defined here is reusable by a later spec that converts
-  runtime-overlay to consume `mvm-host-binaries.nix`; doing so is
-  explicitly *not* required for this spec.
+  The mechanism defined here is reusable by a later spec that
+  converts runtime-overlay to embed those binaries the same way;
+  doing so is explicitly *not* required for this spec.
 
 ## Error handling
 
-- **`cargo-zigbuild` / `zig` missing on macOS:** mvmctl doctor probes
-  for `zig` and `cargo-zigbuild` and emits a clear install hint. The
-  `dev_build` path fails fast with the same hint if either is missing
-  at use-time.
-- **Cargo build fails for any configured package:** mvmctl surfaces
-  cargo's stderr directly with the failing package name in the outer
-  error context.
+- **`zig` or `cargo-zigbuild` missing during `cargo build` of mvm-cli
+  on macOS:** `build.rs` exits with a `cargo:warning=…` line that
+  names the missing tool and the install command. Failing the build
+  is correct — without zigbuild we cannot produce a working mvmctl.
+- **Cargo build fails for any configured package at mvmctl-build
+  time:** cargo's normal stderr appears; `build.rs` surfaces the
+  failing package name in its own error context so the cause is
+  locatable.
+- **At runtime, extraction fails (filesystem error, perms):**
+  mvmctl fails fast with the target dir path and the underlying I/O
+  error. No fallback to "try cargo" — there is no runtime cargo path.
 - **`MVM_HOST_BIN_DIR` not set when the flake is evaluated:** the
   flake errors loudly with the contract documented inline (a
   contributor running `nix build` directly without going through
   mvmctl gets a useful message, not a Nix evaluation failure 12
   layers deep).
 - **A binary declared in `mvm-host-binaries.nix` not present in
-  `MVM_HOST_BIN_DIR`:** the flake errors with the missing name + the
-  staged-dir path, so the cause is locatable.
+  `MVM_HOST_BIN_DIR`:** the flake errors with the missing name +
+  the dir path. The CI sync check makes this combination impossible
+  in CI but it's still possible on a contributor's machine if
+  someone manually rewrites the Nix attrset without rebuilding
+  mvmctl.
 
 ## Testing
 
-- **Unit tests in `crates/mvm-build/`:** parse `mvm-host-binaries.nix`
-  fixture, assert structure; given a stub staged dir, assert mvmctl
-  passes the right `MVM_HOST_BIN_DIR` and `--impure` to the in-VM
-  build invocation.
-- **Flake-side fixture test:** a test that feeds a hand-crafted
-  `MVM_HOST_BIN_DIR` (with placeholder binaries) into `nix build` and
-  asserts the produced rootfs.ext4 has files at the declared install
-  paths with the declared modes.
-- **End-to-end smoke (CI macOS lane):** runs the real cargo zigbuild
-  step + Stage 0 + flake, asserts the produced builder-VM image has
-  `/sbin/mvm-builder-init` and `/sbin/mvm-egress-proxy` with SHA-256
-  matching the cargo outputs.
-- **`mvmctl doctor` test:** asserts the zigbuild probe runs and
-  emits the expected hint when zig is absent.
-- **Tests touching the deleted dev-image dispatch helpers** — updated
-  to reflect the collapse (most likely removed; the helpers are gone).
+- **Unit tests (`crates/mvm-cli/src/host_binaries/`):** parse the
+  manifest, assert the embedded SHA-256 matches the embedded bytes,
+  assert extract is idempotent against an existing populated dir.
+- **`build.rs` integration test:** a small fixture asserts `build.rs`
+  produces non-empty binaries with valid ELF headers for
+  aarch64-unknown-linux-gnu and embeds them under the expected names.
+- **`xtask check-mvm-host-binaries-sync` test:** asserts the Rust
+  manifest and `mvm-host-binaries.nix` agree on name set and
+  install_path; deliberate divergence triggers a clear failure.
+- **Flake-side fixture test:** feeds a hand-crafted
+  `MVM_HOST_BIN_DIR` (with placeholder binaries) into `nix build`
+  and asserts the produced rootfs.ext4 has files at the declared
+  install paths with the declared modes.
+- **End-to-end smoke (CI macOS lane):** runs the real `cargo build`
+  of mvm-cli (triggering the embedded cross-compile), then runs
+  `mvmctl dev up`, asserts the produced builder-VM image has
+  `/sbin/mvm-builder-init` and `/sbin/mvm-egress-proxy` with
+  SHA-256 matching the embedded hashes.
+- **Tests touching the deleted dev-image dispatch helpers** —
+  updated to reflect the collapse (most likely removed; the helpers
+  are gone).
 
 ## Out of scope
 
 - **Converting `nix/images/runtime-overlay/flake.nix` and the guest
-  agent's build to use this mechanism.** The mechanism is reusable;
-  doing the conversion is a follow-up spec. Keeps blast radius small.
+  agent's build to use the embedded-binary contract.** The mechanism
+  is reusable; doing the conversion is a follow-up spec. Keeps blast
+  radius small.
 - **The SDK's `mkGuest` adoption of the same contract** for end-user
   microVMs (so end-user `mvmctl compile` becomes
   `fetchCrate`-independent). Same reasoning — separate spec, separate
   PR. The mechanism here is designed to be adopted there later
   without changes.
-- **Release pipeline changes** to ensure `mvm-builder-init` and
-  `mvm-egress-proxy` ship as standalone artifacts that
-  end-user-mode mvmctl can download into `MVM_HOST_BIN_DIR`. Today's
-  release workflow already cross-compiles to aarch64-unknown-linux-
-  gnu; ensuring the binaries are uploaded as named release assets is
-  a separate, small change. Called out as an assumption this spec
-  relies on but does not enforce.
-- **The `builder_vm_timeout()` value** and the partial-cache promotion
-  bug observed during debugging this. Both are pre-existing,
+- **Release pipeline changes.** Today's release workflow already
+  cross-compiles to `aarch64-unknown-linux-gnu`; the embedded-binary
+  pattern means the release pipeline only needs to ship the mvmctl
+  binary (everything else rides inside it). No standalone Linux
+  binary release artifacts to publish. Called out as a simplification
+  this spec enables but does not enforce.
+- **The `builder_vm_timeout()` value** and the partial-cache
+  promotion bug observed during debugging this. Both are pre-existing,
   unrelated, and out of scope. Calling them out so future readers
   know they were noticed and parked.
+- **Merging `mvm-builder-init` and `mvm-egress-proxy` into a single
+  multi-call binary.** Considered (busybox-style would save ~5 MB on
+  the embedded payload). Rejected because they have different uid
+  policies and different threat-model exposure: builder-init is PID
+  1, egress-proxy is uid 1801 and internet-facing. Merging conflates
+  two things the security model treats separately. Future cleanup
+  not blocked here.
 - **Any change to `mvm.toml` shape or the SDK's end-user transparency
   story.** Reserved for the SDK's own specs.
+
+## Future directions
+
+(Not part of this spec — flagged so the implementation plan doesn't
+paint future work into corners.)
+
+- **OCI-base userland.** `pve-microvm`'s `build-exo-template.sh`
+  pulls a Debian OCI image as the rootfs base, customises in chroot,
+  and `mkfs.ext4 -d`'s the result. We already have `mvm-oci` in the
+  repo (claim 10) for the end-user workload path. Using the same
+  pattern for the *builder/dev VM rootfs* — Debian/Alpine base + mvm
+  binaries on top, no nixpkgs busybox/iptables/etc. — would drain
+  Nix from the rootfs userland side, complementing how ADR-064 drains
+  it from the Rust-build side. Big architectural shift with its own
+  threat-model implications (provenance of the OCI base, signature
+  chain). Worth its own brainstorm later.
+- **Apply the embedded-binary contract to runtime-overlay** so
+  `mvm-runner` and `mvm-guest-agent` follow the same shape. Removes
+  another `rustPlatform.buildRustPackage` site.
+- **SDK's `mkGuest` adoption.** End-user `mvmctl compile` becomes
+  `fetchCrate`-independent the moment `mkGuest` consumes the same
+  contract.
+- **Plan 107 A1b crate rename.** `mvm-builder-init` →
+  `mvm-host-vm-init` is in flight (PR #506). ADR-064's implementation
+  plan should adopt whichever name lands first and is expected to
+  use the new name end-to-end if A1b merges before this work begins.
 
 ## Consequences
 
@@ -342,39 +435,49 @@ headless, no step 12.
 
 - **`fetchCrate` exits mvm's hot path.** crates.io's User-Agent policy,
   rate limits, and future surprises stop being a `dev up` concern.
+- **mvmctl is a true single-binary unit of distribution.** No
+  runtime cargo dependency. No `target/` lookup. No separate Linux
+  binary release artifacts. End-user downloads one file; that file
+  contains everything it needs to build and run a builder/dev VM.
 - **Single image, single source of truth.** The dev/builder split
   dissolves. The Stage-0 chicken-and-egg fallback (boot dev image to
   build builder VM) dissolves with it.
-- **Faster contributor inner loop.** Cargo's incremental compile on
-  the host beats anything that uses a separate target directory.
-  Edit `mvm-builder-init`, `dev up` again, only that crate rebuilds.
+- **Cleaner responsibility split.** mvmctl is a VM orchestrator;
+  cargo is a build system; nix assembles the rootfs. Each does
+  exactly one job. The previous draft had mvmctl shelling out to
+  cargo at runtime — this version eliminates that.
 - **Less surface area in mvmctl.** Three dispatch helpers
   (`find_dev_image_flake`, `ensure_source_checkout_dev_image`,
   `resolve_source_checkout_dev_image`) go away. One bootstrap path
   remains, not two.
-- **Single producer for mvm's binaries.** Source-checkout uses
-  cargo; end-user uses release artifacts. Same `MVM_HOST_BIN_DIR`
-  contract on the flake side. Same paths inside the rootfs.
 - **Aligns with existing release infrastructure.** `release.yml`
-  already cross-compiles to `aarch64-unknown-linux-gnu`; the host
-  path uses the same target triple and toolchain logic.
+  already cross-compiles to `aarch64-unknown-linux-gnu`; the
+  embedded path uses the same target triple and toolchain logic
+  inside mvm-cli's `build.rs`.
 
 ### Negative
 
-- **New host dependency for macOS source-checkout contributors:**
+- **mvmctl binary grows by the embedded payload** (probably +5–15 MB
+  for two static `-gnu` binaries; less if we eventually go `-musl`
+  static). Cost is real but bounded.
+- **`cargo build` of mvm-cli now does the cross-compile.** First
+  build adds ~30–60s for the two Linux binaries. Subsequent builds
+  are incremental — editing `mvm-builder-init` source rebuilds only
+  that crate via cargo's normal incremental detection, then re-links
+  mvmctl (the link step is what feels slow, not the cross-compile).
+- **Iterating on `mvm-builder-init` source incurs a mvmctl re-link.**
+  Not a full rebuild, but noticeable on a hot loop. Mitigation:
+  contributors who are deep in `mvm-builder-init` work can run
+  `cargo build -p mvm-builder-init --target aarch64-unknown-linux-gnu`
+  directly and skip the mvmctl link; mvmctl's `MVM_HOST_BIN_DIR_OVERRIDE`
+  env var (TBD during implementation) can point at the bare target/
+  output for that workflow. Not required for normal use.
+- **The Rust manifest and the Nix attrset are two-sided.** CI sync
+  check enforces equivalence. Cost is small because the manifest is
+  small and changes rarely.
+- **New host build-time deps for macOS source-checkout contributors:**
   `zig` + `cargo-zigbuild`. One brew install + one cargo install,
   probed by doctor. Native Linux contributors are unaffected.
-- **Cargo glibc-version pinning becomes part of the contract.** The
-  binaries must be compatible with the rootfs's glibc. The pin lives
-  in mvmctl's cargo invocation and must move when the rootfs's glibc
-  moves.
-- **The Rust mirror of `mvm-host-binaries.nix` introduces a sync
-  burden.** Two-file edit when adding a new binary; CI check
-  asserts they match. Cost is small because the manifest is small
-  and changes rarely.
-- **Existing release artifacts must publish the binaries by name.**
-  We rely on this for the end-user path, even though we don't change
-  the release pipeline in this spec. Called out as an assumption.
 
 ## Migration
 
@@ -392,25 +495,34 @@ change. Specifically:
   builder-VM cache) becomes a stale concept. A best-effort cleanup
   on first `dev up` after the upgrade isn't required; the dir simply
   stops being read.
+- **Existing mvmctl binaries that predate this change cannot use the
+  new flake.** Cache invalidation is automatic (the content-hash key
+  for the builder-VM cache will not match), but contributors must
+  rebuild mvmctl once after the merge.
 
 ## Verification
 
-- `mvmctl dev up` from a clean macOS source checkout, with `zig` +
-  `cargo-zigbuild` installed: cargo cross-compiles, Stage 0 produces
-  the builder-VM image, dev VM boots with a working interactive
-  shell. No `crates.io` reachability required at any point during
-  Stage 0's `nix build`.
+- `mvmctl dev up` from a clean macOS source checkout, after a
+  successful `cargo build` (with `zig` + `cargo-zigbuild` installed):
+  no runtime cargo invocation; Stage 0 produces the builder-VM
+  image from the embedded binaries; dev VM boots with a working
+  interactive shell. No `crates.io` reachability required at any
+  point during Stage 0's `nix build`.
 - `mvmctl build` (or any non-`dev` command requiring the builder VM)
   from the same setup: same Stage 0 path, builder VM boots headless,
   job completes, VM exits.
-- Edit a file in `mvm-builder-init/src/` and re-run `mvmctl dev up`:
-  cargo's incremental rebuilds only that crate; the staged-dir hash
-  changes; Stage 0 re-bakes the rootfs with the new binary; the
-  rest of the closure stays cached.
+- Edit a file in `mvm-builder-init/src/` and re-run `cargo build`
+  followed by `mvmctl dev up`: `build.rs` incrementally re-cross-
+  compiles `mvm-builder-init`; mvmctl re-links with the new embedded
+  payload; new content hash; Stage 0 re-bakes the rootfs; the rest
+  of the closure stays cached in the persistent `/nix-store`.
+- Manually running `nix build path:.#packages.<system>.default --impure`
+  without `MVM_HOST_BIN_DIR` set: clear, documented error pointing
+  at the contract.
 - Audit chain (claims 8 / 9 / 10): builder VM image's audit
   emission and verification are unaffected because the rootfs
   contents, paths, and binaries' SHA-256s are still deterministic
-  given a fixed workspace + flake + cargo lock.
+  given a fixed mvmctl binary + flake.
 
 ## References
 
@@ -419,12 +531,16 @@ change. Specifically:
 - Plan 72 — Builder VM via libkrun (the implementation of ADR-046).
 - Plan 92, 95 — Alpine + libkrunfw Stage 0; the path this spec
   doubles down on as the only Stage 0 path going forward.
+- Plan 107 A1a/A1b — Concurrent `mvm-builder-init` →
+  `mvm-host-vm-init` crate rename (commit `58c737dd` merged; PR
+  #506 open). ADR-064 implementation should adopt the final name.
 - `crates/mvm-sdk/src/compile/flake.rs` and ADR-0007 — the end-user
-  flake generation path, which adopts the same `MVM_HOST_BIN_DIR`
+  flake generation path, which adopts the same embedded-binary
   contract in a future spec.
-- [rcarmo/pve-microvm](https://github.com/rcarmo/pve-microvm) — a
-  reference implementation for assembling `vmlinux` + `rootfs.ext4`
-  pairs that's worth borrowing from during the implementation plan.
+- [rcarmo/pve-microvm/tools](https://github.com/rcarmo/pve-microvm/tree/main/tools)
+  — `build-exo-template.sh` (the `mkfs.ext4 -d <staged-dir>` rootfs
+  assembly pattern we lift) and the direct-kernel-boot precedent we
+  already follow.
 - NixOS/nixpkgs PR #525067 — the upstream `fetchCrate` fix
   (static.crates.io) that motivated this redesign. The overlay was
   considered as a workaround and explicitly rejected in favor of
