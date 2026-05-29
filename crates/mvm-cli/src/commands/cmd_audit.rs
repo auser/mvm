@@ -157,6 +157,7 @@ impl Commands {
             Commands::Down(_) => "down",
             Commands::ShellInit(_) => "shell-init",
             Commands::Metrics(_) => "metrics",
+            Commands::Bench(_) => "bench",
             Commands::Config(_) => "config",
             Commands::Uninstall(_) => "uninstall",
             Commands::Audit(_) => "audit",

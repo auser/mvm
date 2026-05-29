@@ -88,6 +88,16 @@ const STORAGE_SUB: &[(&str, AuditPosture)] = &[
 
 const SANDBOX_SUB: &[(&str, AuditPosture)] = &[("gc", AuditPosture::Emits("SandboxGc"))];
 
+// Plan 93 Phase 2 Lever 0 — `mvmctl bench microvm-launch`. The live
+// probe boots a throwaway guest through the signed-plan admission path
+// (claim 8), so the documented posture is the same `plan.*`+`VmStart`
+// chain `up` emits. (The live boot wiring is a tracked follow-up; the
+// measurement substrate ships first.)
+const BENCH_SUB: &[(&str, AuditPosture)] = &[(
+    "microvm-launch",
+    AuditPosture::Emits("plan.admitted+plan.launched+VmStart"),
+)];
+
 const NETWORK_SUB: &[(&str, AuditPosture)] = &[
     ("create", AuditPosture::Emits("NetworkCreate")),
     ("list", AuditPosture::ReadOnly),
@@ -283,6 +293,7 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("image", AuditPosture::DelegatesToSub(IMAGE_SUB)),
     // Operational surfaces.
     ("metrics", AuditPosture::ReadOnly),
+    ("bench", AuditPosture::DelegatesToSub(BENCH_SUB)),
     ("config", AuditPosture::Emits("ConfigChange")),
     ("audit", AuditPosture::ReadOnly),
     ("network", AuditPosture::DelegatesToSub(NETWORK_SUB)),

@@ -90,6 +90,8 @@ pub(in crate::commands) enum Commands {
     ShellInit(env::shell_init::Args),
     /// Show runtime metrics (Prometheus text format by default)
     Metrics(ops::metrics::Args),
+    /// Benchmark microVM operations (e.g. cold launch latency)
+    Bench(ops::bench::Args),
     /// Read or write global operator config (~/.mvm/config.toml)
     Config(ops::config::Args),
     /// Remove local mvm state
@@ -277,6 +279,7 @@ pub fn run() -> Result<()> {
         Commands::Down(a) => vm::down::run(&cli, a, &cfg),
         Commands::ShellInit(a) => env::shell_init::run(&cli, a, &cfg),
         Commands::Metrics(a) => ops::metrics::run(&cli, a, &cfg),
+        Commands::Bench(a) => ops::bench::run(&cli, a, &cfg),
         Commands::Config(a) => ops::config::run(&cli, a, &cfg),
         Commands::Uninstall(a) => env::uninstall::run(&cli, a, &cfg),
         Commands::Audit(a) => ops::audit::run(&cli, a, &cfg),
