@@ -2658,7 +2658,8 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
     let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
     mvm_core::audit_emit!(
         Stage0Boot,
-        "seed=root-dir fingerprint_prefix={fingerprint_prefix}"
+        "seed=root-dir fingerprint_prefix={fingerprint_prefix} flavor={flavor}",
+        flavor = STAGE0_FLAVOR_CURRENT,
     );
 
     let image = BuilderVmImage::new_root_dir(root_dir.clone(), "/init");
@@ -2671,8 +2672,9 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
                 .context("promoting Stage 0 artifacts into the builder VM cache")?;
             mvm_core::audit_emit!(
                 Stage0CachePromoted,
-                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms}",
+                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms} flavor={flavor}",
                 cache = out_dir_path.display(),
+                flavor = STAGE0_FLAVOR_CURRENT,
             );
             Ok(())
         }
@@ -2788,7 +2790,8 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
     mvm_core::audit_emit!(
         Stage0Boot,
-        "seed={source_label} fingerprint_prefix={fingerprint_prefix}"
+        "seed={source_label} fingerprint_prefix={fingerprint_prefix} flavor={flavor}",
+        flavor = STAGE0_FLAVOR_CURRENT,
     );
 
     let result = run_stage0_bootstrap(
@@ -2806,8 +2809,9 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
         Ok(()) => {
             mvm_core::audit_emit!(
                 Stage0CachePromoted,
-                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms}",
+                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms} flavor={flavor}",
                 cache = out_dir.display(),
+                flavor = STAGE0_FLAVOR_CURRENT,
             );
             Ok(())
         }
@@ -2822,6 +2826,16 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
         }
     }
 }
+
+/// Plan 93 Phase 0: which Stage 0 bootstrap variant this build runs.
+///
+/// The `flavor=` field on `Stage0Boot` / `Stage0CachePromoted` audit
+/// detail strings carries this value so a future per-variant identifier
+/// (e.g. Plan 91's Alpine bootstrap, an experimental seed image) only
+/// needs to flip this single constant — not every emit site. Today
+/// there is one variant, so the value is the literal `"current"`.
+#[cfg(feature = "builder-vm")]
+const STAGE0_FLAVOR_CURRENT: &str = "current";
 
 /// Plan 77 W3: which phase of Stage 0 failed. Each variant maps to a
 /// `stage=...` value in the `Stage0Failed` audit detail so a dashboard
@@ -3605,6 +3619,11 @@ fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
     // corresponds to a `rustPlatform.buildRustPackage` call in
     // `nix/images/builder-vm/flake.nix`. Add to this list when a
     // new Rust binary gets baked into the rootfs.
+    //
+    // Only `Cargo.toml` and the recursive `src/` tree enter the
+    // closure `rustc` actually sees. `README.md`, `CHANGELOG.md`,
+    // and other crate-root files don't influence the baked binary,
+    // so they don't bust the Stage 0 cache (Plan 93 Phase 0).
     for crate_name in ["mvm-builder-init", "mvm-egress-proxy"] {
         let crate_dir = workspace_root.join("crates").join(crate_name);
         if !crate_dir.is_dir() {
@@ -3613,7 +3632,28 @@ fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
                 crate_dir.display()
             );
         }
-        hash_dir_recursive(&mut hasher, &format!("crates/{crate_name}"), &crate_dir)?;
+
+        let cargo_toml = crate_dir.join("Cargo.toml");
+        if !cargo_toml.is_file() {
+            anyhow::bail!(
+                "builder VM source fingerprint missing {}",
+                cargo_toml.display()
+            );
+        }
+        hash_named_file(
+            &mut hasher,
+            &format!("crates/{crate_name}/Cargo.toml"),
+            &cargo_toml,
+        )?;
+
+        let src_dir = crate_dir.join("src");
+        if !src_dir.is_dir() {
+            anyhow::bail!(
+                "builder VM source fingerprint missing crate src dir {}",
+                src_dir.display()
+            );
+        }
+        hash_dir_recursive(&mut hasher, &format!("crates/{crate_name}/src"), &src_dir)?;
     }
 
     Ok(format!("{:x}", hasher.finalize()))
@@ -3677,9 +3717,10 @@ fn hash_dir_recursive(hasher: &mut Sha256, prefix: &str, dir: &std::path::Path) 
 }
 
 /// Walk every regular file under `dir`, skipping hidden entries
-/// (`.git/`, `.DS_Store`, …) and `target/` (cargo build output).
-/// Paths are returned lexicographically sorted so the hash is
-/// deterministic regardless of filesystem read order.
+/// (`.git/`, `.DS_Store`, …), editor swap files (`*.swp`), and
+/// `target/` (cargo build output). Paths are returned
+/// lexicographically sorted so the hash is deterministic regardless
+/// of filesystem read order.
 fn walk_source_dir_sorted(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -3689,7 +3730,7 @@ fn walk_source_dir_sorted(dir: &std::path::Path) -> Result<Vec<std::path::PathBu
             let e = e.with_context(|| format!("read_dir entry in {}", d.display()))?;
             let name = e.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == "target" {
+            if name_str.starts_with('.') || name_str == "target" || name_str.ends_with(".swp") {
                 continue;
             }
             let path = e.path();
@@ -5647,6 +5688,75 @@ mod builder_vm_bootstrap_tests {
     }
 
     #[test]
+    fn builder_vm_source_fingerprint_does_not_change_with_readme_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let flake = write_builder_vm_workspace(tmp.path());
+        let baseline =
+            builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("baseline fingerprint");
+
+        // Plan 93 Phase 0: only `Cargo.toml` + `src/**` enter the
+        // closure rustc sees. README, CHANGELOG, LICENSE, and other
+        // crate-root files don't influence the baked binary, so they
+        // must NOT bust the Stage 0 cache — a contributor tweaking
+        // docs shouldn't eat a 10-30 minute rebuild.
+        std::fs::write(
+            tmp.path().join("crates/mvm-builder-init/README.md"),
+            "# mvm-builder-init\n\nAdded docs.\n",
+        )
+        .expect("write README");
+        std::fs::write(
+            tmp.path().join("crates/mvm-egress-proxy/CHANGELOG.md"),
+            "# changelog\n",
+        )
+        .expect("write CHANGELOG");
+
+        let after =
+            builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("after fingerprint");
+
+        assert_eq!(
+            baseline, after,
+            "non-src crate-root files must not affect the builder-vm cache key"
+        );
+    }
+
+    #[test]
+    fn builder_vm_source_fingerprint_changes_with_cargo_toml_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let flake = write_builder_vm_workspace(tmp.path());
+        let first = builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("fingerprint");
+
+        // A dep bump or a feature-flag change in Cargo.toml shifts
+        // what rustPlatform.buildRustPackage produces, so the
+        // fingerprint must pick it up.
+        std::fs::write(
+            tmp.path().join("crates/mvm-builder-init/Cargo.toml"),
+            "[package]\nname = \"mvm-builder-init\"\nversion = \"0.0.1\"\n",
+        )
+        .expect("rewrite Cargo.toml");
+        let second = builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("fingerprint");
+
+        assert_ne!(
+            first, second,
+            "Cargo.toml edit must invalidate the builder-vm cache key"
+        );
+    }
+
+    #[test]
+    fn builder_vm_source_fingerprint_errors_when_cargo_toml_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let flake = write_builder_vm_workspace(tmp.path());
+        std::fs::remove_file(tmp.path().join("crates/mvm-builder-init/Cargo.toml"))
+            .expect("rm Cargo.toml");
+
+        let err = builder_vm_source_fingerprint(flake.to_str().unwrap())
+            .expect_err("missing Cargo.toml must be a hard error");
+        assert!(
+            err.to_string().contains("Cargo.toml"),
+            "error must name the missing path: {err}"
+        );
+    }
+
+    #[test]
     fn builder_vm_source_fingerprint_changes_when_new_file_added_to_crate() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let flake = write_builder_vm_workspace(tmp.path());
@@ -5697,9 +5807,17 @@ mod builder_vm_bootstrap_tests {
         // cargo build artifacts under `target/` are not flake inputs.
         // Adding multi-MB junk there must not change the fingerprint
         // (otherwise every `cargo build` would invalidate the cache).
-        let target = tmp.path().join("crates/mvm-builder-init/target/debug");
-        std::fs::create_dir_all(&target).expect("mkdir target");
-        std::fs::write(target.join("garbage.rlib"), vec![0u8; 4096]).expect("write target garbage");
+        // Place a `target/` both at the crate root (outside the
+        // narrowed walk) and inside `src/` (inside the walk, exercising
+        // the explicit skip).
+        let crate_target = tmp.path().join("crates/mvm-builder-init/target/debug");
+        std::fs::create_dir_all(&crate_target).expect("mkdir crate target");
+        std::fs::write(crate_target.join("garbage.rlib"), vec![0u8; 4096])
+            .expect("write crate target garbage");
+        let src_target = tmp.path().join("crates/mvm-builder-init/src/target/debug");
+        std::fs::create_dir_all(&src_target).expect("mkdir src/target");
+        std::fs::write(src_target.join("junk.rlib"), vec![0u8; 4096])
+            .expect("write src/target garbage");
 
         let after =
             builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("after fingerprint");
@@ -5717,17 +5835,26 @@ mod builder_vm_bootstrap_tests {
         let baseline =
             builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("baseline fingerprint");
 
-        // `.git/HEAD`, editor swap files, `.DS_Store`, etc. — none
-        // are flake inputs and editing them shouldn't bust the cache.
-        let hidden = tmp.path().join("crates/mvm-builder-init/.swp");
-        std::fs::write(&hidden, b"editor scratch").expect("write hidden");
+        // `.git/HEAD`, editor swap files (`.swp`, `foo.rs.swp`),
+        // `.DS_Store`, etc. — none are flake inputs and editing them
+        // shouldn't bust the cache. Place each both at the crate root
+        // (outside the narrowed walk) and inside `src/` (inside the
+        // walk, exercising the explicit skip).
+        for path in [
+            "crates/mvm-builder-init/.swp",
+            "crates/mvm-builder-init/.DS_Store",
+            "crates/mvm-builder-init/src/.DS_Store",
+            "crates/mvm-builder-init/src/main.rs.swp",
+        ] {
+            std::fs::write(tmp.path().join(path), b"junk").expect("write hidden");
+        }
 
         let after =
             builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("after fingerprint");
 
         assert_eq!(
             baseline, after,
-            "hidden entries under the crate must not affect the cache key"
+            "hidden entries / swap files must not affect the cache key"
         );
     }
 
@@ -6118,6 +6245,16 @@ mod builder_vm_bootstrap_tests {
         assert_eq!(Stage0FailureStage::Validate.as_str(), "validate");
         assert_eq!(Stage0FailureStage::Promote.as_str(), "promote");
         assert_eq!(format!("{}", Stage0FailureStage::Build), "build");
+    }
+
+    #[test]
+    fn stage0_flavor_current_wire_format_is_stable() {
+        // Plan 93 Phase 0 — the `flavor=` value emitted on every
+        // `Stage0Boot` / `Stage0CachePromoted` audit line. Today there
+        // is one variant (`"current"`); a future Plan 91 follow-up may
+        // introduce additional variants (e.g. `"alpine"`). Pinning the
+        // current literal here so a rename surfaces immediately.
+        assert_eq!(STAGE0_FLAVOR_CURRENT, "current");
     }
 
     /// Plan 77 W3 — `run_stage0_bootstrap` returns a tagged
