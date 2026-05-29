@@ -479,11 +479,21 @@ plans` per commit 8.
 
 🟢 **W6.A merged 2026-05-27** (PR #459 on `main` at `df950fd9`).
 
-🟡 **W6.A.5 substrate wire-up in flight (2026-05-27)** — 8 commits
-on `worktree-plan-102-w6a-5-wire-up` covering Phases 1–5 of the
-follow-up. See [Plan 102 §W6.A.5](102-gateway-audit-substrate-impl.md#w6a5--vz-swift-bridge--fd-interception-wire-up)
-for the per-item status. Producer activation (`Phase 3c`) and
-live smokes are scheduled for the next PR — until then the
-bridge factory branch is dormant at runtime (`cfg.tenant_id`
-stays `None` and every spawn takes the legacy `run_supervisor`
-path).
+🟢 **W6.A.5 substrate wire-up merged 2026-05-28** (PR #487 on `main`).
+Vz Swift bridge + libkrun `run_supervisor_with_bridge<F>` + host-side
+gvproxy lifecycle shipped; `mvm-libkrun-supervisor` split into its own
+leaf crate.
+
+🟡 **Phase 3c producer activation in flight (2026-05-28)** — executed
+as [Plan 112](112-w6a-phase-3c-producer-activation.md) on
+`worktree-plan-102-phase-3c`. Widens `VmStartConfig` with three
+`Option<String>` fields (`tenant_id` / `plan_json` / `bundle_json`),
+populates from `AdmittedPlan` at the three `mvmctl up`
+construction sites, delegates substrate resolution to a new shared
+`crates/mvm-backend/src/audit_substrate.rs` module (allowlist
+validation + path derivation; seam for the future `NetworkProvider`
+trait), threads the result into libkrun's `SupervisorConfig`. Vz path
+gets the allowlist guard but defers full chain-emit wiring to the
+NetworkProvider trait plan (needs lockstep Swift `Config.swift` schema
+update + a Rust drainer for `events_ingest_socket_path`). Live smokes
+scheduled for the Phase 3c PR merge.

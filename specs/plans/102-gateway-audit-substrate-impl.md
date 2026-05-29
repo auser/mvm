@@ -226,26 +226,45 @@ activation + live smokes are tracked separately as Phase 3c.
       no spawn takes the bridge path, so live smokes wouldn't
       exercise the substrate. Scheduled with the Phase 3c PR.
 
-#### Phase 3c — producer activation (next PR in this work stream)
+#### Phase 3c — producer activation (executed as Plan 112)
 
 Threads the `AdmittedPlan` from `mvm-cli`'s `mvmctl up` admission
 flow down to backend `start()` so the audit-substrate fields
-actually populate at runtime:
+actually populate at runtime. Execution detail and field map live in
+[Plan 112](112-w6a-phase-3c-producer-activation.md).
 
-- [ ] Widen `mvm_core::vm_backend::VmStartConfig` with three
+- [x] Widen `mvm_core::vm_backend::VmStartConfig` with three
       `Option<String>` fields: `tenant_id`, `plan_json`,
       `bundle_json`. All `Option<String>` so mvm-core gains no
       typed deps.
-- [ ] Populate the new fields from `AdmittedPlan` at each
-      `VmStartConfig` construction site in `mvm-cli` (~6 sites).
-- [ ] `mvm-backend/src/libkrun.rs::start()` reads them and
-      populates the five `SupervisorConfig` audit fields +
-      `plan` + `bundle` from `mvm_data_dir()` + the
-      pre-serialized JSON.
-- [ ] Same pattern for the Vz backend (vz.rs already populates
-      `events_ingest_socket_path`; the Vz-side `tenant_id`
-      pumping is the parallel work).
-- [ ] Live smoke per backend.
+- [x] Populate the new fields from `AdmittedPlan` at each
+      `VmStartConfig` construction site in `mvm-cli` (three live
+      sites in `up.rs`: direct-boot `admission`, main path
+      `admission_main`, watch-loop `watch_admission`; top-level
+      `exec.rs` template-restore + session VM paths stay None with
+      doc-comment annotation because no admission is in scope).
+- [x] `mvm-backend/src/libkrun.rs::start()` reads them via the new
+      `build_supervisor_config` helper that delegates substrate
+      resolution to `crates/mvm-backend/src/audit_substrate.rs` and
+      maps the resolved `AuditSubstrate` into `SupervisorConfig`
+      (five audit fields + `plan` + `bundle` parsed from the JSON
+      envelopes).
+- [x] Same delegation pattern for the Vz backend with one carve-out:
+      the resolved substrate is computed (so tenant_id allowlist
+      validation fires) but not yet routed into `vz::SupervisorConfig`
+      — that needs a lockstep Swift `Config.swift` schema update +
+      a Rust-side drainer that binds `events_ingest_socket_path` and
+      emits to the chain. Both belong to the NetworkProvider trait
+      follow-up plan.
+- [x] DNS-label allowlist guard (`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`,
+      ASCII-only, 63-char cap) for both `tenant_id` and `vm_name`.
+      `mvm-plan::TenantId` is unchecked today; this is the
+      defense-in-depth boundary on the way to a typed wrapper.
+- [x] Envelope size caps in `populate_audit_substrate`
+      (`plan_json` ≤ 1 MiB, `bundle_json` ≤ 4 MiB) — DoS guard for
+      the supervisor stdin pipe.
+- [ ] Live smoke per backend × network (libkrun+passt,
+      libkrun+gvproxy, Vz+gvproxy) — pending Plan 112 PR merge.
 
 ### W6.B follow-ups (real flow extraction, next PR in this work stream)
 
