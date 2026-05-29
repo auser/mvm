@@ -5,7 +5,7 @@
 Status: proposed (exploration, not commitment)
 Created: 2026-05-27 (as Plan 105); renumbered 2026-05-28 (as Plan 109)
 Owner: tbd
-Related: SPRINT.md Sprint 57, Sprint 42 Track E, ADR-002, ADR-053, ADR-055, ADR-058, ADR-059, Plan 25, Plan 64, Plan 102, **Plan 104** (host services broker — adjacent vsock surface; see §"Process lineage" and W3)
+Related: SPRINT.md Sprint 57, Sprint 42 Track E, ADR-002, ADR-053, ADR-055, ADR-058, ADR-059, ADR-061 (broker hardening), **ADR-062** (drop host.secrets.v1, add host.audit.v1), Plan 25, Plan 64, Plan 102, **Plan 104** (host services broker — adjacent vsock surface; see §"Process lineage" and W3)
 
 ## Why this plan
 
@@ -67,19 +67,19 @@ pid1 = init (NixOS minimal-init, from nix/lib/minimal-init/)
 
 The flake-defined workload is a **child of `mvm-guest-agent`**. The agent is both protocol dispatcher and process supervisor (fork/exec/wait/PTY + warm pool + integration probes). The netinit prototype dodges process-supervisor complexity entirely (one-shot, no children), which is exactly why it's the right calibration target.
 
-### Adjacent vsock surface (Plan 104 / ADR-059 context)
+### Adjacent vsock surface (Plan 104 / ADR-059 / ADR-062 context)
 
-The agent control channel (vsock `:5252`) is *not* the only vsock surface between guest and host. Plan 104 (host services broker, merged 2026-05-26) added two more ports, both using the same `AuthenticatedFrame` envelope:
+The agent control channel (vsock `:5252`) is *not* the only vsock surface between guest and host. Plan 104 (host services broker, merged 2026-05-26) added a broker channel on `:5300` using the same `AuthenticatedFrame` envelope. **ADR-062 (merged 2026-05-28) rescoped Plan 104** to drop runtime secrets handling as an mvm responsibility — `host.secrets.v1` and the dedicated `mvm-secrets-dispatcher` subprocess on `:5301` are gone; `host.audit.v1` (workload-callable audit emission via the `mvm-broker` subprocess uid 903) takes the broker's first-class slot:
 
-- **`:5300`** — general broker (host-side, in `mvm-supervisor` in-process): `host.time.v1`, `host.cost.v1`, observational/low-criticality services.
-- **`:5301`** — secrets channel (host-side, dedicated `mvm-secrets-dispatcher` subprocess, uid 902, separate address space): `host.secrets.v1` only.
+- **`:5300`** — broker channel (host-side, `mvm-broker` subprocess uid 903): hosts `host.time.v1`, `host.cost.v1`, `host.audit.v1`, `broker.v1`. ADR-062's 3-subprocess model — `mvm-broker` for client-facing traffic, `mvm-host-signer` (uid 904) and `mvm-audit-signer` (uid 905) for key-holders behind per-VM UDS, no further vsock listeners.
+- **`:5301` — removed.** Was the secrets channel under the pre-ADR-062 design. Don't reference in new specs.
 
-The broker is **host-side** — `mvm-secrets-dispatcher` is a host subprocess spawned by the supervisor, not a guest binary, so it's outside this plan's pid0 scope. But the wire surface matters for W3 and W4:
+The broker is **host-side** — `mvm-broker` and the signer subprocesses are host-side subprocesses spawned by the supervisor, not guest binaries, so they're outside this plan's pid0 scope. But the wire surface matters for W3 and W4:
 
-- **W3 must cover all three ports.** Same host static Ed25519 pubkey; three independent Noise_NK sessions; the secrets channel (`:5301`) is the highest-stakes priority for any encryption rollout.
-- **W4 control-plane-vs-data-plane ADR must name the broker as part of the control plane.** Workload→host service calls (secrets, time, cost) carry audit-emitting RPCs and gate on signed `ExecutionPlan.services` bindings — control-plane traffic, not data plane (D3).
+- **W3 must cover both vsock ports** (`:5252` agent + `:5300` broker). Same host static Ed25519 pubkey; two independent Noise_NK sessions; the **audit channel (`host.audit.v1` on `:5300`) is the highest-stakes priority** for any encryption rollout because workload-asserted audit entries flow plaintext today and the hypervisor-snooping threat applies to them in the same way it would have to secrets.
+- **W4 control-plane-vs-data-plane ADR must name the broker as part of the control plane.** Workload→host service calls (time, cost, audit-emit) carry audit-emitting RPCs and gate on signed `ExecutionPlan.services` bindings — control-plane traffic, not data plane (D3).
 - **D2 (Rust defines the conversation) extends to broker types**: `ServiceCall` / `ServiceResponse` envelopes stay Rust-canonical in `mvm-core` alongside `GuestRequest`/`GuestResponse`. Any Zig adoption inherits the same drift-protection constraint.
-- **I1 (audit chain) already spans the broker** — Plan 104 funnels all broker calls through the supervisor's `AuditEmitter`. This plan inherits the integration cleanly; nothing to design.
+- **I1 (audit chain) already spans the broker** — Plan 104 funnels all broker calls (including the new `host.audit.v1` workload-emit path) through the supervisor's `AuditEmitter` via the `mvm-audit-signer` subprocess. This plan inherits the integration cleanly; nothing to design.
 
 See `specs/research/agent-evolution-tradeoff-note.md` §"Vsock surface — broader than the agent control channel" for the full table and integration analysis.
 
@@ -165,7 +165,7 @@ Items 1, 2, 6 can independently rule out an implementation. The result table fee
 
 Deliverable: `specs/research/vsock-control-plane-encryption.md`. No code in this milestone.
 
-**Scope**: all three guest↔host vsock surfaces — `:5252` (agent control), `:5300` (broker general — `host.time.v1`, `host.cost.v1`), `:5301` (broker secrets — `host.secrets.v1`). Same `AuthenticatedFrame` envelope on all three; same host static Ed25519 pubkey authenticates all three; three independent Noise_NK sessions. **Priority implementation target for any follow-on plan: `:5301` first** — secrets carry the highest-stakes plaintext today (per Plan 104 the broker ships on plaintext `AuthenticatedFrame`, consistent with ADR-002's current out-of-scope-for-malicious-hypervisor posture; encrypting `:5301` is the most valuable upgrade).
+**Scope**: both guest↔host vsock surfaces — `:5252` (agent control) and `:5300` (broker — `host.time.v1`, `host.cost.v1`, `host.audit.v1`, `broker.v1`). Same `AuthenticatedFrame` envelope on both; same host static Ed25519 pubkey authenticates both; two independent Noise_NK sessions. **Priority implementation target for any follow-on plan: `:5300` first, specifically the `host.audit.v1` traffic** — workload-asserted audit entries carry the highest-stakes plaintext on the broker today (post-ADR-062 the broker ships on plaintext `AuthenticatedFrame`, consistent with ADR-002's current out-of-scope-for-malicious-hypervisor posture; encrypting `:5300` is the most valuable upgrade). The pre-ADR-062 secrets channel (`:5301`) is gone; do not reference in new specs.
 
 Recommended design (locked):
 - **Protocol**: Noise_NK
@@ -173,7 +173,7 @@ Recommended design (locked):
 - **Cipher**: ChaCha20-Poly1305
 - **Hash**: SHA-256
 - **Host pubkey distribution**: bake into guest image via `mkGuest { hostPubkey = ./host-signer.ed25519.pub; }` flake parameter, read from `~/.mvm/keys/host-signer.ed25519.pub` at image build time
-- **Envelope**: stream-level wrap (post-handshake, every byte through `CipherState::write_message`); `AuthenticatedFrame` signing + sequence# remain intact under the cipher (I1). Each port runs its own session; envelope layering is identical across all three.
+- **Envelope**: stream-level wrap (post-handshake, every byte through `CipherState::write_message`); `AuthenticatedFrame` signing + sequence# remain intact under the cipher (I1). Each port runs its own session; envelope layering is identical across both.
 - **Rust impl pointer**: [`snow`](https://crates.io/crates/snow), small audited
 - **Zig impl strategy** (when/if): Noise_NK from scratch (~800 LoC); beats wrapping a C library
 - **Coordination point**: any change to `AuthenticatedFrame` in `crates/mvm-core/src/policy/security.rs` is a sync point with the Plan 104 broker work — W3 design must specify the wrap layer precisely so the two efforts can't drift. The secrets-work session driving broker implementation should treat the W3 doc as the encryption contract their future encrypted broker will inherit.
