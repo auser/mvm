@@ -2620,14 +2620,18 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
 
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
+    // Plan 93 Phase 3: time each host-visible Stage 0 step and print a
+    // one-line `[mvm] <step> … <secs>s` so perceived speed matches the
+    // actual per-step wall-clock.
+    let fetch_started = std::time::Instant::now();
     let stage0_assets = mvm_build::stage0::assets_for_host_arch();
     let vendor_reports = mvm_build::stage0::prepare_assets(stage0_assets)
         .context("preparing Stage 0 bootstrap assets (Alpine minirootfs + signature)")?;
-    // Plan 93 Phase 3: one VendorBlobFetched audit entry per vendored
-    // blob (covers both fresh fetch and cache revalidation), so every
-    // supply-chain trust decision in the no-prebuilt-download path is
-    // auditable. The emit lives here (the host caller) so `mvm-build`
-    // stays audit-free.
+    ui::timed_step("Fetching Stage 0 bootstrap assets", fetch_started.elapsed());
+    // One VendorBlobFetched audit entry per vendored blob (covers both
+    // fresh fetch and cache revalidation), so every supply-chain trust
+    // decision in the no-prebuilt-download path is auditable. The emit
+    // lives here (the host caller) so `mvm-build` stays audit-free.
     for report in &vendor_reports {
         mvm_core::policy::audit::emit(
             mvm_core::policy::audit::LocalAuditKind::VendorBlobFetched,
@@ -2645,12 +2649,13 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
             format!("clearing previous Stage 0 root dir {}", root_dir.display())
         })?;
     }
+    let materialize_started = std::time::Instant::now();
     mvm_build::stage0::materialize_root_dir(&root_dir)
         .with_context(|| format!("materializing Stage 0 root at {}", root_dir.display()))?;
-    ui::info(&format!(
-        "Stage 0 root dir materialized at {}.",
-        root_dir.display()
-    ));
+    ui::timed_step(
+        "Materializing Stage 0 root dir",
+        materialize_started.elapsed(),
+    );
 
     // Workspace root = three dirs above the flake.nix
     // (nix/images/builder-vm/flake.nix → repo root).

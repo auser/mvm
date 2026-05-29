@@ -162,6 +162,36 @@ struct DoctorReport {
     all_ok: bool,
 }
 
+/// Plan 93 Phase 3 — surface the last Stage 0 builder-VM bootstrap
+/// outcome (and its source-fingerprint prefix, carried in the audit
+/// detail) so "why did Stage 0 fire / when did it last run?" is
+/// answerable without grep-ing the audit log. Informational: a stale or
+/// never-run Stage 0 is not a host-side defect, so `ok` is always true.
+fn stage0_status_check() -> Check {
+    use mvm_core::policy::audit::LocalAuditKind;
+    let info = match mvm_core::policy::audit::read_last_stage0_event() {
+        None => "no Stage 0 recorded yet (run `mvmctl dev up`)".to_string(),
+        Some(ev) => {
+            let outcome = match ev.kind {
+                LocalAuditKind::Stage0Boot => "boot (in progress or interrupted)",
+                LocalAuditKind::Stage0CachePromoted => "cache promoted (clean)",
+                LocalAuditKind::Stage0Failed => "failed",
+                _ => "unknown",
+            };
+            match ev.detail {
+                Some(d) => format!("last Stage 0: {outcome} at {} ({d})", ev.timestamp),
+                None => format!("last Stage 0: {outcome} at {}", ev.timestamp),
+            }
+        }
+    };
+    Check {
+        name: "stage 0",
+        category: "tools",
+        ok: true,
+        info,
+    }
+}
+
 pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     // ── Prerequisites (user must install before bootstrap) ───────
     let mut checks = vec![
@@ -220,6 +250,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     checks.push(network_backend_check(plat));
     checks.push(docker_check(plat));
     checks.push(ts_runner_check());
+    checks.push(stage0_status_check());
 
     checks.push(disk_space_check(false));
 

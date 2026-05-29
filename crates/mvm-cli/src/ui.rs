@@ -53,6 +53,19 @@ pub fn warn(msg: &str) {
     }
 }
 
+/// Format a completed timed step's message: `<label> … <secs>s`.
+/// Pure (testable); [`timed_step`] routes it through [`info`].
+pub fn format_timed(label: &str, elapsed: std::time::Duration) -> String {
+    format!("{label} … {:.1}s", elapsed.as_secs_f64())
+}
+
+/// Print a completed timed step: `[mvm] <label> … <secs>s`. Used for
+/// Stage 0 per-step progress (Plan 93 Phase 3) so the user's perceived
+/// speed matches the actual per-step wall-clock.
+pub fn timed_step(label: &str, elapsed: std::time::Duration) {
+    info(&format_timed(label, elapsed));
+}
+
 /// Print a numbered step: [mvm] Step n/total: message
 pub fn step(n: u32, total: u32, msg: &str) {
     let formatted = format!(
@@ -147,4 +160,24 @@ pub fn spinner(msg: &str) -> ProgressBar {
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
     pb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_timed_renders_label_and_one_decimal_second() {
+        assert_eq!(
+            format_timed(
+                "Fetching Alpine minirootfs",
+                std::time::Duration::from_millis(400)
+            ),
+            "Fetching Alpine minirootfs … 0.4s"
+        );
+        assert_eq!(
+            format_timed("nix build", std::time::Duration::from_millis(12_345)),
+            "nix build … 12.3s"
+        );
+    }
 }

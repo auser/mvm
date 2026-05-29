@@ -7,7 +7,7 @@ use crate::ui;
 use mvm_core::user_config::MvmConfig;
 
 use super::Cli;
-use super::shared::human_bytes;
+use super::shared::{human_age_secs, human_bytes};
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -50,11 +50,21 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         CacheAction::Info => {
             println!("Cache directory: {cache_dir}");
             let path = std::path::Path::new(&cache_dir);
-            if path.exists() {
-                let size = dir_size(path);
-                println!("Disk usage: {}", human_bytes(size));
-            } else {
+            if !path.exists() {
                 println!("(not yet created)");
+                return Ok(());
+            }
+            println!("Disk usage: {}", human_bytes(dir_size(path)));
+            // Plan 93 Phase 3: surface vendored-blob ages, the
+            // cross-target builder-VM cache size, assembled rootfs ages,
+            // and the last Stage 0 source fingerprint.
+            let stage0_dir = mvm_build::stage0::stage0_cache_dir();
+            let blob_filenames: Vec<&str> = mvm_build::stage0::assets_for_host_arch()
+                .iter()
+                .map(|a| a.cache_filename)
+                .collect();
+            for line in stage0_cache_report(path, &stage0_dir, &blob_filenames) {
+                println!("{line}");
             }
             Ok(())
         }
@@ -208,6 +218,94 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 }
 
+/// Whole-second age of a file from its mtime, or `None` if it can't be
+/// stat'd / is in the future.
+fn file_age_secs(path: &std::path::Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Build the Plan 93 Phase 3 `cache info` enrichment lines: vendored
+/// Stage 0 blob ages, the builder-VM cross-target cache size, per-arch
+/// assembled rootfs ages, and the last Stage 0 source-fingerprint
+/// prefix. Path-injectable + side-effect-free (only stats + reads the
+/// fingerprint sidecar) so it's hermetically testable; never hashes the
+/// multi-GB rootfs (mtime + the cheap sidecar only).
+fn stage0_cache_report(
+    cache_root: &std::path::Path,
+    stage0_dir: &std::path::Path,
+    blob_filenames: &[&str],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if !blob_filenames.is_empty() {
+        lines.push("Vendored blobs (Stage 0):".to_string());
+        for fname in blob_filenames {
+            let p = stage0_dir.join(fname);
+            match std::fs::metadata(&p) {
+                Ok(m) => {
+                    let age = file_age_secs(&p)
+                        .map(human_age_secs)
+                        .unwrap_or_else(|| "?".to_string());
+                    lines.push(format!("  {fname}: {age} old ({})", human_bytes(m.len())));
+                }
+                Err(_) => lines.push(format!("  {fname}: (absent)")),
+            }
+        }
+    }
+
+    let builder = cache_root.join("builder-vm");
+    if builder.is_dir() {
+        lines.push(format!(
+            "Builder VM cache: {} ({})",
+            builder.display(),
+            human_bytes(dir_size(&builder))
+        ));
+        if let Ok(entries) = std::fs::read_dir(&builder) {
+            // Per-arch artifact dirs only — skip `vms/` (per-VM scratch)
+            // and dotfiles. Sorted for stable output.
+            let mut arch_dirs: Vec<std::path::PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .filter(|p| {
+                    let n = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    n != "vms" && !n.starts_with('.')
+                })
+                .collect();
+            arch_dirs.sort();
+            for p in arch_dirs {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let rootfs = p.join("rootfs.ext4");
+                if let Ok(m) = std::fs::metadata(&rootfs) {
+                    let age = file_age_secs(&rootfs)
+                        .map(human_age_secs)
+                        .unwrap_or_else(|| "?".to_string());
+                    lines.push(format!(
+                        "  {name}/rootfs.ext4: {age} old ({})",
+                        human_bytes(m.len())
+                    ));
+                }
+                if let Ok(s) = std::fs::read_to_string(p.join(".mvm-source.sha256")) {
+                    let prefix: String = s.trim().chars().take(8).collect();
+                    lines.push(format!("  {name}/ last Stage 0 fingerprint: {prefix}"));
+                }
+            }
+        }
+    }
+
+    lines
+}
+
 /// Recursively calculate directory size in bytes.
 fn dir_size(path: &std::path::Path) -> u64 {
     walkdir(path)
@@ -233,4 +331,48 @@ fn walkdir(path: &std::path::Path) -> Result<Vec<std::fs::DirEntry>> {
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage0_cache_report_surfaces_blobs_and_builder_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Vendored Stage 0 blob present (one) + one we ask about that's absent.
+        let stage0 = root.join("stage0");
+        std::fs::create_dir_all(&stage0).unwrap();
+        std::fs::write(stage0.join("alpine-minirootfs-aarch64.tar.gz"), b"hello").unwrap();
+
+        // builder-vm/<arch>/ with an assembled rootfs + fingerprint sidecar.
+        let arch = root.join("builder-vm").join("aarch64");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::write(arch.join("rootfs.ext4"), b"rootfsdata").unwrap();
+        std::fs::write(arch.join(".mvm-source.sha256"), "abcd1234deadbeef\n").unwrap();
+        // A per-VM scratch dir that must be skipped.
+        std::fs::create_dir_all(root.join("builder-vm").join("vms").join("v1")).unwrap();
+
+        let blobs = ["alpine-minirootfs-aarch64.tar.gz", "missing-blob.tar.gz"];
+        let joined = stage0_cache_report(root, &stage0, &blobs).join("\n");
+
+        assert!(joined.contains("alpine-minirootfs-aarch64.tar.gz: "));
+        assert!(joined.contains("missing-blob.tar.gz: (absent)"));
+        assert!(joined.contains("aarch64/rootfs.ext4: "));
+        assert!(joined.contains("last Stage 0 fingerprint: abcd1234"));
+        // The full 16-char sidecar is truncated to 8.
+        assert!(!joined.contains("abcd1234deadbeef"));
+        // `vms/` is not reported as an arch dir.
+        assert!(!joined.contains("vms/rootfs.ext4"));
+    }
+
+    #[test]
+    fn stage0_cache_report_empty_when_nothing_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No stage0 dir, no builder-vm dir, no blobs.
+        let lines = stage0_cache_report(tmp.path(), &tmp.path().join("stage0"), &[]);
+        assert!(lines.is_empty());
+    }
 }
