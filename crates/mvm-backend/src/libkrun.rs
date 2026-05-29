@@ -153,9 +153,14 @@ impl VmBackend for LibkrunBackend {
             );
         }
 
-        // Note: the kernel-path requirement check now lives in
-        // `build_supervisor_config` (which the helper invokes); we still
-        // bail early if it's missing, just via the helper.
+        // Plan 112 Phase 3c — early kernel-path check. `build_supervisor_config`
+        // re-checks too, but this keeps the existing test contract
+        // (`libkrun_start_errors_when_kernel_path_missing`) firing before
+        // `admit_overlay_aware`'s sidecar check would mask it.
+        let _ = config
+            .kernel_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("libkrun backend requires a kernel path"))?;
         let supervisor_path = resolve_supervisor_path()?;
         let state_dir = vm_state_dir(&config.name);
         std::fs::create_dir_all(&state_dir)
