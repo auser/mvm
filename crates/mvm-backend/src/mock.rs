@@ -334,6 +334,9 @@ mod tests {
             secret_files: Vec::new(),
             ports: Vec::new(),
             runner_dir: None,
+            tenant_id: None,
+            plan_json: None,
+            bundle_json: None,
         }
     }
 
