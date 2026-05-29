@@ -1325,11 +1325,21 @@ mod tests {
                 let (tx, rx) = mpsc::channel::<FlowEvent>(8);
                 let (broadcast_tx, _broadcast_rx) = broadcast::channel::<String>(8);
 
-                let count = Arc::new(CountObs(AtomicU32::new(0)));
+                let count_before = Arc::new(CountObs(AtomicU32::new(0)));
+                let count_after = Arc::new(CountObs(AtomicU32::new(0)));
                 let signer = Arc::new(CapturingAuditSigner::new());
+                // Order matters: count_before runs BEFORE PanicObs (covers
+                // "preceding sibling sees event"), count_after runs AFTER
+                // PanicObs (covers "following sibling sees event despite
+                // intervening panic"). Without count_after, a regression
+                // that breaks the fan-out loop on panic would still leave
+                // count_before == 2 — the loop increments it before the
+                // panicking sibling unwinds. count_after at position 2
+                // makes the panic-isolation property load-bearing.
                 let observers: Vec<Arc<dyn Observer>> = vec![
-                    count.clone() as Arc<dyn Observer>,
+                    count_before.clone() as Arc<dyn Observer>,
                     Arc::new(PanicObs) as Arc<dyn Observer>,
+                    count_after.clone() as Arc<dyn Observer>,
                 ];
 
                 let task = tokio::task::spawn_local(signer_task(
@@ -1360,13 +1370,25 @@ mod tests {
                 drop(tx);
                 task.await.unwrap();
 
-                // Observer recorded both events (open + close), even
-                // though `PanicObs` panicked on each one — catch_unwind
-                // isolated the panic without breaking sibling observers.
+                // count_before (vec position 0) ran before PanicObs on
+                // each iteration; counter would tick even if the loop
+                // broke on panic. Kept to cover the "preceding sibling"
+                // property explicitly.
                 assert_eq!(
-                    count.0.load(Ordering::SeqCst),
+                    count_before.0.load(Ordering::SeqCst),
                     2,
-                    "non-panicking observer must see all events"
+                    "before-panic observer must see both events"
+                );
+                // count_after (vec position 2) is the load-bearing
+                // panic-isolation assertion: it sits behind PanicObs in
+                // the fan-out order, so a regression that removed
+                // `catch_unwind` (or otherwise broke the loop on panic)
+                // would leave it at 0.
+                assert_eq!(
+                    count_after.0.load(Ordering::SeqCst),
+                    2,
+                    "after-panic observer must see both events \
+                     (proves panic isolation across siblings)"
                 );
                 // CapturingAuditSigner also recorded both entries —
                 // chain integrity preserved across observer panics.
