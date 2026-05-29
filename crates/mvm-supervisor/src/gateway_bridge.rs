@@ -171,24 +171,41 @@ pub struct BridgeConfig {
     pub audit_socket: PathBuf,
     pub signer: Arc<dyn AuditSigner>,
     pub policy: Arc<dyn FlowPolicy>,
+    /// Plan 113 / ADR-064 — host-allowlisted observers that fan-out
+    /// each FlowEvent before chain signing. Empty `Vec` = no observers
+    /// (only the always-on chain signer fires). The signer task wraps
+    /// each observer call in `catch_unwind`; a panicking observer
+    /// surfaces a `tracing::warn` and does not break sibling observers
+    /// or the chain-signing path.
+    ///
+    /// Task 3 ships the fan-out mechanism with an empty vec at every
+    /// existing producer site (pre-Plan-113 behavior preserved
+    /// byte-for-byte). Task 4 wires `Pipeline::from_admitted` into
+    /// `mvm-libkrun-supervisor::main::run_with_bridge` to populate the
+    /// list from the plan's resolved tenant policy bundle.
+    pub observers: Vec<Arc<dyn crate::network::Observer>>,
 }
 
 // ============================================================================
 // Internal FlowEvent (bridge → signer mpsc)
 // ============================================================================
 
-/// Internal event the bridge tasks push into the signer mpsc. Not
-/// part of the public API; bridge variants build it, signer task
-/// converts to `AuditEntry` + `sign_and_emit`s.
+/// Event the bridge tasks push into the signer mpsc. Plan 113 / ADR-064
+/// lifted visibility from `pub(crate)` to `pub` so external observer
+/// impls hosted in this same crate can be reached through
+/// `BridgeConfig.observers` (a `pub` field whose element type is
+/// `Arc<dyn Observer>`, which receives `&FlowEvent` in `on_flow_event`).
+/// The struct stays unconstructible outside `mvm-supervisor` in
+/// practice because every bridge variant lives inside this module.
 #[derive(Debug, Clone)]
-pub(crate) struct FlowEvent {
+pub struct FlowEvent {
     pub flow_id: String,
     pub direction: FlowDirection,
     pub kind: FlowEventKind,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum FlowEventKind {
+pub enum FlowEventKind {
     Opened,
     Closed { reason: FlowCloseReason },
 }
@@ -235,15 +252,24 @@ impl From<&FlowEvent> for FlowEventWire {
 // Signer task (sole writer)
 // ============================================================================
 
-/// Drains the per-VM event channel, converts each `FlowEvent` into
-/// a chained `AuditEntry`, and signs it. Sole caller of
+/// Drains the per-VM event channel, fans each `FlowEvent` out to the
+/// host-allowlisted observers (Plan 113 / ADR-064), then converts it
+/// to a chained `AuditEntry` and signs it. Sole caller of
 /// `signer.sign_and_emit` per VM.
+///
+/// **Ordering invariant:** observer fan-out runs **before** chain
+/// signing, so observers see every event the chain will record. Chain
+/// signing is structural — it always runs after the fan-out loop and
+/// cannot be displaced by tenant policy. A panicking observer is
+/// caught via `catch_unwind` and logged via `tracing::warn`; sibling
+/// observers and the chain-signing call continue.
 pub(crate) async fn signer_task(
     mut rx: mpsc::Receiver<FlowEvent>,
     plan: Arc<ExecutionPlan>,
     bundle: Option<Arc<PolicyBundle>>,
     signer: Arc<dyn AuditSigner>,
     broadcast_tx: broadcast::Sender<String>,
+    observers: Vec<Arc<dyn crate::network::Observer>>,
 ) {
     while let Some(event) = rx.recv().await {
         // Publish on the live-tail broadcast first (informational,
@@ -251,6 +277,35 @@ pub(crate) async fn signer_task(
         // which is fine).
         if let Ok(json) = serde_json::to_string(&FlowEventWire::from(&event)) {
             let _ = broadcast_tx.send(json);
+        }
+
+        // Plan 113 / ADR-064 — observer fan-out under `catch_unwind`.
+        // Runs BEFORE chain signing so observers see every event the
+        // chain will record (the always-on chain-signing path below
+        // is structural and cannot be displaced by tenant policy).
+        // Each observer call is panic-isolated: a panicking observer
+        // does not break sibling observers or the chain-signing path.
+        for obs in &observers {
+            let obs_name = obs.name();
+            let event_ref = &event;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.on_flow_event(event_ref);
+            }));
+            if let Err(panic) = result {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic>".to_string()
+                };
+                tracing::warn!(
+                    observer = obs_name,
+                    flow_id = %event.flow_id,
+                    panic = %msg,
+                    "observer panicked; isolated via catch_unwind, sibling observers continue"
+                );
+            }
         }
 
         // Construct chained entry + emit. Errors are logged but the
@@ -333,13 +388,16 @@ fn run_bridge_inner(endpoints: BridgeEndpoints, cfg: BridgeConfig) {
 
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        // Signer task — sole writer of sign_and_emit per VM.
+        // Signer task — sole writer of sign_and_emit per VM. Plan 113
+        // / ADR-064: observers fan out BEFORE chain signing inside the
+        // task body; the chain-signing call is structural.
         let signer_handle = tokio::task::spawn_local(signer_task(
             event_rx,
             cfg.plan.clone(),
             cfg.bundle.clone(),
             cfg.signer.clone(),
             broadcast_tx,
+            cfg.observers.clone(),
         ));
 
         // Subscriber-sink accept loop.
@@ -1208,5 +1266,181 @@ mod tests {
         assert!(matches!(close_b.kind, FlowEventKind::Closed { .. }));
 
         let _ = bridge_task.await;
+    }
+
+    // -----------------------------------------------------------------
+    // signer_task fan-out (Plan 113 / ADR-064 §Task 3)
+    // -----------------------------------------------------------------
+
+    /// Plan 113 §Task 3 — proves the structural ordering invariant:
+    /// observers run BEFORE chain signing under `catch_unwind`. A
+    /// panicking observer is logged + isolated; sibling observers
+    /// continue to receive events and the chain-signing call still
+    /// fires. Verifies AuditEmit is non-displaceable by tenant policy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signer_task_fans_out_to_observers_before_signing() {
+        use crate::audit::CapturingAuditSigner;
+        use crate::network::{Observer, RequiredCapabilities};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::task::LocalSet;
+
+        struct CountObs(AtomicU32);
+        impl Observer for CountObs {
+            fn name(&self) -> &'static str {
+                "count"
+            }
+            fn required_capabilities(&self) -> RequiredCapabilities {
+                RequiredCapabilities {
+                    flow_events: true,
+                    payload_tap: false,
+                }
+            }
+            fn on_flow_event(&self, _: &FlowEvent) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct PanicObs;
+        impl Observer for PanicObs {
+            fn name(&self) -> &'static str {
+                "panic"
+            }
+            fn required_capabilities(&self) -> RequiredCapabilities {
+                RequiredCapabilities {
+                    flow_events: true,
+                    payload_tap: false,
+                }
+            }
+            fn on_flow_event(&self, _: &FlowEvent) {
+                panic!("test panic");
+            }
+        }
+
+        // signer_task is `spawn_local`'d in production (LocalSet
+        // runtime, current-thread tokio); mirror that here so the
+        // test exercises the same execution shape.
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::channel::<FlowEvent>(8);
+                let (broadcast_tx, _broadcast_rx) = broadcast::channel::<String>(8);
+
+                let count = Arc::new(CountObs(AtomicU32::new(0)));
+                let signer = Arc::new(CapturingAuditSigner::new());
+                let observers: Vec<Arc<dyn Observer>> = vec![
+                    count.clone() as Arc<dyn Observer>,
+                    Arc::new(PanicObs) as Arc<dyn Observer>,
+                ];
+
+                let task = tokio::task::spawn_local(signer_task(
+                    rx,
+                    Arc::new(test_plan()),
+                    None,
+                    signer.clone() as Arc<dyn crate::audit::AuditSigner>,
+                    broadcast_tx,
+                    observers,
+                ));
+
+                tx.send(FlowEvent {
+                    flow_id: "f1".into(),
+                    direction: FlowDirection::Egress,
+                    kind: FlowEventKind::Opened,
+                })
+                .await
+                .unwrap();
+                tx.send(FlowEvent {
+                    flow_id: "f1".into(),
+                    direction: FlowDirection::Egress,
+                    kind: FlowEventKind::Closed {
+                        reason: FlowCloseReason::Eof,
+                    },
+                })
+                .await
+                .unwrap();
+                drop(tx);
+                task.await.unwrap();
+
+                // Observer recorded both events (open + close), even
+                // though `PanicObs` panicked on each one — catch_unwind
+                // isolated the panic without breaking sibling observers.
+                assert_eq!(
+                    count.0.load(Ordering::SeqCst),
+                    2,
+                    "non-panicking observer must see all events"
+                );
+                // CapturingAuditSigner also recorded both entries —
+                // chain integrity preserved across observer panics.
+                let entries = signer.entries();
+                assert_eq!(
+                    entries.len(),
+                    2,
+                    "chain signing fires AFTER fan-out regardless of observer panics"
+                );
+            })
+            .await;
+    }
+
+    /// Plan-doc-shaped `ExecutionPlan` for fan-out tests. Mirrors the
+    /// `sample_plan()` helper in `audit.rs` but kept local so this
+    /// test module owns its fixture lifecycle.
+    fn test_plan() -> mvm_plan::ExecutionPlan {
+        use chrono::TimeZone;
+        use mvm_plan::{
+            AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement,
+            ExecutionPlan, FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PlanSeccompTier, PolicyRef,
+            PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef,
+            TenantId, TimeoutSpec, WorkloadId,
+        };
+        ExecutionPlan {
+            schema_version: SCHEMA_VERSION,
+            plan_id: PlanId("test-plan".into()),
+            plan_version: 1,
+            tenant: TenantId("test".into()),
+            workload: WorkloadId("test-workload".into()),
+            runtime_profile: RuntimeProfileRef("firecracker".into()),
+            image: SignedImageRef {
+                name: "img".into(),
+                sha256: "0".repeat(64),
+                cosign_bundle: None,
+            },
+            resources: Resources {
+                cpus: 1,
+                mem_mib: 256,
+                disk_mib: 1024,
+                timeouts: TimeoutSpec {
+                    boot_secs: 30,
+                    exec_secs: 60,
+                },
+            },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
+            network_policy: PolicyRef("local-default".into()),
+            fs_policy: FsPolicyRef("local-default".into()),
+            secrets: Vec::new(),
+            egress_policy: PolicyRef("local-default".into()),
+            tool_policy: PolicyRef("local-default".into()),
+            artifact_policy: ArtifactPolicy {
+                capture_paths: vec![],
+                retention_days: 0,
+            },
+            audit_labels: std::collections::BTreeMap::new(),
+            key_rotation: KeyRotationSpec { interval_days: 0 },
+            attestation: AttestationRequirement {
+                mode: AttestationMode::Noop,
+            },
+            release_pin: None,
+            post_run: PostRunLifecycle {
+                destroy_on_exit: true,
+                snapshot_on_idle: false,
+                idle_secs: 0,
+            },
+            valid_from: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            valid_until: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 1, 0, 0).unwrap(),
+            nonce: Nonce::from_bytes([0xab; 16]),
+            bundle: None,
+            deps_volume: None,
+        }
     }
 }

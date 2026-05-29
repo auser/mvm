@@ -14,12 +14,23 @@
 //! Per ADR-064 §Decision 7.
 //!
 //! Task 1 lands the trait + builder + allowlist scaffolding in
-//! isolation; Tasks 2–4 (this same plan) wire the types into
-//! `BridgeConfig.observers` + `signer_task` + `Pipeline::from_admitted`,
-//! at which point the `#[allow(dead_code)]` lift can drop. The lib-only
-//! references today are the `#[cfg(test)]` unit tests in this module.
-
-#![allow(dead_code)] // Tasks 2–4 wire observers into BridgeConfig + signer_task.
+//! isolation; Task 3 wires `Observer` into `BridgeConfig.observers` +
+//! `signer_task`, at which point the module-level `#[allow(dead_code)]`
+//! drops (the Observer trait + Pipeline + ObserverAllowlist + MAX_OBSERVERS
+//! become reachable through `BridgeConfig`). Task 4 will wire
+//! `Pipeline::from_admitted` from `run_with_bridge`.
+//!
+//! ## Visibility
+//!
+//! Observer + the capability + builder types are `pub` (not `pub(crate)`)
+//! because Task 3 exposes them through `BridgeConfig.observers`, which is
+//! itself a `pub` field on a `pub` struct — the supervisor binary
+//! (`mvm-libkrun-supervisor`) constructs the literal with an empty
+//! `observers: vec![]` until Task 4 wires real resolution.
+//!
+//! `FlowEvent` in `gateway_bridge` is similarly `pub` (was `pub(crate)`
+//! in Plan 102 W6.A's original commit) so external observer impls can
+//! receive `&FlowEvent` references through the Observer trait.
 
 use crate::gateway_bridge::FlowEvent;
 use std::collections::HashMap;
@@ -30,26 +41,26 @@ pub mod flow_count;
 /// Maximum number of observers per VM. ADR-064 §Decision: hard cap of 8
 /// (each observer is a synchronous callback in the signer task's hot path;
 /// per-VM bound keeps the hot path predictable).
-pub(crate) const MAX_OBSERVERS: usize = 8;
+pub const MAX_OBSERVERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProviderCapabilities {
+pub struct ProviderCapabilities {
     pub flow_events: bool,
     pub payload_tap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RequiredCapabilities {
+pub struct RequiredCapabilities {
     pub flow_events: bool,
     pub payload_tap: bool,
 }
 
 impl ProviderCapabilities {
-    pub(crate) fn satisfies(&self, req: &RequiredCapabilities) -> bool {
+    pub fn satisfies(&self, req: &RequiredCapabilities) -> bool {
         (!req.flow_events || self.flow_events) && (!req.payload_tap || self.payload_tap)
     }
 
-    pub(crate) fn missing_for(&self, req: &RequiredCapabilities) -> Vec<&'static str> {
+    pub fn missing_for(&self, req: &RequiredCapabilities) -> Vec<&'static str> {
         let mut out = Vec::new();
         if req.flow_events && !self.flow_events {
             out.push("flow_events");
@@ -67,19 +78,19 @@ impl ProviderCapabilities {
 /// expensive work should buffer + defer to a background task the observer
 /// owns.
 ///
-/// Visibility is `pub(crate)` because `FlowEvent` (the event reference
-/// observers receive) is `pub(crate)` in `gateway_bridge`. All Task 4
-/// integration points (`BridgeConfig`, `signer_task`, the
-/// `Pipeline::from_admitted` constructor) live inside `mvm-supervisor`,
-/// so crate visibility is sufficient.
-pub(crate) trait Observer: Send + Sync {
+/// Visibility is `pub` because Task 3 exposes observer references through
+/// `BridgeConfig.observers` (a `pub` field on a `pub` struct), and
+/// external supervisor binaries (`mvm-libkrun-supervisor`) construct the
+/// literal at startup. `FlowEvent` is also `pub` in `gateway_bridge` for
+/// the same reason.
+pub trait Observer: Send + Sync {
     fn name(&self) -> &'static str;
     fn required_capabilities(&self) -> RequiredCapabilities;
     fn on_flow_event(&self, event: &FlowEvent);
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BuildError {
+pub enum BuildError {
     #[error("observer chain too deep (max {max}); requested {requested}")]
     TooManyObservers { max: usize, requested: usize },
 
@@ -105,7 +116,7 @@ pub(crate) enum BuildError {
 /// `signer.sign_and_emit(&entry)` after the fan-out — chain signing
 /// is structural, runs after every observer, and cannot be displaced
 /// by tenant policy.
-pub(crate) struct Pipeline {
+pub struct Pipeline {
     observers: Vec<Arc<dyn Observer>>,
 }
 
@@ -121,13 +132,13 @@ impl std::fmt::Debug for Pipeline {
 }
 
 impl Pipeline {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             observers: Vec::new(),
         }
     }
 
-    pub(crate) fn observe(
+    pub fn observe(
         mut self,
         observer: Arc<dyn Observer>,
         leaf_caps: ProviderCapabilities,
@@ -149,7 +160,7 @@ impl Pipeline {
         Ok(self)
     }
 
-    pub(crate) fn build_observers(self) -> Vec<Arc<dyn Observer>> {
+    pub fn build_observers(self) -> Vec<Arc<dyn Observer>> {
         self.observers
     }
 }
@@ -164,7 +175,7 @@ impl Default for Pipeline {
 /// `~/.mvm/observers/allowlist.toml` (mode 0600) at supervisor startup.
 /// Tenant policy bundles reference observer names; `resolve()` returns
 /// the typed `Arc<dyn Observer>` or `BuildError::NotAllowlisted`.
-pub(crate) struct ObserverAllowlist {
+pub struct ObserverAllowlist {
     entries: HashMap<String, ObserverConstructor>,
 }
 
@@ -203,7 +214,7 @@ impl ObserverAllowlist {
     /// HOME unset (e.g. a misconfigured systemd unit or chroot) would trust.
     /// Operator action in that case is "set HOME" or "place
     /// /etc/mvm/observers/allowlist.toml" — both are explicit.
-    pub(crate) fn load_from_host_config() -> Result<Self, BuildError> {
+    pub fn load_from_host_config() -> Result<Self, BuildError> {
         let home = std::env::var("HOME").map_err(|_| BuildError::AllowlistRead {
             path: "$HOME unset".to_string(),
             detail: "HOME environment variable is not set; cannot resolve user allowlist path. \
@@ -319,11 +330,11 @@ impl ObserverAllowlist {
         Ok(Self { entries })
     }
 
-    pub(crate) fn contains(&self, name: &str) -> bool {
+    pub fn contains(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
 
-    pub(crate) fn resolve(&self, name: &str) -> Result<Arc<dyn Observer>, BuildError> {
+    pub fn resolve(&self, name: &str) -> Result<Arc<dyn Observer>, BuildError> {
         match self.entries.get(name) {
             Some(ctor) => Ok(ctor()),
             None => Err(BuildError::NotAllowlisted(name.to_string())),

@@ -223,6 +223,12 @@ fn run_with_bridge(cfg: SupervisorConfig) -> Result<std::convert::Infallible> {
         audit_socket,
         signer,
         policy: Arc::new(AllowAll),
+        // Plan 113 / ADR-064 — observers stay empty here until Task 4
+        // wires `Pipeline::from_admitted` to resolve them from the
+        // tenant policy bundle via the host allowlist. An empty `Vec`
+        // preserves pre-Plan-113 behavior exactly: signer_task fans
+        // out to zero observers, then signs the chain entry.
+        observers: Vec::new(),
     };
 
     run_supervisor_with_bridge(&cfg, move |bridge_fds| {

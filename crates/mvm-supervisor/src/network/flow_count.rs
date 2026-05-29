@@ -27,7 +27,7 @@ use crate::network::{Observer, RequiredCapabilities};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub(crate) struct FlowCountMetrics {
+pub struct FlowCountMetrics {
     tenant: String,
     opened: AtomicU64,
     closed: AtomicU64,
@@ -40,7 +40,7 @@ impl FlowCountMetrics {
     /// the tenant is read from `MVM_TENANT` at construction time.
     /// Renamed from `new` to `into_arc` per Task 1's `clippy::new_ret_no_self`
     /// resolution.
-    pub(crate) fn into_arc() -> Arc<dyn Observer> {
+    pub fn into_arc() -> Arc<dyn Observer> {
         let tenant = std::env::var("MVM_TENANT").unwrap_or_else(|_| "local".to_string());
         Arc::new(Self {
             tenant,
@@ -50,15 +50,15 @@ impl FlowCountMetrics {
         })
     }
 
-    pub(crate) fn opened(&self) -> u64 {
+    pub fn opened(&self) -> u64 {
         self.opened.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn closed(&self) -> u64 {
+    pub fn closed(&self) -> u64 {
         self.closed.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn closed_by_reason_snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+    pub fn closed_by_reason_snapshot(&self) -> std::collections::BTreeMap<String, u64> {
         self.closed_by_reason
             .lock()
             .expect("flow-count-metrics mutex poisoned")
@@ -68,7 +68,7 @@ impl FlowCountMetrics {
     /// Prometheus text format for the three counter families.
     /// Mounted by mvm-cli's /metrics handler in Task 7 via the per-VM
     /// scrape file at `~/.mvm/audit/metrics-<vm>-flow-count.prom`.
-    pub(crate) fn prometheus_format(&self) -> String {
+    pub fn prometheus_format(&self) -> String {
         let tenant = &self.tenant;
         let opened = self.opened.load(Ordering::SeqCst);
         let closed = self.closed.load(Ordering::SeqCst);
