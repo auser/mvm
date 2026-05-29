@@ -1,8 +1,11 @@
 # Plan 93 — fast + secure dev path (post-Plan-91 follow-ups)
 
-**Status:** drafted 2026-05-22, planning only. No implementation
-yet — saved to track direction while in-flight work is the
-priority.
+**Status:** drafted 2026-05-22. **Phase 0 / PR-A shipped** (PR #504,
+`b848a309`). **Phases 1–3 in flight** under Sprint 59
+(`worktree-plan-93-fast-secure-dev-path`), sequenced as a chain of
+PRs (PR-1 bench harness → PR-2/3 observability → PR-4..8 Phase 1 →
+PR-9/10 Phase 2). Phase 1 host cross-compile resolved to **static
+musl** (see Phase 1 Lever 2).
 
 **Follows:**
 - [Plan 91](91-stage0-alpine-bootstrap.md) — Stage 0 Alpine
@@ -158,26 +161,31 @@ contributors actually feel daily.
    (rustc + cargo + gcc, on-demand fetch from cache.nixos.org
    inside the VM). Most workflows only need minimal.
 
-2. **Cross-compile our crates on host**: contributors editing
-   `crates/mvm-cli/` or any workspace crate cross-compile on the
-   host (via `cargo --target aarch64-unknown-linux-gnu` with the
-   appropriate cross sysroot) and bind-mount the binary into the
+2. **Cross-compile our guest crates on host (static musl)**:
+   contributors editing the Linux-resident guest binaries
+   (`mvm-guest-agent`, `mvm-builder-init`, `mvm-egress-proxy`)
+   cross-compile on the host via `cargo --target
+   aarch64-unknown-linux-musl` and bind-mount the binary into the
    running dev shell. **No dev-shell rebuild needed for our own
    code edits.** This is the lever that actually delivers "no
    LONG dev cycles" — day-to-day work bypasses Nix entirely.
+   (`mvmctl` itself is the host orchestrator; it is *not* a default
+   bind-mount target — running it inside the Linux dev VM is
+   meaningless.)
 
-   Open question: where does the cross sysroot come from? Plan 91
-   doesn't need one (Alpine's apk supplies the in-VM toolchain).
-   For host cross-compile we'd need either:
-   - A pinned upstream sysroot (e.g., from Linux distro archives,
-     hash-pinned and downloaded on first use — same trust pattern
-     Plan 91 uses for Alpine).
-   - A maintainer-built sysroot hosted somewhere mvm-controlled
-     (but this re-introduces the "mvm-controlled bootstrap binary"
-     concern Plan 91 explicitly rejected).
-
-   Lean: pinned upstream sysroot, fetched lazily, same trust
-   model as Alpine. Decision deferred to implementation.
+   **Resolved (2026-05-29) — target static musl, not a glibc
+   sysroot.** A glibc-gnu cross binary expects `/lib/ld-linux-*.so`,
+   which a Nix-built rootfs does not provide (Nix patches binaries
+   to a `/nix/store` loader), so it likely would not even run in the
+   dev shell. `<arch>-unknown-linux-musl` static is fully
+   self-contained — **no loader, no sysroot fetch** — and is already
+   the established pattern for `mvm-builder-init` in this repo. This
+   eliminates the pinned-sysroot download and its entire
+   supply-chain/verification surface. Caveat: a workspace crate with
+   a C `build.rs` needs a musl-capable C compiler on the host (the
+   same C-toolchain requirement glibc would impose, minus the
+   loader/sysroot problem); surface that prerequisite in
+   `mvmctl doctor`.
 
 3. **Lazy Nix fetch inside dev-compile**: when the user does
    need in-VM compilation, the dev-shell flake uses Nix's
@@ -207,20 +215,44 @@ the cold case better.
 - [ ] Lever 1 — split monolithic dev shell into `dev-minimal`
       and `dev-compile` flake outputs; default `dev shell` uses
       `dev-minimal`.
-- [ ] Lever 2a — host cross-compile pipeline:
-      `rust-toolchain.toml` + `.cargo/config.toml` + cross
-      sysroot resolution (pinned upstream, hash-verified,
-      fetched lazily — same trust shape as Plan 91's Alpine).
-- [ ] Lever 2b — bind-mount the host-cross-compiled workspace
-      binary into a running dev shell, with cargo-incremental
-      detection so the bind-mount refreshes on edit.
-- [ ] Lever 2c — reproducibility regression CI lane: build
-      same source from two macOS runners, assert byte-identical
-      artifacts.
+- [ ] Lever 2a — musl cross target: `targets = [...-musl]` in
+      `rust-toolchain.toml` + `.cargo/config.toml` stanzas. No
+      sysroot fetch (static musl is self-contained). Audit guest-
+      binary crates for C `build.rs`; document any musl C-compiler
+      prerequisite + surface in `doctor`.
+- [ ] Lever 2b — `mvmctl dev compile` (alias `dev sync`):
+      cross-compile the guest binaries to static musl and bind-mount
+      via a **per-VM** virtiofs share `~/.mvm/dev/<vm>/binbridge`
+      (RO) mounted at `/opt/mvm-binbridge`, prepended to `$PATH`. Live
+      virtiofs → re-edit refreshes with no VM restart. **v1: libkrun/
+      Apple-Container macOS path only.**
+- [ ] Lever 2c — reproducibility regression CI lane: build same
+      source from two pinned `macos-14` runners, assert byte-identical
+      artifacts (musl-static; no sysroot to pin).
 - [ ] Lever 3 — confirm the persistent `/nix` virtio-blk image
       survives `dev up`/`dev down` cycles with the dev-compile
       flake's closure; document the cold-fetch + warm-reuse
-      contract in the dev-shell flake's README.
+      contract in the dev-shell flake's README; add a
+      `should_delete_nix_store(reset)` test.
+
+### deferred follow-ups
+
+- [ ] **Vz + Firecracker/Linux bind-mount coverage** — Phase 1
+      Lever 2b ships libkrun/Apple-Container (macOS) only; the Vz
+      builder backend and the Linux Firecracker/libkrun-direct
+      contributor path use different mount wiring. Mirrors the
+      existing gateway-audit-substrate backend-coverage gap.
+- [ ] **Vz + Firecracker launch benches** — Phase 2 Lever 0
+      (`mvmctl bench microvm-launch`) measures libkrun only in v1.
+- [ ] **Phase 2 Lever 1 kernel cmdline trim** — the
+      `console=hvc0`-drop trim is gated on Plan 92/95 (slim kernel)
+      merging to `main`. The kernel-agnostic cmdline-override
+      plumbing + validation allowlist land now.
+- [ ] **Phase 2 Lever 4 VMM balloon** — blocked on libkrun exposing
+      a virtio-balloon C API (`capabilities().balloon = false`
+      today); upstream-tracked. Intended `KrunContext::with_balloon`
+      shape documented; a balloon target may never exceed the
+      admitted `plan.mem_mib`.
 
 ## Phase 2 — sub-200 ms runtime microvm launch
 
