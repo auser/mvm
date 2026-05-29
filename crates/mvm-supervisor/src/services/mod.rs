@@ -1,10 +1,10 @@
-//! Supervisor-side UDS proxy clients for the four broker subprocesses
-//! (Plan 104 W1b.2a; Plan 104 §"Host-side: four-subprocess architecture"
-//! and ADR-061).
+//! Supervisor-side UDS proxy clients for the three broker subprocesses
+//! (Plan 104 W1b.2a; Plan 104 §"Host-side: three-subprocess architecture"
+//! and ADR-061 / ADR-062).
 //!
 //! Per the supersession in ADR-061, the supervisor no longer holds
 //! handler logic, the host signer key, or the audit chain-signing key.
-//! All four responsibilities live in their own subprocesses; the
+//! All three responsibilities live in their own subprocesses; the
 //! supervisor's job is to route requests over per-VM UDS to the right
 //! subprocess. This module is the client-side library that does the
 //! routing.
@@ -14,7 +14,6 @@
 //! | Subprocess | Proxy module | Wire protocol |
 //! | --- | --- | --- |
 //! | `mvm-broker` | [`broker_proxy`] | `mvm_core::protocol::broker::ServiceCall` |
-//! | `mvm-secrets-dispatcher` | [`secrets_proxy`] | `mvm_core::protocol::broker::ServiceCall` (same envelope, different target) |
 //! | `mvm-host-signer` | [`host_signer_proxy`] | `mvm_core::protocol::host_signer::SignRequest` |
 //! | `mvm-audit-signer` | [`audit_signer_proxy`] | `mvm_core::protocol::audit_signer::AppendEntryRequest` |
 //!
@@ -49,7 +48,6 @@ pub mod binary_integrity;
 pub mod broker_proxy;
 pub mod frame;
 pub mod host_signer_proxy;
-pub mod secrets_proxy;
 // Plan 104 W1b.2b.1 — subprocess spawn lifecycle: SubprocessSpawner +
 // ProcessSpawner + RestartSupervisor + UDS-connect readiness probe.
 // W1b.2b.2 wraps the spawn site with cosign verify (§H-L3.1) +

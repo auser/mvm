@@ -3644,21 +3644,6 @@ name = "mvm-sdk-macros"
 version = "0.14.0"
 
 [[package]]
-name = "mvm-secrets-dispatcher"
-version = "0.14.0"
-dependencies = [
- "anyhow",
- "mvm-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mvm-security"
 version = "0.14.0"
 dependencies = [

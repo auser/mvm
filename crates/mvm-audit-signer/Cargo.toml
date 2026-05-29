@@ -11,8 +11,9 @@ authors.workspace = true
 [package.metadata.mvm.architecture]
 substrate_server_category = "per-workload broker subprocess substrate"
 
-# One of the four per-VM subprocesses (mvm-broker, mvm-secrets-dispatcher,
-# mvm-host-signer, mvm-audit-signer). Runs at uid 905. **Sole writer to
+# One of the three per-VM subprocesses (mvm-broker, mvm-host-signer,
+# mvm-audit-signer; ADR-062 dropped mvm-secrets-dispatcher). Runs at
+# uid 905. **Sole writer to
 # the audit chain JSONL** and **sole holder of the audit chain-signing
 # key**. The supervisor routes typed audit entries to it over a per-VM
 # UDS; this subprocess JCS-canonicalizes the entry (Plan 104 §S28), signs

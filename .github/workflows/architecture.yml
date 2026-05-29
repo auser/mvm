@@ -78,10 +78,10 @@ jobs:
   #      to this category declare
   #      `[package.metadata.mvm.architecture].substrate_server_category`
   #      in their `Cargo.toml`. Today that includes `mvm-broker`,
-  #      `mvm-secrets-dispatcher`, `mvm-host-signer`, and
-  #      `mvm-audit-signer`. These UDS listeners are VM-local
-  #      broker/signer/secrets helpers spawned by the supervisor for a
-  #      single workload, not multi-tenant control-plane servers.
+  #      `mvm-host-signer`, and `mvm-audit-signer` (ADR-062 dropped
+  #      `mvm-secrets-dispatcher`). These UDS listeners are VM-local
+  #      broker/signer helpers spawned by the supervisor for a single
+  #      workload, not multi-tenant control-plane servers.
   #
   # The in-guest vsock agent in `mvm-guest` is also excluded — it
   # runs *inside* the microVM, not on the host.

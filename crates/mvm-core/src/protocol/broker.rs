@@ -2,10 +2,10 @@
 //! enums (Plan 104 W1a foundation slice).
 //!
 //! The types here cross every process boundary in the broker subprocess set
-//! (`mvm-broker`, `mvm-secrets-dispatcher`, `mvm-host-signer`,
-//! `mvm-audit-signer`) plus the supervisor's UDS proxies. They MUST stay in
-//! `mvm-core` so all five processes can import them without pulling each
-//! other's runtime deps. See [ADR-061 §"Wire format"] and Plan 104
+//! (`mvm-broker`, `mvm-host-signer`, `mvm-audit-signer`; ADR-062 dropped
+//! `mvm-secrets-dispatcher`) plus the supervisor's UDS proxies. They MUST
+//! stay in `mvm-core` so all four processes can import them without pulling
+//! each other's runtime deps. See [ADR-061 §"Wire format"] and Plan 104
 //! §"Hardening posture L4.1" for the algorithm-identifier byte that pairs
 //! with these envelopes on the vsock side.
 

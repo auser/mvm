@@ -24,12 +24,12 @@ use serde::{Deserialize, Serialize};
 
 /// What the supervisor is asking the host-signer to sign.
 ///
-/// Both variants carry the bytes to be signed (the canonical form is the
-/// caller's responsibility — for `SignPlan` the supervisor passes
-/// `mvm_plan::ExecutionPlan` bytes; for `SignCredential` the secrets
-/// dispatcher passes a JCS-canonicalized credential envelope per Plan
-/// 104 §S28). The host-signer treats the input as opaque bytes; it does
-/// not parse them.
+/// `SignPlan` carries `mvm_plan::ExecutionPlan` bytes; the host-signer
+/// treats the input as opaque bytes and does not parse them. ADR-062
+/// dropped the `SignCredential` variant when `host.secrets.v1` was
+/// removed from v1 scope; future verbs (PQC, attestation) extend this
+/// enum via the algorithm-identifier byte in the response (Plan 104
+/// §H-L4.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SignRequest {
@@ -43,22 +43,12 @@ pub enum SignRequest {
         /// supervisor can correlate async signs.
         request_id: String,
     },
-    /// Sign a destination-bound credential for `host.secrets.v1` (Plan
-    /// 104 §H-L1.1 + ADR-049). `mvm-secrets-dispatcher` calls this via
-    /// the supervisor proxy.
-    SignCredential {
-        /// JCS-canonicalized credential envelope bytes (Plan 104 §S28).
-        bytes: Vec<u8>,
-        /// Supervisor-set request id, echoed back in the response.
-        request_id: String,
-    },
 }
 
 impl SignRequest {
     pub fn request_id(&self) -> &str {
         match self {
-            SignRequest::SignPlan { request_id, .. }
-            | SignRequest::SignCredential { request_id, .. } => request_id,
+            SignRequest::SignPlan { request_id, .. } => request_id,
         }
     }
 }
@@ -152,17 +142,6 @@ mod tests {
         let parsed: SignRequest = serde_json::from_slice(&json).unwrap();
         assert_eq!(parsed, req);
         assert_eq!(parsed.request_id(), "req-001");
-    }
-
-    #[test]
-    fn sign_credential_request_roundtrips() {
-        let req = SignRequest::SignCredential {
-            bytes: b"jcs-canonical-credential".to_vec(),
-            request_id: "req-002".to_string(),
-        };
-        let json = serde_json::to_vec(&req).unwrap();
-        let parsed: SignRequest = serde_json::from_slice(&json).unwrap();
-        assert_eq!(parsed, req);
     }
 
     #[test]
