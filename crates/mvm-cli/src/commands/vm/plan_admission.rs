@@ -217,6 +217,67 @@ pub fn admit_for_run(
     })
 }
 
+/// Plan 112 Phase 3c — soft caps on the JSON envelope sizes flowing
+/// through `VmStartConfig` → `SupervisorConfig` over the supervisor's
+/// stdin pipe. Adversarial envelopes are a DoS vector (memory pressure
+/// on the supervisor + pipe-buffer pressure on the producer). 1 MiB /
+/// 4 MiB are generous for legitimate plans / bundles and tight enough
+/// to refuse pathological inputs.
+const PLAN_JSON_MAX_BYTES: usize = 1024 * 1024;
+const BUNDLE_JSON_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Plan 112 Phase 3c — populate the three `VmStartConfig` audit-substrate
+/// fields (`tenant_id`, `plan_json`, `bundle_json`) from the admitted
+/// plan. Call after the `VmStartConfig` is built and before
+/// `backend.start()`; the libkrun/Vz backends read these to wire
+/// `SupervisorConfig.{tenant_id, audit_dir, gateway_audit_socket,
+/// gateway_events_socket, signing_key_path}` and activate the
+/// bridge-factory path.
+///
+/// JSON-encoded so `mvm-core` carries no typed dep on `mvm-plan`. The
+/// supervisor re-verifies the `SignedExecutionPlan` envelope before
+/// trusting any decoded field — see ADR-041 §"Verification at admission"
+/// and `mvm_supervisor::supervisor::SupervisorAdmission::admit`.
+///
+/// **Do not log the resulting `plan_json` / `bundle_json` values.**
+/// The signed envelope may contain secret bindings, environment
+/// variables, or policy refs that resolve to credentials. Treat as
+/// opaque transport bytes.
+pub fn populate_audit_substrate(
+    cfg: &mut mvm_core::vm_backend::VmStartConfig,
+    admitted: &AdmittedPlan,
+) -> Result<()> {
+    cfg.tenant_id = Some(admitted.plan.tenant.0.clone());
+
+    let plan_json = serde_json::to_string(&admitted.signed)
+        .context("serializing SignedExecutionPlan for VmStartConfig.plan_json")?;
+    if plan_json.len() > PLAN_JSON_MAX_BYTES {
+        anyhow::bail!(
+            "plan_json exceeds {} byte cap (got {}); refusing",
+            PLAN_JSON_MAX_BYTES,
+            plan_json.len()
+        );
+    }
+    cfg.plan_json = Some(plan_json);
+
+    cfg.bundle_json = match admitted.plan.bundle.as_ref() {
+        Some(pin) => {
+            let bj = serde_json::to_string(pin)
+                .context("serializing PlanArtifact bundle pin for VmStartConfig.bundle_json")?;
+            if bj.len() > BUNDLE_JSON_MAX_BYTES {
+                anyhow::bail!(
+                    "bundle_json exceeds {} byte cap (got {}); refusing",
+                    BUNDLE_JSON_MAX_BYTES,
+                    bj.len()
+                );
+            }
+            Some(bj)
+        }
+        None => None,
+    };
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +661,40 @@ mod tests {
             err.chain().any(|e| e.to_string().contains("sha256")),
             "expected sha256 mismatch chain; got {err:#}"
         );
+    }
+
+    #[test]
+    fn populate_audit_substrate_threads_tenant_and_signed_envelope() {
+        use mvm_core::vm_backend::VmStartConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let clock = SystemClock;
+        let ledger = InMemoryNonceLedger::new();
+        let admitted = admit_for_run(
+            &fixture_input("vm-substrate"),
+            &clock,
+            &ledger,
+            Some(dir.path()),
+            None,
+        )
+        .expect("happy admit");
+
+        let mut cfg = VmStartConfig::default();
+        populate_audit_substrate(&mut cfg, &admitted).expect("populate");
+        assert_eq!(
+            cfg.tenant_id.as_deref(),
+            Some(admitted.plan.tenant.0.as_str())
+        );
+        let plan_json = cfg.plan_json.expect("plan_json populated");
+        let roundtrip: mvm_plan::SignedExecutionPlan =
+            serde_json::from_str(&plan_json).expect("roundtrip");
+        // Re-verify the envelope to get the inner ExecutionPlan and
+        // confirm the plan_id matches what the producer admitted.
+        let signer = super::super::host_signer::load_or_init_at(dir.path()).unwrap();
+        let trusted: [(&str, &ed25519_dalek::VerifyingKey); 1] =
+            [(&admitted.signer_id, &signer.verifying)];
+        let recovered = mvm_plan::verify_plan(&roundtrip, &trusted).expect("envelope re-verifies");
+        assert_eq!(recovered.plan_id, admitted.plan_id);
+        // fixture has no bundle pin, so bundle_json stays None
+        assert!(cfg.bundle_json.is_none());
     }
 }
