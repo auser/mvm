@@ -373,6 +373,34 @@ pub fn from_admitted(
     Ok(pipe.build_observers())
 }
 
+/// Plan 113 Task 4 (security follow-up) — validate that a policy-bundle
+/// path segment is safe to use as a filesystem component.
+/// Allows only [A-Za-z0-9_-]+ (DNS-label-shape). Rejects empty,
+/// `.`, `..`, any non-ASCII, any path separator or shell meta.
+fn validate_policy_path_segment(segment: &str, kind: &str) -> Result<(), BuildError> {
+    if segment.is_empty() {
+        return Err(BuildError::AllowlistRead {
+            path: segment.to_string(),
+            detail: format!("{kind} segment must not be empty"),
+        });
+    }
+    if segment.len() > 63 {
+        return Err(BuildError::AllowlistRead {
+            path: segment.to_string(),
+            detail: format!("{kind} segment must be 1..=63 chars; got {}", segment.len()),
+        });
+    }
+    for c in segment.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(BuildError::AllowlistRead {
+                path: segment.to_string(),
+                detail: format!("{kind} segment may only contain [A-Za-z0-9_-]; got {c:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reads the policy bundle referenced by `plan.network_policy` and
 /// returns its `network.observers` list.
 ///
@@ -399,42 +427,78 @@ pub fn resolve_observer_chain_from_plan(
     if policy_ref == LOCAL_DEFAULT {
         return Ok(Vec::new());
     }
+
     let (tenant, workload) = match policy_ref.split_once(':') {
-        Some((t, w))
-            if !t.is_empty()
-                && !w.is_empty()
-                && !t.contains('/')
-                && !w.contains('/')
-                && !t.contains('\\')
-                && !w.contains('\\') =>
-        {
-            (t, w)
-        }
-        _ => {
+        Some((t, w)) => (t, w),
+        None => {
             return Err(BuildError::AllowlistRead {
                 path: policy_ref.clone(),
                 detail: format!("network_policy ref {policy_ref:?} is not in tenant:workload form"),
             });
         }
     };
+
+    validate_policy_path_segment(tenant, "tenant")?;
+    validate_policy_path_segment(workload, "workload")?;
+
+    // Plan 113 Task 4 (security follow-up) — refuse cross-tenant policy
+    // bundle access. The plan envelope was already verified upstream;
+    // its declared tenant is authoritative. The ref's tenant segment
+    // must agree.
+    if tenant != plan.tenant.0 {
+        return Err(BuildError::AllowlistRead {
+            path: policy_ref.clone(),
+            detail: format!(
+                "policy ref tenant {tenant:?} does not match plan tenant {:?}; \
+                 cross-tenant policy access refused",
+                plan.tenant.0
+            ),
+        });
+    }
+
     let home = std::env::var("HOME").map_err(|_| BuildError::AllowlistRead {
         path: "$HOME unset".to_string(),
         detail: "HOME is unset; cannot resolve policy bundle path".to_string(),
     })?;
-    let path = std::path::PathBuf::from(home)
-        .join(".mvm/policies")
-        .join(tenant)
-        .join(format!("{workload}.toml"));
+    let policies_root = std::path::PathBuf::from(&home).join(".mvm/policies");
+    let path = policies_root.join(tenant).join(format!("{workload}.toml"));
+
     if !path.exists() {
         return Err(BuildError::AllowlistRead {
             path: path.display().to_string(),
             detail: format!("policy bundle for {tenant}:{workload} not found at the expected path"),
         });
     }
-    let body = std::fs::read_to_string(&path).map_err(|e| BuildError::AllowlistRead {
+
+    // After confirming the file exists, canonicalize and assert the
+    // result is still beneath ~/.mvm/policies/. Defends against
+    // intermediate-directory symlink redirection that O_NOFOLLOW
+    // doesn't catch.
+    let canonical_path = path.canonicalize().map_err(|e| BuildError::AllowlistRead {
         path: path.display().to_string(),
+        detail: format!("canonicalize: {e}"),
+    })?;
+    let canonical_root = policies_root
+        .canonicalize()
+        .map_err(|e| BuildError::AllowlistRead {
+            path: policies_root.display().to_string(),
+            detail: format!("canonicalize policies root: {e}"),
+        })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(BuildError::AllowlistRead {
+            path: canonical_path.display().to_string(),
+            detail: format!(
+                "policy bundle path escapes {} after canonicalization; refusing",
+                canonical_root.display()
+            ),
+        });
+    }
+
+    let body = std::fs::read_to_string(&canonical_path).map_err(|e| BuildError::AllowlistRead {
+        path: canonical_path.display().to_string(),
         detail: e.to_string(),
     })?;
+
     #[derive(serde::Deserialize)]
     struct BundleShim {
         #[serde(default)]
@@ -445,10 +509,27 @@ pub fn resolve_observer_chain_from_plan(
         #[serde(default)]
         observers: Vec<String>,
     }
-    let shim: BundleShim = toml::from_str(&body).map_err(|e| BuildError::AllowlistRead {
-        path: path.display().to_string(),
-        detail: format!("toml parse: {e}"),
-    })?;
+
+    let shim: BundleShim = match toml::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            // Plan 113 Task 4 (security follow-up) — do NOT echo the
+            // parser error into BuildError; the parser's Display impl
+            // can include the offending line content, which leaks
+            // bundle bytes. Log internally for debugging.
+            tracing::warn!(
+                path = %canonical_path.display(),
+                error = ?e,
+                "policy bundle toml parse failed"
+            );
+            return Err(BuildError::AllowlistRead {
+                path: canonical_path.display().to_string(),
+                detail: "policy bundle toml parse failed (see supervisor log for details)"
+                    .to_string(),
+            });
+        }
+    };
+
     Ok(shim.network.observers)
 }
 
@@ -690,6 +771,13 @@ mod tests {
     // Plan 113 §Task 4 — `from_admitted` + `resolve_observer_chain_from_plan`.
 
     fn test_execution_plan_with_policy(policy_ref: &str) -> mvm_plan::ExecutionPlan {
+        test_execution_plan_with_policy_and_tenant(policy_ref, "test")
+    }
+
+    fn test_execution_plan_with_policy_and_tenant(
+        policy_ref: &str,
+        tenant: &str,
+    ) -> mvm_plan::ExecutionPlan {
         use chrono::TimeZone;
         use mvm_plan::{
             AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement,
@@ -701,7 +789,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             plan_id: PlanId("test-plan".into()),
             plan_version: 1,
-            tenant: TenantId("test".into()),
+            tenant: TenantId(tenant.into()),
             workload: WorkloadId("test-workload".into()),
             runtime_profile: RuntimeProfileRef("firecracker".into()),
             image: SignedImageRef {
@@ -763,6 +851,49 @@ mod tests {
         let err = resolve_observer_chain_from_plan(&plan).expect_err("must refuse malformed");
         if let BuildError::AllowlistRead { detail, .. } = err {
             assert!(detail.contains("tenant:workload"), "got: {detail}");
+        } else {
+            panic!("wrong error: {err:?}");
+        }
+    }
+
+    // Plan 113 Task 4 (security follow-up) — three rejection tests
+    // backing the path-traversal, cross-tenant, and charset hardening.
+
+    #[test]
+    fn resolve_observer_chain_dotdot_in_segment_refused() {
+        let plan = test_execution_plan_with_policy("..:..");
+        let err = resolve_observer_chain_from_plan(&plan).expect_err("must refuse ..");
+        if let BuildError::AllowlistRead { detail, .. } = err {
+            assert!(
+                detail.contains("[A-Za-z0-9_-]") || detail.contains("segment"),
+                "got: {detail}"
+            );
+        } else {
+            panic!("wrong error: {err:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_observer_chain_cross_tenant_refused() {
+        let plan = test_execution_plan_with_policy_and_tenant("globex:workload", "acme");
+        let err = resolve_observer_chain_from_plan(&plan).expect_err("must refuse cross-tenant");
+        if let BuildError::AllowlistRead { detail, .. } = err {
+            assert!(
+                detail.contains("cross-tenant") || detail.contains("does not match plan tenant"),
+                "got: {detail}"
+            );
+        } else {
+            panic!("wrong error: {err:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_observer_chain_invalid_charset_refused() {
+        let plan = test_execution_plan_with_policy("with space:workload");
+        let err =
+            resolve_observer_chain_from_plan(&plan).expect_err("must refuse non-ASCII charset");
+        if let BuildError::AllowlistRead { detail, .. } = err {
+            assert!(detail.contains("[A-Za-z0-9_-]"), "got: {detail}");
         } else {
             panic!("wrong error: {err:?}");
         }
