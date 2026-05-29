@@ -118,27 +118,27 @@ the diagnosis to the user.
 
 Code changes:
 
-- [ ] Extend `builder_vm_source_fingerprint` to include workspace
+- [x] Extend `builder_vm_source_fingerprint` to include workspace
       `Cargo.lock` + `crates/mvm-builder-init/{Cargo.toml,src/**}` +
       `crates/mvm-egress-proxy/{Cargo.toml,src/**}` via a
       deterministic sorted walk.
-- [ ] Add `flavor=current` field to `stage0_boot` /
+- [x] Add `flavor=current` field to `stage0_boot` /
       `stage0_cache_promoted` audit detail strings.
 
 Tests:
 
-- [ ] Editing `crates/mvm-builder-init/src/foo.rs` changes the
+- [x] Editing `crates/mvm-builder-init/src/foo.rs` changes the
       fingerprint.
-- [ ] Editing `crates/mvm-builder-init/README.md` (or any non-`src`
+- [x] Editing `crates/mvm-builder-init/README.md` (or any non-`src`
       file) does NOT change the fingerprint.
-- [ ] Deterministic walk: same fingerprint twice in a row.
+- [x] Deterministic walk: same fingerprint twice in a row.
 
 Verification:
 
-- [ ] `cargo test -p mvm-cli --lib -- builder_vm_bootstrap_tests`
+- [x] `cargo test -p mvm-cli --lib -- builder_vm_bootstrap_tests`
       passes (including the new tests).
-- [ ] `cargo test --workspace` — 0 failures.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace` — 0 failures.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
       clean.
 
 PR-A is ~150-250 lines, ships in 1-2 days.
