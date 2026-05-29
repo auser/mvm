@@ -2621,8 +2621,20 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
     let stage0_assets = mvm_build::stage0::assets_for_host_arch();
-    mvm_build::stage0::prepare_assets(stage0_assets)
+    let vendor_reports = mvm_build::stage0::prepare_assets(stage0_assets)
         .context("preparing Stage 0 bootstrap assets (Alpine minirootfs + signature)")?;
+    // Plan 93 Phase 3: one VendorBlobFetched audit entry per vendored
+    // blob (covers both fresh fetch and cache revalidation), so every
+    // supply-chain trust decision in the no-prebuilt-download path is
+    // auditable. The emit lives here (the host caller) so `mvm-build`
+    // stays audit-free.
+    for report in &vendor_reports {
+        mvm_core::policy::audit::emit(
+            mvm_core::policy::audit::LocalAuditKind::VendorBlobFetched,
+            None,
+            Some(&report.audit_detail()),
+        );
+    }
 
     // Materialize the guest root tree (Alpine minirootfs + /init +
     // stubs) under a stable per-host location. libkrun mounts this

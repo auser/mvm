@@ -204,17 +204,28 @@ fn signature_cache_path_in(cache_dir: &Path, asset: &BootstrapAsset) -> PathBuf 
 /// Network access only happens on first run (or after a manual
 /// cache prune). Subsequent invocations short-circuit on the
 /// per-file sha256 check.
-pub fn prepare_assets(assets: &[&BootstrapAsset]) -> Result<()> {
+pub fn prepare_assets(assets: &[&BootstrapAsset]) -> Result<Vec<VendorBlobReport>> {
     prepare_assets_in(&stage0_cache_dir(), assets)
 }
 
 /// Like [`prepare_assets`] but takes the cache directory
 /// explicitly. Production callers go through [`prepare_assets`];
 /// tests use this to avoid mutating the `HOME` env var.
-pub fn prepare_assets_in(cache_dir: &Path, assets: &[&BootstrapAsset]) -> Result<()> {
+///
+/// Returns one [`VendorBlobReport`] per asset describing whether it
+/// was freshly fetched or revalidated from cache, its verified
+/// SHA-256, and its PGP verdict. The host caller turns each into a
+/// `LocalAuditKind::VendorBlobFetched` audit entry (Plan 93 Phase 3)
+/// so every supply-chain trust decision is auditable. `mvm-build`
+/// stays audit-free; the caller (in `mvm-cli`) owns the emit.
+pub fn prepare_assets_in(
+    cache_dir: &Path,
+    assets: &[&BootstrapAsset],
+) -> Result<Vec<VendorBlobReport>> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating {}", cache_dir.display()))?;
 
+    let mut reports = Vec::with_capacity(assets.len());
     for asset in assets {
         let target = cache_dir.join(asset.cache_filename);
         let sig_target = signature_cache_path_in(cache_dir, asset);
@@ -236,6 +247,11 @@ pub fn prepare_assets_in(cache_dir: &Path, assets: &[&BootstrapAsset]) -> Result
                     format!("verifying cached PGP signature for {}", target.display())
                 })?;
             }
+            reports.push(VendorBlobReport::for_asset(
+                asset,
+                blob_size(&target),
+                VendorBlobOutcome::CacheRevalidated,
+            ));
             continue;
         }
 
@@ -253,8 +269,103 @@ pub fn prepare_assets_in(cache_dir: &Path, assets: &[&BootstrapAsset]) -> Result
                 )
             })?;
         }
+        reports.push(VendorBlobReport::for_asset(
+            asset,
+            blob_size(&target),
+            VendorBlobOutcome::Fetched,
+        ));
     }
-    Ok(())
+    Ok(reports)
+}
+
+/// Best-effort on-disk size of a freshly verified blob, for the
+/// `bytes=` field of the audit report. A stat failure degrades to 0
+/// rather than failing the (already successful) verification.
+fn blob_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// PGP verdict recorded for a vendored-blob fetch/revalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VendorBlobPgp {
+    /// Carried a detached signature that verified against the
+    /// embedded Alpine signing key.
+    Verified,
+    /// No `signature_url` (nothing to verify).
+    None,
+    /// Reserved for emitting a failed-verification report before
+    /// propagating the error; `prepare_assets_in` itself bails on a
+    /// bad signature rather than returning this.
+    Failed,
+}
+
+impl VendorBlobPgp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VendorBlobPgp::Verified => "verified",
+            VendorBlobPgp::None => "none",
+            VendorBlobPgp::Failed => "failed",
+        }
+    }
+}
+
+/// Whether a vendored blob was freshly downloaded or re-validated
+/// from the on-disk cache during this `prepare_assets` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VendorBlobOutcome {
+    Fetched,
+    CacheRevalidated,
+}
+
+impl VendorBlobOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VendorBlobOutcome::Fetched => "fetched",
+            VendorBlobOutcome::CacheRevalidated => "cache_revalidated",
+        }
+    }
+}
+
+/// One vendored-blob supply-chain event, returned by
+/// [`prepare_assets`]. The host caller renders each into a
+/// `LocalAuditKind::VendorBlobFetched` audit entry (Plan 93 Phase 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorBlobReport {
+    pub url: &'static str,
+    pub sha256_hex: &'static str,
+    pub pgp: VendorBlobPgp,
+    pub bytes: u64,
+    pub outcome: VendorBlobOutcome,
+}
+
+impl VendorBlobReport {
+    fn for_asset(asset: &BootstrapAsset, bytes: u64, outcome: VendorBlobOutcome) -> Self {
+        Self {
+            url: asset.url,
+            sha256_hex: asset.sha256_hex,
+            pgp: if asset.signature_url.is_some() {
+                VendorBlobPgp::Verified
+            } else {
+                VendorBlobPgp::None
+            },
+            bytes,
+            outcome,
+        }
+    }
+
+    /// The `detail` string for the blob's `VendorBlobFetched` audit
+    /// entry: space-separated `key=value` pairs, matching the Stage 0
+    /// sibling kinds. Pure — unit-tested without any network fetch.
+    pub fn audit_detail(&self) -> String {
+        format!(
+            "url={} sha256={} pgp={} bytes={} outcome={}",
+            self.url,
+            self.sha256_hex,
+            self.pgp.as_str(),
+            self.bytes,
+            self.outcome.as_str()
+        )
+    }
 }
 
 /// Mountpoint stubs (extra to whatever Alpine ships) the in-VM
@@ -553,6 +664,49 @@ mod tests {
         assert!(
             INIT_SCRIPT.contains("apk"),
             "init script invokes apk (Alpine package manager)"
+        );
+    }
+
+    // ---------------- VendorBlobReport (Plan 93 Phase 3) ----------------
+
+    #[test]
+    fn vendor_blob_pgp_and_outcome_wire_strings() {
+        assert_eq!(VendorBlobPgp::Verified.as_str(), "verified");
+        assert_eq!(VendorBlobPgp::None.as_str(), "none");
+        assert_eq!(VendorBlobPgp::Failed.as_str(), "failed");
+        assert_eq!(VendorBlobOutcome::Fetched.as_str(), "fetched");
+        assert_eq!(
+            VendorBlobOutcome::CacheRevalidated.as_str(),
+            "cache_revalidated"
+        );
+    }
+
+    #[test]
+    fn vendor_blob_report_for_signed_asset_records_verified_pgp() {
+        // Every shipped bootstrap asset carries a signature, so a
+        // report built from one must record `pgp=verified`.
+        let asset = ASSETS_AARCH64[0];
+        let report = VendorBlobReport::for_asset(asset, 1024, VendorBlobOutcome::Fetched);
+        assert_eq!(report.pgp, VendorBlobPgp::Verified);
+        assert_eq!(report.url, asset.url);
+        assert_eq!(report.sha256_hex, asset.sha256_hex);
+        assert_eq!(report.bytes, 1024);
+        assert_eq!(report.outcome, VendorBlobOutcome::Fetched);
+    }
+
+    #[test]
+    fn vendor_blob_audit_detail_shape_is_space_separated_kv() {
+        let report = VendorBlobReport {
+            url: "https://example.test/alpine.tar.gz",
+            sha256_hex: "abc123",
+            pgp: VendorBlobPgp::Verified,
+            bytes: 4096,
+            outcome: VendorBlobOutcome::CacheRevalidated,
+        };
+        assert_eq!(
+            report.audit_detail(),
+            "url=https://example.test/alpine.tar.gz sha256=abc123 \
+             pgp=verified bytes=4096 outcome=cache_revalidated"
         );
     }
 
