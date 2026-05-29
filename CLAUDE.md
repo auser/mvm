@@ -125,19 +125,38 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 
 ## Security model
 
-mvm makes ten CI-enforced security claims. Each one is backed by a
-test or a workflow gate; ADR-002 (`specs/adrs/002-microvm-security-posture.md`)
-describes the threat model and `specs/plans/25-microvm-hardening.md`
-sequences the implementation. Claim 8 was added by plan 64
-(`specs/plans/64-supervisor-wiring.md`) — see ADR-041
-(`specs/adrs/041-signed-audited-execution-plans.md`). Claim 9 was added
-by Plan 73 Followup D (CI gate) — see ADR-047
-(`specs/adrs/047-app-deps-audit-pipeline.md`). Claim 10 was added by
-Plan 85 Phase E + F (the user-facing OCI image runner) — see
-`specs/claims/claim-10-oci-image-provenance.md`. (ADR-002's full claim
-table also names two additional cross-cutting claims for signed bundles
-and default-deny network policy; those are tracked there because they
-post-date the CLAUDE.md per-claim summary below.)
+mvm makes thirteen CI-enforced security claims. Each one is backed by
+a test or a workflow gate. **ADR-002
+(`specs/adrs/002-microvm-security-posture.md`) is the source of truth**
+for the claim numbering, threat model, and per-backend tier matrix;
+this section is the summary. Implementation is sequenced in
+`specs/plans/25-microvm-hardening.md`.
+
+Claim lineage:
+
+- Claims 1–7 ship with ADR-002's original posture.
+- Claim 8 was added by plan 64 (`specs/plans/64-supervisor-wiring.md`)
+  — see ADR-041 (`specs/adrs/041-signed-audited-execution-plans.md`).
+- Claim 9 (signed bundles content-addressed) is Sprint 52 W2.
+- Claim 10 (default-deny egress) is Sprint 52 W3.
+- Claim 11 (app-dep volume sealed) was added by ADR-047 / Plan 73
+  Followups A + B.1/B.2/B.3 + C + D
+  (`specs/adrs/047-app-deps-audit-pipeline.md`).
+- Claims 12 + 13 (host services broker — binding-gated dispatch and
+  no raw secret over broker channel) were added by Plan 104 / ADR-059
+  (`specs/adrs/059-host-services-broker.md`) /
+  ADR-049 (`specs/adrs/049-vsock-substitution-service.md`).
+
+A fourteenth property — **OCI image provenance recorded in the
+chain-signed audit log** — has its own claim doc at
+`specs/claims/claim-10-oci-image-provenance.md` and is enforced
+under the claim 8 admission flow; promotion to the ADR-002 numbered
+table is tracked in `specs/plans/111-cardoso-gap-coordination.md`.
+
+Companion docs: the Cardoso minimum-viable-policy mapping lives in
+ADR-002 §"Appendix: Cardoso minimum-viable-policy checklist", and
+the source gap analysis is at
+`specs/research/sandboxes-for-ai-cardoso-gap-analysis.md`.
 
 1. **No host-fs access from a guest beyond explicit shares.** Per-service
    uid (W2.1), seccomp `standard` default (W1.1, W2.4), and `setpriv
@@ -190,7 +209,24 @@ post-date the CLAUDE.md per-claim summary below.)
    (plan 64 W1–W4 — `synthesize_plan`, `host_signer::load_or_init_at`,
    `admit_for_run`, `AuditEmitter`; `xtask check-no-display-on-secret-types`
    protects the host signer's redacted `Debug`).
-9. **Every application-dep volume is hash-locked, attestation-checked,
+9. **Every published bundle is content-addressed, key_id-pinned, and
+   re-verified at fetch and at admit time.** Sprint 52 W2 +
+   admit-time re-verify follow-on. `mvm_plan::bundle::read_and_verify_bundle`
+   + `mvm_plan::bundle::verify_plan_bundle` exercise the
+   rejection ladder on every PR: unknown-key, tampered manifest,
+   key_id mismatch, tampered artifact, missing artifact, unsafe
+   path, schema bump, pin-archive sha256 drift, pin-signature
+   drift. `mvmctl bundle fetch` round-trip + `admit_for_run` tests
+   assert refusal on pin-without-context and pin-archive mismatch.
+10. **No untrusted workload reaches the network unless explicitly
+    admitted by policy.** Sprint 52 W3. `policy_default_is_deny_all`
+    + `test_resolve_network_policy_default_is_deny_all` assert the
+    default-deny posture; `mvmctl up` emits an opt-in warning when
+    the resolved policy is `unrestricted` (escape hatch is
+    `MVM_ACK_UNRESTRICTED_NETWORK=1`, never set in CI). Cardoso-flavoured
+    audit of DNS / vsock control-plane carve-out / Plan 104 broker
+    channels as covert egress is tracked in Plan 111 Workstream A.
+11. **Every application-dep volume is hash-locked, attestation-checked,
    CVE-scanned, SBOM-enumerated, and bound to the workload's audit
    chain.** ADR-047 / Plan 73 Followups A + B.1/B.2/B.3 + C + D wire
    this end-to-end: the builder VM (`mvm-builder-init` +
@@ -215,8 +251,34 @@ post-date the CLAUDE.md per-claim summary below.)
    cloud-hypervisor builder VM) is still gated on Plan 72 W4/W5
    cutover; the CI lane exercises every code path that doesn't
    require a working microVM backend.
-10. **Every `mvmctl run --image <oci-ref>` admission records the OCI
-    image provenance in the chain-signed audit log.** Plan 85 Phase E
+12. **Every host-side service the broker exposes is bound to a signed
+    `ExecutionPlan.services` binding, enforced before handler
+    dispatch, and audited via the chain-signed log.** Plan 104 W2 /
+    ADR-059. `service_call_denied_when_unbound` +
+    `service_call_denied_outside_profile` +
+    `audit_chain_contains_service_call_entries` +
+    `audit_chain_carries_no_payload_bytes` exercise the rejection
+    ladder. `xtask check-handler-adr-coverage` +
+    `xtask check-handler-policy-schema` +
+    `xtask check-handler-composition` lint the handler registry.
+    `fuzz_service_call.rs` (Plan 104 W6) exercises the dispatch
+    surface.
+13. **No raw secret value crosses the broker channel.**
+    `host.secrets.v1` returns destination-bound, time-bound signed
+    credentials only; raw secret bytes never leave the supervisor's
+    address space. Plan 104 W5 / ADR-049 / ADR-059.
+    `host_secrets_v1_denied_outside_allowed_destinations` +
+    `zeroize_drop_zeros_secret_bytes` +
+    `handler_inter_call_memory_hygiene` +
+    `host_secrets_v1_signed_payload_jcs_roundtrip` +
+    `secrets_subprocess_cannot_reach_supervisor_memory` +
+    `placeholder_in_outbound_request_dropped_and_audited`
+    (S25 backstop) tests; ADR-049 hostile-guest matrix in W7.
+14. **Every `mvmctl run --image <oci-ref>` admission records the OCI
+    image provenance in the chain-signed audit log.** Tracked as a
+    standalone claim doc at
+    `specs/claims/claim-10-oci-image-provenance.md`; promotion to
+    the ADR-002 numbered table is queued in Plan 111. Plan 85 Phase E
     + F wire the user-facing OCI image runner to the same audit chain
     that backs claim 8 — see `specs/claims/claim-10-oci-image-provenance.md`.
     `mvmctl image pull` materializes the layer set in `mvm-oci`'s
