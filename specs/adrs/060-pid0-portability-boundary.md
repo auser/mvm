@@ -2,7 +2,7 @@
 
 **Status**: Proposed
 **Date**: 2026-05-28
-**Cross-refs**: ADR-002 (security posture), ADR-053 (guest protocol versioning & readiness), ADR-055 (passt virtio-net), ADR-059 (host services broker), Plan 109 (guest control-layer dep-reduction + encryption design), Plan 25 (microVM hardening), Plan 64 (signed execution plans), Plan 104 (host services broker)
+**Cross-refs**: ADR-002 (security posture), ADR-053 (guest protocol versioning & readiness), ADR-055 (passt virtio-net), ADR-059 (host services broker), ADR-061 (broker hardening), ADR-062 (broker rescope — drop secrets, add host.audit.v1), Plan 109 (guest control-layer dep-reduction + encryption design), Plan 25 (microVM hardening), Plan 64 (signed execution plans), Plan 104 (host services broker)
 
 ## Context
 
@@ -32,7 +32,7 @@ The pid0 control surface is the set of guest-side processes the host's control p
 The pid0 control surface is **distinct from**:
 
 - The workload itself (defined in the user's `mkGuest { entrypoint = ...; }` flake; runs as a child of the agent on `RunEntrypoint`).
-- The host services broker (ADR-059 / Plan 104) — `mvm-secrets-dispatcher` and the general broker live on the **host**, not the guest. The guest is a *client* of the broker via additional vsock ports (5300, 5301), but the broker is not part of the pid0 contract.
+- The host services broker (ADR-059 / ADR-061 / ADR-062 / Plan 104) — the broker's 3 subprocesses (`mvm-broker`, `mvm-host-signer`, `mvm-audit-signer`) live on the **host**, not the guest. The guest is a *client* of the broker via vsock port `:5300`, but the broker is not part of the pid0 contract. (Pre-ADR-062 designs referenced a separate secrets channel on `:5301`; that port and `mvm-secrets-dispatcher` are gone as of ADR-062.)
 
 ### 2. Transport contract
 
@@ -127,7 +127,7 @@ Any language change at the boundary MUST preserve these *byte-identically*. See 
 
 ## Out of scope
 
-- The host-side broker (ADR-059 / Plan 104) and its ports `:5300` / `:5301`. The broker is host-side; the guest's *client* code that calls into the broker is in `mvm-sdk`, not the agent, and is not part of the pid0 contract.
+- The host-side broker (ADR-059 / ADR-061 / ADR-062 / Plan 104) and its port `:5300` (pre-ADR-062 `:5301` is removed). The broker is host-side; the guest's *client* code that calls into the broker is in `mvm-sdk`, not the agent, and is not part of the pid0 contract.
 - The encrypted-vsock design (Plan 109 W3, Noise_NK). Encryption is forward-looking and will land via a separate ADR or as an addendum to this one once Plan 109's W3 design doc commits.
 - The control-plane-vs-data-plane partition. Forthcoming separate ADR (Plan 109 W4a).
 
