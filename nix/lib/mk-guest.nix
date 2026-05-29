@@ -84,7 +84,7 @@ in
 # microVMs rely on (see `specs/contracts/local-addon-dns.md`).
 # Builder/utility VMs whose `/init` doesn't run mkGuest's addon-dns
 # activation block (e.g. `nix/images/builder-vm/`, which substitutes
-# `mvm-builder-init` as PID 1) should pass `bakeAddonDns = false` to
+# `mvm-host-vm-init` as PID 1) should pass `bakeAddonDns = false` to
 # skip the Rust compile of `mvm-addon-dns` during their rootfs build
 # — a meaningful saving in Stage 0 where the build runs on tmpfs and
 # competes with the kernel compile for memory.
@@ -247,7 +247,7 @@ let
     # nodes but never these symlinks; udev/mdev/systemd-tmpfiles
     # normally do, and we run none of them. Without /dev/fd a
     # nixpkgs-style build hook fails with "/dev/fd/63: No such
-    # file or directory" — same gap is fixed in mvm-builder-init's
+    # file or directory" — same gap is fixed in mvm-host-vm-init's
     # mount_pseudofs(). The four lines are kept symmetric on both
     # sides on purpose.
     [ -e /dev/fd ]     || /bin/busybox ln -s /proc/self/fd   /dev/fd
@@ -526,7 +526,7 @@ let
   #     → shorthand for `{ source = <that string>; }`.
   #
   # Binary-source variants exist so Plan 72's builder-vm flake can
-  # install `mvm-builder-init` at `/sbin/mvm-builder-init` without
+  # install `mvm-host-vm-init` at `/sbin/mvm-host-vm-init` without
   # inlining its bytes as a string (`writeText` is text-only).
   extraFilePopulation = lib.concatMapStringsSep "\n"
     (path:
@@ -578,7 +578,7 @@ let
     # Standard FHS dirs the kernel + init expect. `/nix-store`,
     # `/job`, `/out`, `/work` are mount points the libkrun builder
     # VM (Plan 72 W3) needs pre-created — rootfs boots `ro` so
-    # `mvm-builder-init` can't `mkdir` them at runtime.
+    # `mvm-host-vm-init` can't `mkdir` them at runtime.
     mkdir -p "$out"/{bin,sbin,etc,proc,sys,dev,tmp,run,var,root,home,nix/store,nix-store,etc/mvm,job,out,work}
     chmod 1777 "$out/tmp"
     chmod 0755 "$out/run"
@@ -793,7 +793,7 @@ let
               # `/job` as virtio-fs. nixpkgs ships `CONFIG_VIRTIO_FS=m`
               # and `CONFIG_FUSE_FS=m`, so without the module closure
               # `mount -t virtiofs` fails with ENODEV and the VM powers
-              # down before `mvm-builder-init` can finalize `/job/result`.
+              # down before `mvm-host-vm-init` can finalize `/job/result`.
               # #333 trimmed the closure to vsock-only because that's all
               # the workload microVM path needed; Stage 0's reuse of this
               # rootfs landed later and depends on virtio-fs.
@@ -818,7 +818,7 @@ let
     # Closure of additional packages — symlink each binary into
     # `/usr/local/bin` AND `/sbin` so the standard system-binary
     # paths (`/sbin/mkfs.ext4`, `/sbin/udhcpc`, etc.) resolve.
-    # `mvm-builder-init` uses those paths verbatim and would
+    # `mvm-host-vm-init` uses those paths verbatim and would
     # ENOENT-fail without them (e.g. e2fsprogs ships mkfs.ext4 in
     # the package's sbin subdir, not bin).
     mkdir -p "$out/usr/local/bin"

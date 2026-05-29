@@ -3343,18 +3343,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mvm-builder-init"
-version = "0.14.0"
-dependencies = [
- "libc",
- "mvm-build",
- "nix 0.29.0",
- "serde_json",
- "tempfile",
- "uuid",
-]
-
-[[package]]
 name = "mvm-cli"
 version = "0.14.0"
 dependencies = [
@@ -3482,6 +3470,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "mvm-host-vm-init"
+version = "0.14.0"
+dependencies = [
+ "libc",
+ "mvm-build",
+ "nix 0.29.0",
+ "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

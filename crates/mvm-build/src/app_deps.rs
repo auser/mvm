@@ -533,7 +533,7 @@ fn run_install_via_driver(
 }
 
 /// Serialize an [`InstallSpec`] into the JSON shape
-/// `mvm-builder-init::install_spec::parse` expects. Hand-rolled
+/// `mvm-host-vm-init::install_spec::parse` expects. Hand-rolled
 /// (rather than serde-derived) so the wire shape stays pinned —
 /// adding a field on either side surfaces here, not as a silent
 /// drift.
@@ -564,7 +564,7 @@ fn install_spec_json(spec: &InstallSpec) -> String {
 }
 
 /// JSON-string escaper matching the one in
-/// `mvm-builder-init::install_spec` so the spec round-trips
+/// `mvm-host-vm-init::install_spec` so the spec round-trips
 /// unchanged. Mirrors the RFC 8259 §7 must-escape set.
 fn json_string_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

@@ -596,7 +596,7 @@ impl BuilderVm for VzBuilderVm {
         // 6. Stage the per-build job dir under the shared cache
         //    root. Same convention as the libkrun side; both
         //    backends pass `/job` as a virtio-fs share so the
-        //    in-guest `mvm-builder-init` finds cmd.sh /
+        //    in-guest `mvm-host-vm-init` finds cmd.sh /
         //    install_spec.json regardless of which hypervisor
         //    booted it.
         let job_id = unique_job_id();
@@ -655,7 +655,7 @@ impl BuilderVm for VzBuilderVm {
             vm_state_dir: vm_state_dir.clone(),
         };
 
-        // 10. Mount layout matches what `mvm-builder-init` /
+        // 10. Mount layout matches what `mvm-host-vm-init` /
         //     `cmd.sh` expect:
         //     - `/work` (flake source) is read-only — the in-guest
         //       script uses `--no-write-lock-file` to avoid EROFS.
@@ -684,7 +684,7 @@ impl BuilderVm for VzBuilderVm {
 
         // 11. The persistent `/nix-store` image rides as the second
         //     virtio-blk device (the rootfs is the first). The
-        //     in-guest `mvm-builder-init` mounts it at `/nix-store`
+        //     in-guest `mvm-host-vm-init` mounts it at `/nix-store`
         //     before invoking cmd.sh.
         let extra_disks = vec![BuilderVmDisk {
             id: "nix-store".to_string(),
@@ -851,7 +851,7 @@ fn workspace_root_from_manifest_dir() -> Option<PathBuf> {
 // Parallel of [`libkrun_builder::LibkrunPersistentHostVm`]. Same
 // dispatch-loop semantics (vsock-framed `HostVmRequest::Run` from the
 // host-side [`crate::persistent_builder::PersistentBuilderSupervisor`]
-// → in-guest `mvm-builder-init` runs cmd.sh / install_spec.json →
+// → in-guest `mvm-host-vm-init` runs cmd.sh / install_spec.json →
 // `HostVmResponse::Result` back over the same vsock), only the host
 // VMM differs. Locked decision §5 of Plan 98: keep the drivers
 // parallel rather than collapse them behind a trait — mirrors the
@@ -1028,7 +1028,7 @@ impl VzPersistentBuilderVm {
 }
 
 /// Stage `<job_dir>/<DISPATCH_SOCK_MARKER>` so the in-guest
-/// `mvm-builder-init` enters the W3 part 3 dispatch loop instead of
+/// `mvm-host-vm-init` enters the W3 part 3 dispatch loop instead of
 /// the single-shot cmd.sh / install_spec flow. The marker body is
 /// intentionally empty — its mere presence is the signal. Same shape
 /// libkrun's `stage_persistent_job_dir` uses (Plan 89 W3 part 2).
@@ -1116,7 +1116,7 @@ fn build_vz_persistent_supervisor_config(
                 read_only: true,
             },
             // `/nix-store` rides as the second virtio-blk; the
-            // in-guest `mvm-builder-init` mounts it before invoking
+            // in-guest `mvm-host-vm-init` mounts it before invoking
             // cmd.sh. Same layout libkrun uses.
             mvm_vz::DiskConfig {
                 id: "nix-store".to_string(),
@@ -1136,7 +1136,7 @@ fn build_vz_persistent_supervisor_config(
                 read_only: false,
             },
             // `/out` and `/job` both point at the per-VM job dir.
-            // The in-guest `mvm-builder-init` reads cmd.sh /
+            // The in-guest `mvm-host-vm-init` reads cmd.sh /
             // install_spec.json from `/job`, writes artifacts to
             // `/out`. Two shares (same host path) match libkrun's
             // convention; the dispatch protocol assumes that
@@ -1264,7 +1264,7 @@ impl VzPersistentVmHandle {
     /// Block until the supervisor child exits. Normal way to reach
     /// this is the supervisor receiving `HostVmRequest::Shutdown`,
     /// the guest dispatch loop processing it + replying `Bye`, then
-    /// `mvm-builder-init` calling `reboot(RB_POWER_OFF)`, then the
+    /// `mvm-host-vm-init` calling `reboot(RB_POWER_OFF)`, then the
     /// Vz supervisor exiting `main`. Consumes the child; subsequent
     /// calls return [`BuilderVmError::ExtractionFailed`].
     pub fn wait_for_shutdown(mut self) -> Result<i32, BuilderVmError> {

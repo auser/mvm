@@ -618,7 +618,7 @@ mod tests {
     /// the Stage 0 nix build OOM-killed the slim Linux kernel
     /// compile at `HOSTCC scripts/basic/fixdep`. With Alpine nix's
     /// default `max-jobs = auto`, four heavy derivations
-    /// (mvm-builder-init, mvm-egress-proxy, mvm-guest-agent, linux)
+    /// (mvm-host-vm-init, mvm-egress-proxy, mvm-guest-agent, linux)
     /// ran concurrently and the combined working set exceeded the
     /// 16 GiB guest RAM / 14 GiB `/nix` tmpfs envelope. Serializing
     /// derivations with `--max-jobs 1` keeps peak memory under the

@@ -16,7 +16,7 @@ the `enables` / `disables` lists in `default.nix`.
 Stock `pkgs.linuxPackages.kernel` ships hundreds of `=m` modules
 the builder VM never loads, and the things it *does* load are
 modules too (overlay, vsock, virtio-fs, iptables tables). Under
-that shape, `mvm-builder-init` has to:
+that shape, `mvm-host-vm-init` has to:
 
 1. Ship a `/lib/modules/<kver>/` tree in the rootfs (closure-walked
    by `mkGuest`).

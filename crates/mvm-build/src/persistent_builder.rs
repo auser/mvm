@@ -587,11 +587,11 @@ pub fn stage_flake_dispatch_job(
          echo \"store-path=$STORE_PATH\"\n\
          printf '%s\\n' \"$STORE_PATH\" > \"$OUT_DIR/{store_path_sidecar}\"\n\
          if [ ! -f \"$STORE_PATH/vmlinux\" ]; then\n\
-             echo 'mvm-builder-init: nix output missing vmlinux' >&2\n\
+             echo 'mvm-host-vm-init: nix output missing vmlinux' >&2\n\
              exit 4\n\
          fi\n\
          if [ ! -f \"$STORE_PATH/rootfs.ext4\" ]; then\n\
-             echo 'mvm-builder-init: nix output missing rootfs.ext4' >&2\n\
+             echo 'mvm-host-vm-init: nix output missing rootfs.ext4' >&2\n\
              exit 4\n\
          fi\n\
          cp -L \"$STORE_PATH/vmlinux\" \"$OUT_DIR/vmlinux\"\n\
@@ -779,7 +779,7 @@ impl PersistentBuilderVm {
 
         // The in-guest spec path the dispatch loop reads.
         // `<JOB_DIR>/<job_id>/install_spec.json` where JOB_DIR=`/job`
-        // is the convention `mvm-builder-init`'s dispatch loop
+        // is the convention `mvm-host-vm-init`'s dispatch loop
         // resolves against.
         let in_guest_spec_path = PathBuf::from(format!("/job/{}/install_spec.json", job_id));
 

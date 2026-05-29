@@ -121,7 +121,7 @@ fn seal_with_high_cve(rest: &[String]) -> Result<ExitCode, String> {
 }
 
 /// Re-use `mvm_sdk::compile::deps_audit::seal_volume` to produce a
-/// volume the way the builder VM's `mvm-builder-init::install::seal`
+/// volume the way the builder VM's `mvm-host-vm-init::install::seal`
 /// would. Realistic-ish payloads so the inspector pretty-print works
 /// against fields it would see in production (component_count > 0,
 /// host count > 0).

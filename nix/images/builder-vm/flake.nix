@@ -1,5 +1,5 @@
 {
-  description = "mvm builder VM image — kernel + rootfs.ext4 with Nix + tools + mvm-builder-init (Plan 72 W2)";
+  description = "mvm builder VM image — kernel + rootfs.ext4 with Nix + tools + mvm-host-vm-init (Plan 72 W2)";
 
   # ── Why this flake exists ────────────────────────────────────────────
   #
@@ -9,7 +9,7 @@
   # (`LibkrunBuilderVm`, Plan 72 W1). This flake is the artifact
   # `LibkrunBuilderVm` boots into: a small Linux kernel + ext4
   # rootfs containing Nix + a curated build-tools subset +
-  # `mvm-builder-init` (Plan 72 W3) at `/sbin/mvm-builder-init`.
+  # `mvm-host-vm-init` (Plan 72 W3) at `/sbin/mvm-host-vm-init`.
   #
   # `packages.<system>.default` produces `$out/{vmlinux,rootfs.ext4,
   # cmdline.txt,manifest.json}`. CI (Plan 72 W2 release-workflow
@@ -53,16 +53,16 @@
   #   `losetup`).
   # - iproute2 (used by `udhcpc` and friends; small).
   # - iptables — Plan 73 Followup B.2.y / ADR-047 defense-in-
-  #   depth: `mvm-builder-init` installs an OUTPUT-chain
+  #   depth: `mvm-host-vm-init` installs an OUTPUT-chain
   #   default-deny + uid-owner ACCEPT for `mvm-egress-proxy`
   #   (uid 1801), so a build step that ignores `HTTP_PROXY`
   #   cannot reach upstream. See
-  #   `crates/mvm-builder-init/src/network.rs`.
+  #   `crates/mvm-host-vm-init/src/network.rs`.
   # - **No** `procps`-interactive / `less` per the plan's
   #   slimming directive.
-  # - `mvm-builder-init` mounted at `/sbin/mvm-builder-init` via
+  # - `mvm-host-vm-init` mounted at `/sbin/mvm-host-vm-init` via
   #   `extraFiles`. The kernel cmdline (`cmdline.txt` output)
-  #   sets `init=/sbin/mvm-builder-init` so this becomes PID 1.
+  #   sets `init=/sbin/mvm-host-vm-init` so this becomes PID 1.
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -124,7 +124,7 @@
       # install pipeline (ADR-047): `uv` / `pnpm` drive the
       # installer, `cyclonedx-py` / `pnpm sbom` emit SBOMs, and
       # `pip-audit` / `pnpm audit` run the CVE scan. Each is
-      # currently a soft gate — `mvm-builder-init::install`
+      # currently a soft gate — `mvm-host-vm-init::install`
       # emits a CycloneDX-1.5 empty stub when the SBOM / CVE
       # tool isn't on PATH and logs a warning. B.2.x will
       # hard-gate the SBOM + CVE side once the egress allowlist
@@ -134,7 +134,7 @@
       # builder VM now runs `mvm-egress-proxy` (built via
       # `mvmEgressProxyFor system`, installed at
       # `/sbin/mvm-egress-proxy` via `extraFiles` below).
-      # `mvm-builder-init::install::run_install` spawns it
+      # `mvm-host-vm-init::install::run_install` spawns it
       # before the installer + injects `HTTPS_PROXY` /
       # `HTTP_PROXY` on `uv` / `pnpm`'s env. The proxy refuses
       # anything outside ADR-047's four hostnames:
@@ -146,7 +146,7 @@
         bashInteractive
         coreutils
         # `pkgsStatic.busybox` for the lightweight utilities that
-        # mvm-builder-init spawns by absolute path — chiefly
+        # mvm-host-vm-init spawns by absolute path — chiefly
         # `/sbin/udhcpc` (busybox applet) for DHCP on the builder
         # VM's eth0. Without busybox in `packages`, mkGuest's
         # symlink loop (nix/lib/mk-guest.nix:770-788) skips it
@@ -161,14 +161,14 @@
         # gitMinimal drops perl/sendmail/gui/manpages (~20 MB). git is
         # only invoked here by nix's `github:` substituter/fetcher; the
         # core porcelain that needs is intact in the minimal build.
-        # `mvm-builder-init` does not shell to git (grep -rn '"git"' in
-        # crates/mvm-builder-init/).
+        # `mvm-host-vm-init` does not shell to git (grep -rn '"git"' in
+        # crates/mvm-host-vm-init/).
         gitMinimal
         gnumake
         curl
         jq
         iproute2
-        # iptables — installed at boot by mvm-builder-init's
+        # iptables — installed at boot by mvm-host-vm-init's
         # network::install_egress_lockdown (Plan 73 Followup
         # B.2.y / ADR-047). FATAL if absent.
         iptables
@@ -192,14 +192,14 @@
         # python3Packages.pip-audit
       ];
 
-      # Build `mvm-builder-init` (Plan 72 W3) for the target system.
+      # Build `mvm-host-vm-init` (Plan 72 W3) for the target system.
       # `rustPlatform.buildRustPackage` consumes the workspace's
       # `Cargo.lock` so the dependency closure matches the rest of
       # the workspace — same `nix` crate version we cargo-check on
       # macOS, same nothing-else.
       #
       # `doCheck = false` because the unit tests under
-      # `mvm-builder-init::linux::tests` already run in the
+      # `mvm-host-vm-init::linux::tests` already run in the
       # workspace's `cargo test` CI lane; running them again here
       # would double-pay the closure compute for no extra signal.
       mvmBuilderInitFor = system:
@@ -207,23 +207,23 @@
           pkgs = import nixpkgs { inherit system; };
         in
         pkgs.rustPlatform.buildRustPackage {
-          pname = "mvm-builder-init";
+          pname = "mvm-host-vm-init";
           version = "0.14.0";
           src = workspace;
           cargoLock = {
             lockFile = workspace + "/Cargo.lock";
           };
-          buildAndTestSubdir = "crates/mvm-builder-init";
+          buildAndTestSubdir = "crates/mvm-host-vm-init";
           doCheck = false;
           meta = {
             description = "PID-1 for the libkrun builder VM (Plan 72 W3)";
-            mainProgram = "mvm-builder-init";
+            mainProgram = "mvm-host-vm-init";
           };
         };
 
       # Build `mvm-egress-proxy` (Plan 73 Followup B.2.x) for the
       # target system. Same `rustPlatform.buildRustPackage` shape
-      # as `mvm-builder-init` — the workspace's `Cargo.lock`
+      # as `mvm-host-vm-init` — the workspace's `Cargo.lock`
       # drives the closure so we don't fork dep versions across
       # the two builder-VM binaries. Tests run in CI's
       # `cargo test --workspace` lane; `doCheck = false` here for
@@ -256,8 +256,8 @@
       # - `ro` — root is read-only; writes go to the persistent
       #   /nix-store virtio-blk at /dev/vdb (Plan 72 W4 wires it).
       # - `rootfstype=ext4` — skip filesystem auto-detection.
-      # - `init=/sbin/mvm-builder-init` — Plan 72 W3 binary as PID 1.
-      builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
+      # - `init=/sbin/mvm-host-vm-init` — Plan 72 W3 binary as PID 1.
+      builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-host-vm-init";
 
       # Rootfs builder. The custom kernel under `./kernel` is built
       # `CONFIG_MODULES=n` (everything in-tree is `=y`), so the
@@ -275,8 +275,8 @@
         (libFor { inherit system; }).mkGuest {
           name = "mvm-builder-vm";
           # Skip the addon-dns bake. The builder VM's PID 1 is
-          # `mvm-builder-init` (set via `extraFiles` + the
-          # `init=/sbin/mvm-builder-init` kernel cmdline), so
+          # `mvm-host-vm-init` (set via `extraFiles` + the
+          # `init=/sbin/mvm-host-vm-init` kernel cmdline), so
           # mkGuest's initScript-side addon-dns activation block
           # never runs and the binary would just sit unused at
           # /usr/local/bin/mvm-addon-dns. The win is in Stage 0:
@@ -285,16 +285,16 @@
           # the tmpfs-bound build into OOM territory.
           bakeAddonDns = false;
           # mkGuest requires an entrypoint declaration. At runtime
-          # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
+          # the kernel cmdline sets `init=/sbin/mvm-host-vm-init`,
           # so mkGuest's entrypoint is vestigial — but we still
           # need to declare one to satisfy the type contract.
           entrypoint.shell = "/bin/sh";
           packages = builderPackages pkgs;
           extraFiles = {
-            "/sbin/mvm-builder-init" =
-              "${builderInit}/bin/mvm-builder-init";
+            "/sbin/mvm-host-vm-init" =
+              "${builderInit}/bin/mvm-host-vm-init";
             # Plan 73 Followup B.2.x — egress allowlist proxy.
-            # `mvm-builder-init::install::run_install` spawns
+            # `mvm-host-vm-init::install::run_install` spawns
             # this from PATH (kernel default PATH includes
             # `/sbin`) before invoking `uv` / `pnpm`. The
             # binary embeds the ADR-047 four-hostname list at
@@ -313,7 +313,7 @@
           # Slim custom kernel — see `./kernel/default.nix`.
           # `pkgs.linuxManualConfig` over `make tinyconfig` + a
           # narrow `enables` list. `CONFIG_MODULES=n` so the kernel
-          # has only what `mvm-builder-init` actually uses built-in
+          # has only what `mvm-host-vm-init` actually uses built-in
           # — no driver modules tree to ship.
           # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
           kernelPkg = import ./kernel { inherit pkgs; };

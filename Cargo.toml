@@ -35,11 +35,11 @@ members = [
     # Plan 72 W3 — PID-1 for the libkrun builder VM. Linux-only at
     # runtime; the crate compiles on macOS / Windows as an inert
     # binary so workspace builds stay green for non-Linux contributors.
-    "crates/mvm-builder-init",
+    "crates/mvm-host-vm-init",
     # Plan 73 Followup B.2.x — HTTP CONNECT proxy with hostname
     # allowlist for the builder VM's application-deps install.
     # Linux-only at runtime; same workspace-ergonomics rule as
-    # mvm-builder-init.
+    # mvm-host-vm-init.
     "crates/mvm-egress-proxy",
     # Local addon developer experience: in-guest addon name resolution
     # and loopback TCP to host-vsock bridge. Distributed service mesh,
@@ -284,7 +284,7 @@ mvm-vz = { path = "crates/mvm-vz", version = "0.14.0" }
 mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-features = false }
 
 # Plan 73 Followup B.2.x — builder-VM egress allowlist proxy.
-# mvm-builder-init spawns this as a subprocess before the
+# mvm-host-vm-init spawns this as a subprocess before the
 # installer + tears it down after.
 mvm-egress-proxy = { path = "crates/mvm-egress-proxy", version = "0.14.0" }
 
