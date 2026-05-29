@@ -2372,9 +2372,9 @@ Plan 93 Phase 0 (fingerprint correctness) shipped in PR #504; its dependency Pla
 Phase 1 host cross-compile targets **`<arch>-unknown-linux-musl` static**, not glibc-gnu — a glibc binary needs a `/lib` loader a Nix rootfs lacks; musl-static is self-contained and matches `mvm-builder-init`'s existing pattern. This deletes the pinned-sysroot fetch and its supply-chain surface.
 
 ### Workstream breakdown (PR chain)
-- [ ] **PR-1 — bench harness** `mvmctl bench microvm-launch` (Phase 2 Lever 0; everything measurable hangs off it; libkrun-only in v1; must drive real plan admission).
-- [ ] **PR-2 — `LocalAuditKind::VendorBlobFetched`** (Phase 3; additive observability foundation).
-- [ ] **PR-3 — `cache info` / `doctor` enrichment + Stage 0 progress** (Phase 3 observability).
+- [x] **PR-1 — bench harness** `mvmctl bench microvm-launch` (Phase 2 Lever 0; everything measurable hangs off it; libkrun-only in v1; must drive real plan admission). Measurement substrate landed + unit-tested; live libkrun probe is a tracked stub.
+- [x] **PR-2 — `LocalAuditKind::VendorBlobFetched`** (Phase 3; additive observability foundation).
+- [x] **PR-3 — `cache info` / `doctor` enrichment + Stage 0 progress** (Phase 3 observability). Deferred: doctor next-run HIT/MISS fingerprint + docs (Item 5).
 - [ ] **PR-4 — dev-shell split** `dev-minimal`/`dev-compile` (Phase 1 Lever 1).
 - [ ] **PR-5 — musl cross target** (Phase 1 Lever 2a).
 - [ ] **PR-6 — `mvmctl dev compile` + per-VM binbridge bind-mount** of guest binaries (Phase 1 Lever 2b; load-bearing; libkrun/macOS only).
