@@ -18,6 +18,7 @@ use super::Cli;
 use super::audit_chain::{AuditEmitter, default_audit_dir};
 use super::forward::forward_ports;
 use super::host_signer::load_or_init_at;
+use super::managed_secrets::lower_workload_secrets;
 use super::plan_admission::{
     AdmittedPlan, BundleAdmissionContext, InMemoryNonceLedger, SystemClock, admit_for_run,
 };
@@ -112,6 +113,7 @@ struct AdmitPlanForBootParams<'a> {
     pub mem_mib: u64,
     pub seccomp_tier: mvm_plan::PlanSeccompTier,
     pub secret_release: mvm_plan::SecretReleasePolicy,
+    pub secrets: Vec<mvm_plan::SecretBinding>,
     pub no_supervisor: bool,
     pub ledger: &'a InMemoryNonceLedger,
     /// Override for the host-signer keys directory. Production callers
@@ -148,16 +150,6 @@ fn plan_seccomp_tier(
     tier.to_string()
         .parse()
         .context("converting runtime seccomp tier into plan seccomp tier")
-}
-
-fn secret_release_policy(
-    bindings: &[mvm_core::secret_binding::SecretBinding],
-) -> mvm_plan::SecretReleasePolicy {
-    if bindings.is_empty() {
-        mvm_plan::SecretReleasePolicy::None
-    } else {
-        mvm_plan::SecretReleasePolicy::PlanBound
-    }
 }
 
 /// Bundle of artifacts produced by a successful admission: the
@@ -269,6 +261,7 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
         egress_policy_ref: None,
         tool_policy_ref: None,
         secret_release: p.secret_release,
+        secrets: p.secrets.clone(),
         audit_event_prefix: None,
         cpus: p.cpus,
         mem_mib: p.mem_mib,
@@ -548,6 +541,19 @@ fn resolve_deps_volume_binding(
     resolve_deps_volume_binding_with_cache(workload_ir_path, build_mode, None)
 }
 
+fn load_workload_ir(
+    workload_ir_path: Option<&std::path::Path>,
+) -> Result<Option<mvm_ir::Workload>> {
+    let Some(ir_path) = workload_ir_path else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(ir_path)
+        .with_context(|| format!("reading workload IR at {}", ir_path.display()))?;
+    let workload: mvm_ir::Workload = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing workload IR at {}", ir_path.display()))?;
+    Ok(Some(workload))
+}
+
 /// Cache-root-overridable form of [`resolve_deps_volume_binding`].
 /// Tests inject a per-tempdir override so they don't touch the user's
 /// `~/.mvm/volumes/deps/` and don't race each other through the
@@ -731,9 +737,6 @@ pub(in crate::commands) struct Args {
     /// posture is "defaults must be safe."
     #[arg(long, default_value = "standard")]
     pub seccomp: String,
-    /// Secret binding (format: KEY:host, KEY:host:header, or KEY=value:host). Repeatable
-    #[arg(short, long)]
-    pub secret: Vec<String>,
     /// Named dev network to attach VM to (default: "default")
     #[arg(long, default_value = "default")]
     pub network: String,
@@ -912,15 +915,11 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     }
     let seccomp_tier: mvm_security::seccomp::SeccompTier =
         args.seccomp.parse().context("Invalid --seccomp value")?;
-    let secret_bindings: Vec<mvm_core::secret_binding::SecretBinding> = args
-        .secret
-        .iter()
-        .map(|s| s.parse())
-        .collect::<Result<Vec<_>>>()
-        .context("Invalid --secret value")?;
     let plan_seccomp_tier = plan_seccomp_tier(seccomp_tier)?;
-    let plan_secret_release = secret_release_policy(&secret_bindings);
-
+    let lowered_plan_secrets = load_workload_ir(args.from_workload_ir.as_deref())?
+        .map(|workload| lower_workload_secrets(&workload))
+        .unwrap_or_default();
+    let plan_secret_release = lowered_plan_secrets.secret_release;
     // Sandbox metadata (W1 of the filesystem-volumes plan). Tag charset/length
     // validation happens in the security crate so audit-event emission
     // and webhook bodies see only validated input. TTL parsing rejects
@@ -1000,7 +999,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         seccomp_tier,
         plan_seccomp_tier,
         plan_secret_release,
-        secret_bindings,
+        plan_secrets: lowered_plan_secrets.secrets,
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
@@ -1084,7 +1083,7 @@ pub(in crate::commands) struct RunParams<'a> {
     pub(super) seccomp_tier: mvm_security::seccomp::SeccompTier,
     pub(super) plan_seccomp_tier: mvm_plan::PlanSeccompTier,
     pub(super) plan_secret_release: mvm_plan::SecretReleasePolicy,
-    pub(super) secret_bindings: Vec<mvm_core::secret_binding::SecretBinding>,
+    pub(super) plan_secrets: Vec<mvm_plan::SecretBinding>,
     /// Validated sandbox tags from `--tag k=v`.
     pub(super) sandbox_tags: std::collections::BTreeMap<String, String>,
     /// Parsed `--ttl` duration; reaper tears VM down after this elapses.
@@ -1146,7 +1145,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         seccomp_tier,
         plan_seccomp_tier,
         plan_secret_release,
-        secret_bindings,
+        plan_secrets,
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
@@ -1294,6 +1293,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             mem_mib: direct_mem as u64,
             seccomp_tier: plan_seccomp_tier,
             secret_release: plan_secret_release,
+            secrets: plan_secrets.clone(),
             no_supervisor,
             ledger: &admission_ledger,
             keys_dir: None,
@@ -1618,50 +1618,6 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         });
     }
 
-    // Resolve and inject secret bindings
-    if !secret_bindings.is_empty() {
-        let resolved = mvm_core::secret_binding::ResolvedSecrets::resolve(&secret_bindings)
-            .context("failed to resolve secret bindings")?;
-
-        // Write actual secret values to the secrets drive
-        for (filename, content) in resolved.to_secret_files() {
-            secret_files.push(microvm::DriveFile {
-                name: filename,
-                content,
-                mode: 0o600,
-            });
-        }
-
-        // Write secret manifest to config drive (no secret values, just metadata)
-        config_files.push(microvm::DriveFile {
-            name: "secrets-manifest.json".to_string(),
-            content: resolved.manifest_json(),
-            mode: 0o644,
-        });
-
-        // Write placeholder env vars so tools pass existence checks
-        let placeholders: Vec<String> = resolved
-            .placeholder_env_vars()
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
-        if let Some(f) = env_vars_to_drive_file(&placeholders) {
-            config_files.push(microvm::DriveFile {
-                name: "secret-env.env".to_string(),
-                content: f.content,
-                mode: f.mode,
-            });
-        }
-
-        // Log which secrets are bound (without revealing values)
-        for b in &secret_bindings {
-            ui::info(&format!(
-                "Secret {} bound to {} (header: {})",
-                b.env_var, b.target_host, b.header
-            ));
-        }
-    }
-
     let vm_name_owned = vm_name.clone();
     let has_ports = !port_mappings.is_empty();
 
@@ -1685,6 +1641,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         mem_mib: final_memory as u64,
         seccomp_tier: plan_seccomp_tier,
         secret_release: plan_secret_release,
+        secrets: plan_secrets.clone(),
         no_supervisor,
         ledger: &admission_ledger,
         keys_dir: None,
@@ -2052,6 +2009,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 mem_mib: final_memory as u64,
                 seccomp_tier: plan_seccomp_tier,
                 secret_release: plan_secret_release,
+                secrets: plan_secrets.clone(),
                 no_supervisor,
                 ledger: &admission_ledger,
                 keys_dir: None,
@@ -2323,6 +2281,7 @@ mod admit_plan_tests {
             mem_mib: 512,
             seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
             secret_release: mvm_plan::SecretReleasePolicy::None,
+            secrets: Vec::new(),
             no_supervisor: true,
             ledger: &ledger,
             keys_dir: None, // not read — short-circuit returns first
@@ -2351,6 +2310,7 @@ mod admit_plan_tests {
             mem_mib: 512,
             seccomp_tier: mvm_plan::PlanSeccompTier::Network,
             secret_release: mvm_plan::SecretReleasePolicy::PlanBound,
+            secrets: Vec::new(),
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2400,6 +2360,7 @@ mod admit_plan_tests {
             mem_mib: 128,
             seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
             secret_release: mvm_plan::SecretReleasePolicy::None,
+            secrets: Vec::new(),
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2435,6 +2396,7 @@ mod admit_plan_tests {
             mem_mib: 128,
             seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
             secret_release: mvm_plan::SecretReleasePolicy::None,
+            secrets: Vec::new(),
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2454,6 +2416,7 @@ mod admit_plan_tests {
             mem_mib: 128,
             seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
             secret_release: mvm_plan::SecretReleasePolicy::None,
+            secrets: Vec::new(),
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2515,6 +2478,7 @@ mod admit_plan_tests {
             mem_mib: 128,
             seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
             secret_release: mvm_plan::SecretReleasePolicy::None,
+            secrets: Vec::new(),
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2598,6 +2562,7 @@ chain_signing = true
                 egress_policy_ref: None,
                 tool_policy_ref: None,
                 secret_release: mvm_plan::SecretReleasePolicy::None,
+                secrets: Vec::new(),
                 audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
@@ -2695,6 +2660,7 @@ stream_destinations = ["file://{}"]
                 egress_policy_ref: None,
                 tool_policy_ref: None,
                 secret_release: mvm_plan::SecretReleasePolicy::None,
+                secrets: Vec::new(),
                 audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
@@ -2791,6 +2757,7 @@ chain_signing = false
                 egress_policy_ref: None,
                 tool_policy_ref: None,
                 secret_release: mvm_plan::SecretReleasePolicy::None,
+                secrets: Vec::new(),
                 audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
@@ -2862,6 +2829,7 @@ chain_signing = false
                 egress_policy_ref: None,
                 tool_policy_ref: None,
                 secret_release: mvm_plan::SecretReleasePolicy::None,
+                secrets: Vec::new(),
                 audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
@@ -2953,6 +2921,7 @@ disabled_inspectors = ["ssrf_guarrd"]
                 egress_policy_ref: None,
                 tool_policy_ref: None,
                 secret_release: mvm_plan::SecretReleasePolicy::None,
+                secrets: Vec::new(),
                 audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
@@ -3050,6 +3019,7 @@ port_hi  = 443
                 egress_policy_ref: None,
                 tool_policy_ref: None,
                 secret_release: mvm_plan::SecretReleasePolicy::None,
+                secrets: Vec::new(),
                 audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,

@@ -38,7 +38,7 @@ The rootfs is built by `mkGuest` and contains:
 The config drive (`/dev/vdb`, mounted at `/mnt/config/`) contains non-sensitive configuration:
 
 - `config.json` — mvm instance metadata (name, role, resources)
-- Application config files injected via `--config-dir`
+- Application config files from host directories you mounted yourself
 
 Files are written with mode 0444 (world-readable, read-only mount).
 
@@ -47,7 +47,7 @@ Files are written with mode 0444 (world-readable, read-only mount).
 The secrets drive (`/dev/vdc`, mounted at `/mnt/secrets/`) contains sensitive data:
 
 - `secrets.json` — tenant-level secrets
-- Application secrets injected via `--secrets-dir`
+- Application secret files from host directories you mounted yourself
 
 Security hardening:
 - Uses tmpfs-backed file (never hits persistent storage)

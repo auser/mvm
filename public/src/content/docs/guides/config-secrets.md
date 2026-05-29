@@ -49,34 +49,24 @@ let config = FlakeRunConfig {
 };
 ```
 
-## Secret Bindings
+## Managed Secrets
 
-For AI agent workloads, use `--secret` to bind environment variable secrets to specific target domains. This provides domain-scoped secret injection — combine with `--network-preset` to prevent exfiltration:
+`mvmctl up --secret` has been removed.
 
-```bash
-mvmctl up --flake . \
-    --secret OPENAI_API_KEY:api.openai.com \
-    --secret ANTHROPIC_API_KEY:api.anthropic.com:x-api-key \
-    --network-preset dev
-```
+Use `mvmctl secret put` to store local secret refs, then bind those refs
+through `mvm.toml` or the SDKs. That is the supported path for managed
+secrets.
 
-**Binding syntax:**
+The managed-secret model is:
 
-| Format | Meaning |
-|--------|---------|
-| `KEY:host` | Read KEY from host env, bind to host (Authorization header) |
-| `KEY:host:header` | Custom HTTP header name |
-| `KEY=value:host` | Explicit value instead of env lookup |
-| `KEY=value:host:header` | Explicit value + custom header |
+1. Store a secret ref locally with `mvmctl secret put <name>`
+2. Declare that ref in `mvm.toml` or with `mvm.secret(...)`
+3. The guest sees only a normal env var name with an opaque placeholder
+4. Host-mediated surfaces such as `mvm.web_fetch` and `mvm.web_search`
+   release the real value at request time when policy allows it
 
-**What happens at boot:**
-
-1. Secret values are resolved (from host env or explicit) and written to the **secrets drive** (mode 0600)
-2. A `secrets-manifest.json` is written to the **config drive** (metadata only, no values)
-3. Placeholder env vars (`mvm-managed:KEY`) are set in the guest environment so tools pass existence checks
-4. Combined with network allowlists, the VM can only send traffic to the allowed domains
-
-This is the "config-drive injection" approach. The secret values are on the guest's secrets drive but are scoped to specific domains via network policy. A future upgrade will add MITM proxy-based injection where secrets never touch the guest filesystem.
+Managed secret refs are host-mediated only. Guest HTTPS CONNECT egress
+is not a substitution path.
 
 ## Design
 

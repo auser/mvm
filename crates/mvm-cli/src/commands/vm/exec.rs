@@ -532,6 +532,7 @@ fn emit_oci_run_admission(
         egress_policy_ref: None,
         tool_policy_ref: None,
         secret_release: mvm_plan::SecretReleasePolicy::None,
+        secrets: Vec::new(),
         audit_event_prefix: None,
         cpus,
         mem_mib,

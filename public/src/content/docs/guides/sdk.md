@@ -79,7 +79,7 @@ recognizes. Anything else in decorator kwarg position is rejected:
 | `nix_packages([...])`   | `Image::NixPackages`     | direct passthrough                             |
 | `resources(...)`        | `Resources`              | `cpu`/`memory_mb`/`rootfs_size_mb`             |
 | `network(mode=, ports=)`| `Network`                | `none` \| `bridge` \| `host`                   |
-| `secret(name, var=)`    | `EnvValue::SecretRef`    | resolved at admission by supervisor            |
+| `secret(name, var=)`    | `EnvValue::SecretRef`    | host-mediated secret ref; guest sees placeholder only |
 | `literal(value)`        | `EnvValue::Literal`      | parity with `secret(...)`                      |
 | `hook(cmd)`             | `HookCmd`                | str → Shell; list → Argv                       |
 
@@ -105,6 +105,19 @@ Nix factory to bake into `/etc/mvm/hooks/<phase>.sh`.
 Deployment to the hosted control plane is an `mvmd` responsibility. Use
 `mvmctl compile` to produce local build artifacts; mvmd consumes the same SDK
 compile/deploy libraries when it packages and accepts workloads.
+
+## Secret semantics
+
+`mvm.secret(...)` names a managed secret reference, not a raw secret
+value.
+
+- The guest sees a normal env var name and an opaque placeholder
+  value.
+- The raw secret stays on the host side.
+- Request-time release is supported only on host-mediated outbound
+  surfaces such as `mvm.web_fetch` and `mvm.web_search`.
+- Guest HTTPS CONNECT egress is not a managed-secret substitution
+  path.
 
 ## TypeScript runner
 

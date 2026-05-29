@@ -13,7 +13,7 @@ use crate::compile::reachability::{
     discover_python_reachable,
 };
 use crate::compile::source::{SourceError, copy_source, rehash};
-use mvm_ir::{Entrypoint, Source, Workload};
+use mvm_ir::{Entrypoint, EnvValue, Source, Workload};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -49,6 +49,9 @@ pub enum CompileError {
     /// the surface explicit so callers can distinguish a real
     /// "function missing" from "we couldn't even parse the source".
     FuncDescribe(FuncDescribeError),
+    ManagedSecretsNotSupported {
+        targets: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for CompileError {
@@ -80,6 +83,13 @@ impl std::fmt::Display for CompileError {
                 "function {module:?}:{function:?} is missing parameters required by args_schema: {missing:?}"
             ),
             Self::FuncDescribe(e) => write!(f, "function-presence check: {e}"),
+            Self::ManagedSecretsNotSupported { targets } => write!(
+                f,
+                "managed secret refs are not supported by `mvmctl compile` local boot artifacts yet; \
+                 found secret-backed env targets: {}. Use deploy/plan flows for managed refs, or \
+                 mount guest-visible files explicitly if you accept guest materialization.",
+                targets.join(", ")
+            ),
         }
     }
 }
@@ -136,6 +146,12 @@ pub fn compile(workload: &Workload, out: &Path, manifest_dir: &Path) -> Result<(
             .apps
             .first()
             .expect("validate() ensures at least one app");
+        let managed_secret_targets = managed_secret_targets(app);
+        if !managed_secret_targets.is_empty() {
+            return Err(CompileError::ManagedSecretsNotSupported {
+                targets: managed_secret_targets,
+            });
+        }
         let bundle_dir = staging.join("src");
         let mut source_plan = match &app.source {
             Source::LocalPath {
@@ -231,6 +247,36 @@ pub fn compile(workload: &Workload, out: &Path, manifest_dir: &Path) -> Result<(
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
             Err(e)
+        }
+    }
+}
+
+fn managed_secret_targets(app: &mvm_ir::App) -> Vec<String> {
+    let mut targets = Vec::new();
+    collect_secret_targets(&app.env, &mut targets);
+    for ep in &app.entrypoints {
+        match ep {
+            Entrypoint::Command { env, .. } | Entrypoint::Function { env, .. } => {
+                collect_secret_targets(env, &mut targets);
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn collect_secret_targets(
+    env: &std::collections::BTreeMap<String, EnvValue>,
+    out: &mut Vec<String>,
+) {
+    for value in env.values() {
+        let EnvValue::SecretRef { reference } = value else {
+            continue;
+        };
+        match &reference.mount {
+            mvm_ir::SecretMount::Env { var } => out.push(var.clone()),
+            mvm_ir::SecretMount::File { path } => out.push(path.clone()),
         }
     }
 }
@@ -415,7 +461,7 @@ fn write_lf(path: &Path, contents: &str) -> Result<(), CompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mvm_ir::{App, Entrypoint, Format, Image, Resources, Source};
+    use mvm_ir::{App, Entrypoint, Format, Image, Resources, SecretMount, SecretRef, Source};
     use tempfile::TempDir;
 
     fn sample() -> Workload {
@@ -538,6 +584,34 @@ mod tests {
             concurrency: None,
         }];
         w
+    }
+
+    #[test]
+    fn compile_refuses_managed_secret_refs_for_local_boot_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let manifest_dir = tmp.path().join("manifest");
+        make_src(&manifest_dir);
+        let out = tmp.path().join("artifact");
+        let mut workload = sample();
+        workload.apps[0].env.insert(
+            "API_KEY".into(),
+            EnvValue::SecretRef {
+                reference: SecretRef {
+                    name: "api-key".into(),
+                    mount: SecretMount::Env {
+                        var: "API_KEY".into(),
+                    },
+                },
+            },
+        );
+
+        let err = compile(&workload, &out, &manifest_dir).unwrap_err();
+        match err {
+            CompileError::ManagedSecretsNotSupported { targets } => {
+                assert_eq!(targets, vec!["API_KEY".to_string()]);
+            }
+            other => panic!("expected ManagedSecretsNotSupported, got {other:?}"),
+        }
     }
 
     #[test]

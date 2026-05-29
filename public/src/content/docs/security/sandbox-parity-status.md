@@ -97,10 +97,11 @@ Tracking work:
 
 ### `secret-non-leakage` — Planned
 
-Today secrets reach the guest as plain env or mounted files. A
-compromised guest can read them. ADR-048 §"Non-goals" explicitly
-states mvm will **not claim** secret non-leakage for that legacy
-flow. The placeholder + host-side substitution path is Planned.
+Today, manually mounted secret files are still readable by the guest
+that receives them. ADR-048 §"Non-goals" explicitly states mvm will
+**not claim** secret non-leakage for that manual file-materialization
+path. The placeholder + host-side substitution path is Planned for
+managed secret refs.
 
 To move to Preview: ship the `SecretPlaceholder` type, host-side
 grant registry, and L7-proxy substitution for at least one provider
@@ -109,8 +110,8 @@ end-to-end, behind a default-off feature flag.
 To move to Shipped: the default flow is placeholder-based; redaction
 wrappers cover plan JSON, logs, audit, errors, cache keys, route
 labels, and panic output; hostile-guest exfiltration tests run in
-CI; the legacy env/file path sits behind
-`unsafe_guest_secret_materialization` and is documented as such.
+CI; explicit guest-visible file mounts remain manual opt-ins and are
+documented as such.
 
 Tracking work:
 [Plan 74 W3](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-claim-safe-sandbox-parity.md#w3--secret-placeholders-and-host-side-substitution).

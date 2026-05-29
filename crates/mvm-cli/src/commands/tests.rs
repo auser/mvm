@@ -1739,6 +1739,16 @@ fn secret_get_rejects_force_flag() {
     );
 }
 
+#[test]
+fn up_rejects_removed_secret_flag() {
+    let err = Cli::try_parse_from(["mvmctl", "up", "--secret", "API_KEY:api.example.com"])
+        .expect_err("up --secret must be rejected");
+    assert!(
+        err.to_string().contains("unexpected argument '--secret'"),
+        "got: {err}"
+    );
+}
+
 // --- Exec CLI tests ---
 
 #[test]

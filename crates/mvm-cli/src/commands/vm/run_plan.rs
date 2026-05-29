@@ -63,6 +63,7 @@ use mvm_ir::{App, Workload};
 
 use super::plan_admission::{InMemoryNonceLedger, SystemClock, admit_for_run};
 use super::plan_builder::SynthesisInput;
+use super::managed_secrets::lower_app_secrets;
 use crate::commands::build::sandbox_record::{auto_exec_record_script, script_language_from_path};
 
 use super::exec::{RunArgs, RunMode};
@@ -260,6 +261,7 @@ fn extract_script_arg(args: &RunArgs) -> Result<PathBuf> {
 /// plan-mode is a shape check; downstream consumers that want the
 /// real artifact hash run the live path.
 fn synthesis_input_for_app<'a>(workload: &'a Workload, app: &'a App) -> Result<SynthesisInput<'a>> {
+    let lowered_secrets = lower_app_secrets(app);
     // `SynthesisInput` borrows `image_sha256` as `&str`; we need a
     // 64-char hex string that lives long enough. Since we can't
     // return a reference to a local in the synthesis input struct,
@@ -290,7 +292,8 @@ fn synthesis_input_for_app<'a>(workload: &'a Workload, app: &'a App) -> Result<S
         fs_policy_ref: None,
         egress_policy_ref: None,
         tool_policy_ref: None,
-        secret_release: mvm_plan::SecretReleasePolicy::None,
+        secret_release: lowered_secrets.secret_release,
+        secrets: lowered_secrets.secrets,
         audit_event_prefix: None,
         cpus: app.resources.cpu_cores.max(1) as u32,
         mem_mib: app.resources.memory_mb.max(64) as u64,

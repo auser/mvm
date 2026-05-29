@@ -39,9 +39,10 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use mvm_plan::{
     AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, AuditTaxonomy,
-    DepsVolumeBinding, ExecutionPlan, FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PlanSeccompTier,
-    PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION, SecretReleasePolicy,
-    SignedImageRef, TenantId, TimeoutSpec, WorkloadId, WorkloadIntent,
+    DepsVolumeBinding, ExecutionPlan, FsPolicyRef, KeyRotationSpec, Nonce, PlanId,
+    PlanSeccompTier, PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION,
+    SecretBinding, SecretReleasePolicy, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
+    WorkloadIntent,
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -106,6 +107,8 @@ pub struct SynthesisInput<'a> {
     pub tool_policy_ref: Option<&'a str>,
     /// Whether any secret can be released under this profile.
     pub secret_release: SecretReleasePolicy,
+    /// Secret refs lowered into plan-visible bindings.
+    pub secrets: Vec<SecretBinding>,
     /// Optional audit event prefix override. `None` derives from the
     /// intent.
     pub audit_event_prefix: Option<&'a str>,
@@ -213,7 +216,7 @@ pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
         admission_profile,
         network_policy,
         fs_policy,
-        secrets: Vec::new(),
+        secrets: input.secrets.clone(),
         egress_policy,
         tool_policy,
         artifact_policy: ArtifactPolicy {
@@ -330,6 +333,7 @@ mod tests {
             egress_policy_ref: None,
             tool_policy_ref: None,
             secret_release: SecretReleasePolicy::None,
+            secrets: Vec::new(),
             audit_event_prefix: None,
             cpus: 2,
             mem_mib: 512,
@@ -523,6 +527,20 @@ mod tests {
         assert_eq!(plan.admission_profile.audit.event_prefix, "agent.web");
         assert_eq!(plan.audit_labels["intent"], "agent:web-research");
         assert_eq!(plan.audit_labels["seccomp_tier"], "network");
+    }
+
+    #[test]
+    fn synthesized_plan_carries_secret_bindings() {
+        let mut inp = input("myvm");
+        inp.secret_release = SecretReleasePolicy::PlanBound;
+        inp.secrets = vec![SecretBinding {
+            name: "API_KEY".into(),
+            source: mvm_plan::SecretSource::Keystore {
+                address: "api-key".into(),
+            },
+        }];
+        let plan = synthesize_plan(&inp).unwrap();
+        assert_eq!(plan.secrets, inp.secrets);
     }
 
     #[test]
