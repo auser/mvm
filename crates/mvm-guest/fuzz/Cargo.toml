@@ -30,7 +30,7 @@ path = ".."
 path = "../../mvm-core"
 
 # Plan 89 W2 — `fuzz_builder_request` covers the
-# `BuilderRequest`/`BuilderResponse` payloads in
+# `HostVmRequest`/`HostVmResponse` payloads in
 # `mvm-build::builder_protocol`. mvm-build depends on mvm-guest, so
 # this is fine direction-wise; the fuzz crate is already detached
 # from the workspace (see [workspace] above).

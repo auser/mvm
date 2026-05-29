@@ -47,31 +47,82 @@ Goal: split the persistent-VM framing layer so the same long-lived
 libkrun VM can serve Nix builds (existing) and Firecracker workload
 spawns (new).
 
-- [ ] **A1.1** Extract a `HostVmRequest` / `HostVmResponse` framing
+Split into two PRs (discovered during A1 implementation — the crate
+rename in A1.3 turned out to drag the Stage 0 byte-scan + kernel
+cmdline path migration along with it, materially heavier than the
+protocol rename. A1a ships the cheap half today; A1b ships the
+Stage 0 migration on its own with full attention).
+
+#### A1a — Protocol type rename + struct rename
+
+- [x] **A1.1** Extract a `HostVmRequest` / `HostVmResponse` framing
       layer from `crates/mvm-build/src/builder_protocol.rs`. Today's
       `BuilderRequest::Run { job }` becomes one variant of a
       backend-agnostic message; add `WorkloadStart`, `WorkloadStop`,
       `WorkloadStatus` siblings (payload shapes deferred to A2.2).
-- [ ] **A1.2** Generalise `LibkrunPersistentBuilderVm` →
+      Adds a `WorkloadId` newtype mirroring `JobId`.
+- [x] **A1.2** Generalise `LibkrunPersistentBuilderVm` →
       `LibkrunPersistentHostVm`. Location: keep in `mvm-build` for
       this slice (cheapest); revisit splitting into a dedicated
       `mvm-host-vm` crate in A5 if the API surface grows beyond
       what fits next to the builder code. Hard rename per the
       no-backcompat memory — no `LibkrunPersistentBuilderVm`
       alias.
-- [ ] **A1.3** Rename `mvm-builder-init` → `mvm-host-vm-init`. The
-      guest-side dispatch loop branches on request kind: Nix builds
-      (existing arm, unchanged behaviour) vs. workload spawn (new
-      arm, stubbed with `unimplemented!()` until A2.2 fills it in).
-- [ ] **A1.4** Hermetic protocol tests — same shape as Plan 89's
+- [x] **A1.4** Hermetic protocol tests — same shape as Plan 89's
       builder-protocol round-trip tests, extended for the workload
       variants. Tampered-frame rejection paths included
-      (`#[serde(deny_unknown_fields)]` carries over).
+      (`#[serde(deny_unknown_fields)]` carries over). 9 new tests
+      covering `WorkloadId` serialization, all 6 new
+      request/response variants round-tripping, wire-kind tag
+      stability, and `deny_unknown_fields` rejection on new
+      variants.
 
-Exit: a `cargo test --workspace` green PR that adds the new
-variants without changing runtime behaviour. The new arm in
-`mvm-host-vm-init` is a stub; existing Nix-build flow round-trips
-identically through the renamed protocol.
+Exit (A1a): `cargo test --workspace` green; existing Nix-build
+flow round-trips identically through the renamed protocol; new
+workload variants reachable through the type system. Guest-side
+dispatch arm for workloads lands with A1b's crate rename.
+
+#### A1b — Crate rename `mvm-builder-init` → `mvm-host-vm-init` <a id="a1b-rationale"></a>
+
+The crate's binary name `mvm-builder-init` is baked into the Stage
+0 rootfs at `/sbin/mvm-builder-init`. Several host code paths scan
+the rootfs for that exact byte sequence to validate Stage 0
+compatibility (`crates/mvm-cli/src/commands/env/apple_container.rs`
+lines 24, 1047, 1122, 2268, 2317, 2562, 2744). Renaming the binary
+in lockstep means:
+
+- Kernel cmdline `init=/sbin/mvm-builder-init` changes everywhere
+  it appears.
+- Host rootfs-scan byte strings change at all seven call sites
+  above.
+- All cached rootfs images become Stage 0-incompatible until
+  rebuilt — `mvmctl dev up` users see a fail-closed rebuild prompt
+  on first run after upgrade.
+
+- [ ] **A1.3.crate** Rename crate dir + `Cargo.toml` `package.name`
+      + `[[bin]] name` + workspace members entry. Update
+      `mvm_builder_init` → `mvm_host_vm_init` across all Rust
+      imports (~30 call sites).
+- [ ] **A1.3.stage0** Update the Stage 0 byte-scan constants +
+      kernel cmdline + rootfs path everywhere — seven sites in
+      `apple_container.rs` plus any other `/sbin/mvm-builder-init`
+      literal in the tree.
+- [ ] **A1.3.nix** Update Nix flakes that copy the binary into
+      the rootfs: `nix/lib/mk-guest.nix`,
+      `nix/images/builder/flake.nix`,
+      `nix/images/builder-vm/flake.nix`.
+- [ ] **A1.3.ci** Update `.github/workflows/ci.yml` paths.
+- [ ] **A1.3.docs** Update `CLAUDE.md` and any spec docs that
+      reference the active surface (not historical specs).
+- [ ] **A1.3.guest-arm** Guest-side dispatch loop branches on
+      request kind: Nix builds (existing arm, unchanged behaviour)
+      vs. workload spawn (new arm, stubbed with `unimplemented!()`
+      until A2.2 fills it in).
+
+Exit (A1b): `cargo test --workspace` green; `mvmctl dev up` boots
+a freshly-built rootfs through the renamed binary; cached
+pre-rename rootfs images fail-closed with an actionable rebuild
+prompt; live-KVM smoke (cold) green.
 
 ### Phase A2 — Firecracker-in-guest launch path
 

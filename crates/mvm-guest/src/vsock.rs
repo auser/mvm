@@ -730,7 +730,7 @@ impl GuestRequest {
     /// - `SealedProd` allows only `ProdSafe`.
     /// - `Dev` allows `ProdSafe` and `DevOnly` (a superset).
     /// - `Builder` allows only `BuilderOnly` — today the builder
-    ///   agent speaks `BuilderRequest`, so `GuestRequest` reaching
+    ///   agent speaks `HostVmRequest`, so `GuestRequest` reaching
     ///   a `Builder`-profile agent is a configuration error.
     pub fn allowed_in(&self, profile: AgentProfile) -> bool {
         matches!(

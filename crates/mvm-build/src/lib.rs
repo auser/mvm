@@ -19,7 +19,7 @@ pub mod firecracker;
 pub mod packed_artifact;
 /// Plan 89 W3 part 1 — host-side scaffold for the persistent
 /// builder VM's dispatch supervisor. Spawning the actual libkrun
-/// VM lives in W3 part 2 (`LibkrunPersistentBuilderVm`); this
+/// VM lives in W3 part 2 (`LibkrunPersistentHostVm`); this
 /// module owns the dispatch wire over the socket libkrun creates.
 pub mod persistent_builder;
 /// Plan 85 Phase B — OCI-unpacked tree to ext4 rootfs image.

@@ -73,14 +73,14 @@ use std::process::ExitCode;
 #[allow(dead_code)]
 mod boot_timings;
 /// Plan 89 W3 part 2 — hand-rolled parser for the
-/// `BuilderRequest` wire shape the persistent builder VM's
+/// `HostVmRequest` wire shape the persistent builder VM's
 /// dispatch loop reads off vsock. Cross-platform; the W3 part 3
 /// Linux dispatch loop calls into it after reading the framed
 /// body. Tested against the host's serde-derived encoding so
 /// schema drift on either side is loud.
 #[allow(dead_code)]
 mod builder_request;
-/// Plan 89 W2 part 3 — hand-rolled `BuilderResponse::Result`
+/// Plan 89 W2 part 3 — hand-rolled `HostVmResponse::Result`
 /// JSON. Cross-platform (testable on macOS) so the wire shape can
 /// be validated against `mvm_build::builder_protocol`'s typed
 /// serde via a dev-dep test, without dragging serde_json into the
@@ -606,7 +606,7 @@ mod linux {
 
         // Plan 89 W3 part 3 dispatch: if the host staged a
         // `dispatch.sock.marker` in /job, this VM is persistent
-        // (host-side `LibkrunPersistentBuilderVm`, W3 part 4).
+        // (host-side `LibkrunPersistentHostVm`, W3 part 4).
         // Enter the dispatch loop instead of single-shot. Marker
         // absent (the default) preserves the existing cmd.sh /
         // install_spec flows exactly.
@@ -618,7 +618,7 @@ mod linux {
             });
             // Snapshot the cold-boot timings — the dispatch loop's
             // first response carries this; subsequent responses
-            // see None (per Plan 89's BuilderResponse::Result
+            // see None (per Plan 89's HostVmResponse::Result
             // semantics).
             let cold_boot_timings = match timings.lock() {
                 Ok(t) => Some(t.clone()),
@@ -679,8 +679,8 @@ mod linux {
         });
         write_result(code, &tail);
         // Plan 89 W2 part 3: best-effort vsock send of the
-        // `BuilderResponse::Result` frame the host's
-        // `mvm_build::builder_protocol::read_builder_response_from_socket`
+        // `HostVmResponse::Result` frame the host's
+        // `mvm_build::builder_protocol::read_host_vm_response_from_socket`
         // is waiting for. Runs BEFORE write_boot_timings so the
         // timings snapshot we send mirrors what hits the filesystem.
         // Any failure logs and falls through to power_off — the
@@ -719,7 +719,7 @@ mod linux {
 
     /// Plan 89 W2 part 3 — listen on `AF_VSOCK` port
     /// [`BUILDER_DISPATCH_PORT`] and write a single framed
-    /// `BuilderResponse::Result` to the first connection that
+    /// `HostVmResponse::Result` to the first connection that
     /// arrives within `ACCEPT_TIMEOUT_SECS` seconds. Best-effort:
     /// any failure (no host connection, socket setup error, write
     /// error) is logged to stderr and the boot continues to
@@ -728,7 +728,7 @@ mod linux {
     /// Wire shape is hand-rolled by
     /// [`crate::dispatch_response::DispatchResponse::to_json`]; the
     /// cross-validation test in that module pins the output against
-    /// `mvm_build::builder_protocol::BuilderResponse` so the host
+    /// `mvm_build::builder_protocol::HostVmResponse` so the host
     /// deserializer parses what we emit.
     ///
     /// AF_VSOCK constants are inlined rather than going through
@@ -757,7 +757,7 @@ mod linux {
     const SO_RCVTIMEO: i32 = 20;
     const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
 
-    /// W3 part 3 cap on a single inbound `BuilderRequest` body.
+    /// W3 part 3 cap on a single inbound `HostVmRequest` body.
     /// Matches `mvm_guest::vsock::MAX_FRAME_SIZE` (256 KiB) — the
     /// host's `read_frame` enforces the same bound on its side, so
     /// a body above this size couldn't have been written by a
@@ -929,10 +929,10 @@ mod linux {
     /// Plan 89 W3 part 3 — dispatch loop entry point. Called from
     /// `run` when `/job/dispatch.sock.marker` is present (the host
     /// stages the marker when spawning a long-lived
-    /// `LibkrunPersistentBuilderVm`, W3 part 4). Opens a long-lived
+    /// `LibkrunPersistentHostVm`, W3 part 4). Opens a long-lived
     /// AF_VSOCK listener on [`BUILDER_DISPATCH_PORT`], reads one
-    /// `BuilderRequest` per accepted connection, dispatches the
-    /// inner job, writes back a `BuilderResponse::Result`, and
+    /// `HostVmRequest` per accepted connection, dispatches the
+    /// inner job, writes back a `HostVmResponse::Result`, and
     /// repeats until a `Shutdown` request triggers a clean exit.
     ///
     /// `cold_boot_timings` carries the BootTimings snapshot taken
@@ -948,7 +948,7 @@ mod linux {
         // No accept timeout — the dispatch loop is persistent and
         // blocks waiting for the supervisor's next submit. The
         // outer `mvmctl dev down` signals shutdown via a
-        // `BuilderRequest::Shutdown` frame on a fresh connection.
+        // `HostVmRequest::Shutdown` frame on a fresh connection.
         let Some(listen_fd) = open_dispatch_listener_fd(None) else {
             eprintln!("mvm-builder-init: dispatch loop: listener setup failed");
             return 1;
@@ -979,7 +979,7 @@ mod linux {
                 }
             };
             match request {
-                crate::builder_request::BuilderRequest::Run {
+                crate::builder_request::HostVmRequest::Run {
                     job_id,
                     job,
                     job_dir_relpath,
@@ -995,7 +995,7 @@ mod linux {
                         eprintln!("mvm-builder-init: dispatch loop: write Result failed mid-frame");
                     }
                 }
-                crate::builder_request::BuilderRequest::Shutdown => {
+                crate::builder_request::HostVmRequest::Shutdown => {
                     eprintln!("mvm-builder-init: dispatch loop: shutdown requested");
                     let bye = crate::dispatch_response::bye_json();
                     if !write_frame(&mut conn, bye.as_bytes()) {
@@ -1094,9 +1094,9 @@ mod linux {
 
     /// Run one dispatched job: locate cmd.sh under
     /// `/job/<job_dir_relpath>/cmd.sh`, exec it, stream every
-    /// stderr line back to `conn` as a `BuilderResponse::StderrChunk`
+    /// stderr line back to `conn` as a `HostVmResponse::StderrChunk`
     /// frame, capture the exit code + stderr tail. Returns the wire
-    /// JSON for the final `BuilderResponse::Result` ready to frame
+    /// JSON for the final `HostVmResponse::Result` ready to frame
     /// and write back.
     ///
     /// `conn` is the same vsock connection the request arrived on;
@@ -1889,15 +1889,15 @@ mod linux {
     /// Plan 89 W3 part 9 — same as [`run_job`] but invokes
     /// `on_line` for each stderr line as it arrives. Used by the
     /// persistent dispatch loop to frame each line as a
-    /// `BuilderResponse::StderrChunk` and write it to the active
-    /// vsock conn before the final `BuilderResponse::Result`. The
+    /// `HostVmResponse::StderrChunk` and write it to the active
+    /// vsock conn before the final `HostVmResponse::Result`. The
     /// callback runs on this thread between line reads, so a slow
     /// host can backpressure the build's stderr stream — the
     /// host's vsock conn is the natural rate-limiter and we don't
     /// need a separate buffer thread.
     ///
     /// The trailing `\n` is stripped from each line (the typed
-    /// `BuilderResponse::StderrChunk` docs commit to that).
+    /// `HostVmResponse::StderrChunk` docs commit to that).
     /// `STDERR_TAIL_LINES` of trailing context is still buffered
     /// for the final Result frame's `stderr_tail`, matching the
     /// single-shot path's contract.

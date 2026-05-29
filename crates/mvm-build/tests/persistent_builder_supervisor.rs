@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use mvm_build::builder_protocol::{
-    BootTimingsWire, BuilderRequest, BuilderResponse, JobId, JobTimings,
+    BootTimingsWire, HostVmRequest, HostVmResponse, JobId, JobTimings,
 };
 use mvm_build::builder_vm::BuilderJob;
 use mvm_build::persistent_builder::{
@@ -24,7 +24,7 @@ use mvm_build::persistent_builder::{
 
 /// Spawn a fake guest dispatch loop on `socket_path`. The closure
 /// is invoked with each accepted connection and is responsible for
-/// reading any incoming `BuilderRequest`, writing responses, and
+/// reading any incoming `HostVmRequest`, writing responses, and
 /// dropping the stream. Returns the listener thread handle —
 /// callers `join` after asserting the supervisor outcome.
 fn spawn_fake_guest<F>(socket_path: &Path, handler: F) -> std::thread::JoinHandle<()>
@@ -63,13 +63,12 @@ fn submit_round_trips_request_and_result_with_no_stderr_chunks() {
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let request: BuilderRequest =
-            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let request: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
         let job_id = match &request {
-            BuilderRequest::Run { job_id, .. } => *job_id,
+            HostVmRequest::Run { job_id, .. } => *job_id,
             other => panic!("expected Run, got {other:?}"),
         };
-        let response = BuilderResponse::Result {
+        let response = HostVmResponse::Result {
             job_id,
             exit_code: 0,
             stderr_tail: String::new(),
@@ -112,23 +111,22 @@ fn submit_streams_stderr_chunks_then_collects_terminating_result() {
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let request: BuilderRequest =
-            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let request: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
         let job_id = match &request {
-            BuilderRequest::Run { job_id, .. } => *job_id,
+            HostVmRequest::Run { job_id, .. } => *job_id,
             other => panic!("expected Run, got {other:?}"),
         };
         for line in ["building", "building 2/3", "building 3/3"] {
             mvm_guest::vsock::write_frame(
                 &mut conn,
-                &BuilderResponse::StderrChunk {
+                &HostVmResponse::StderrChunk {
                     job_id,
                     line: line.to_string(),
                 },
             )
             .expect("write chunk");
         }
-        let result = BuilderResponse::Result {
+        let result = HostVmResponse::Result {
             job_id,
             exit_code: 0,
             stderr_tail: "building 3/3".to_string(),
@@ -178,7 +176,7 @@ fn submit_returns_premature_eof_when_guest_closes_without_result() {
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let _: BuilderRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let _: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
         // Drop conn -> EOF.
     });
 
@@ -211,8 +209,8 @@ fn submit_detects_job_id_mismatch_in_result() {
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let _: BuilderRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
-        let bogus = BuilderResponse::Result {
+        let _: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let bogus = HostVmResponse::Result {
             job_id: JobId::new(),
             exit_code: 0,
             stderr_tail: String::new(),
@@ -242,16 +240,15 @@ fn submit_detects_job_id_mismatch_in_result() {
 #[test]
 fn shutdown_writes_shutdown_request_and_consumes_bye() {
     // Lifecycle path: caller invokes shutdown(); supervisor sends
-    // BuilderRequest::Shutdown; guest replies with Bye; supervisor
+    // HostVmRequest::Shutdown; guest replies with Bye; supervisor
     // returns cleanly.
     let scratch = tempfile::tempdir().expect("tempdir");
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let request: BuilderRequest =
-            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
-        assert!(matches!(request, BuilderRequest::Shutdown {}));
-        mvm_guest::vsock::write_frame(&mut conn, &BuilderResponse::Bye {}).expect("write bye");
+        let request: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        assert!(matches!(request, HostVmRequest::Shutdown {}));
+        mvm_guest::vsock::write_frame(&mut conn, &HostVmResponse::Bye {}).expect("write bye");
     });
 
     let supervisor =
@@ -318,13 +315,12 @@ fn submit_with_audit_sink_emits_dispatched_then_completed_on_success() {
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let request: BuilderRequest =
-            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let request: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
         let job_id = match &request {
-            BuilderRequest::Run { job_id, .. } => *job_id,
+            HostVmRequest::Run { job_id, .. } => *job_id,
             other => panic!("expected Run, got {other:?}"),
         };
-        let response = BuilderResponse::Result {
+        let response = HostVmResponse::Result {
             job_id,
             exit_code: 0,
             stderr_tail: String::new(),
@@ -380,7 +376,7 @@ fn submit_with_audit_sink_emits_dispatched_then_failed_on_premature_eof() {
     // Guest accepts and immediately closes — supervisor surfaces
     // PrematureEof, audit sink should see dispatched + failed.
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let _request: BuilderRequest =
+        let _request: HostVmRequest =
             mvm_guest::vsock::read_frame(&mut conn).expect("read request");
         drop(conn);
     });
@@ -422,15 +418,14 @@ fn submit_without_audit_sink_emits_nothing() {
     let socket = dispatch_socket_path(scratch.path());
 
     let guest = spawn_fake_guest(&socket, |mut conn| {
-        let request: BuilderRequest =
-            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let request: HostVmRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
         let job_id = match &request {
-            BuilderRequest::Run { job_id, .. } => *job_id,
+            HostVmRequest::Run { job_id, .. } => *job_id,
             other => panic!("expected Run, got {other:?}"),
         };
         mvm_guest::vsock::write_frame(
             &mut conn,
-            &BuilderResponse::Result {
+            &HostVmResponse::Result {
                 job_id,
                 exit_code: 0,
                 stderr_tail: String::new(),

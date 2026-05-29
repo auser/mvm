@@ -2,12 +2,12 @@
 //
 // Mirror of fuzz_guest_request.rs / fuzz_authenticated_frame.rs:
 // arbitrary bytes are fed straight into
-// `serde_json::from_slice::<BuilderRequest>` and
-// `serde_json::from_slice::<BuilderResponse>`. We're asserting only
+// `serde_json::from_slice::<HostVmRequest>` and
+// `serde_json::from_slice::<HostVmResponse>`. We're asserting only
 // that the deserializer never panics — every parse failure must be a
 // typed `serde_json::Error`, not an unwind. The signed-envelope layer
 // (`AuthenticatedFrame`) is fuzzed separately by fuzz_authed_path.rs;
-// this target covers only the inner BuilderRequest / BuilderResponse
+// this target covers only the inner HostVmRequest / HostVmResponse
 // payloads.
 //
 // The seed corpus directory at
@@ -23,9 +23,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mvm_build::builder_protocol::{BuilderRequest, BuilderResponse};
+use mvm_build::builder_protocol::{HostVmRequest, HostVmResponse};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = serde_json::from_slice::<BuilderRequest>(data);
-    let _ = serde_json::from_slice::<BuilderResponse>(data);
+    let _ = serde_json::from_slice::<HostVmRequest>(data);
+    let _ = serde_json::from_slice::<HostVmResponse>(data);
 });

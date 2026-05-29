@@ -1,7 +1,7 @@
 //! Plan 89 W3 part 5 — `mvmctl persistent-builder` CLI verb.
 //!
 //! Wires the W3 parts 1-4 pieces (host-side
-//! `LibkrunPersistentBuilderVm` + `PersistentBuilderSupervisor`
+//! `LibkrunPersistentHostVm` + `PersistentBuilderSupervisor`
 //! + the in-guest dispatch loop) into a user-facing command.
 //! Three subcommands:
 //!
@@ -10,9 +10,9 @@
 //!   subsequent `submit` / `stop` calls find it.
 //! - **`submit --flake <path>`** — dispatches one
 //!   `BuilderJob::Flake` into the running VM, blocks for the
-//!   `BuilderResponse::Result`, prints the outcome. Re-stages
+//!   `HostVmResponse::Result`, prints the outcome. Re-stages
 //!   `cmd.sh` under the running VM's job dir per-call.
-//! - **`stop`** — sends `BuilderRequest::Shutdown` to the dispatch
+//! - **`stop`** — sends `HostVmRequest::Shutdown` to the dispatch
 //!   loop, waits for the supervisor child to exit cleanly.
 //!
 //! This is deliberately separate from `mvmctl dev up`. Plan 89's
@@ -20,7 +20,7 @@
 //! supervisor) lands in a follow-up to avoid colliding with the
 //! ur-seed work in flight on `mvmctl dev`. Once both stacks are
 //! merged, `mvmctl dev up` becomes a thin caller of the same
-//! `LibkrunPersistentBuilderVm::start()` this verb invokes.
+//! `LibkrunPersistentHostVm::start()` this verb invokes.
 //!
 //! ## Session state
 //!
@@ -45,10 +45,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use mvm_build::builder_protocol::BuilderResponseRead;
+use mvm_build::builder_protocol::HostVmResponseRead;
 use mvm_build::builder_vm::BuilderJob;
 use mvm_build::libkrun_builder::{
-    DISPATCH_SOCK_MARKER, LibkrunPersistentBuilderVm, PersistentVmHandle,
+    DISPATCH_SOCK_MARKER, LibkrunPersistentHostVm, PersistentVmHandle,
 };
 use mvm_build::persistent_builder::{DispatchOutcome, PersistentBuilderSupervisor};
 
@@ -69,7 +69,7 @@ pub enum Sub {
     /// Dispatch one flake build into the running persistent VM
     /// and print the outcome.
     Submit(SubmitArgs),
-    /// Send `BuilderRequest::Shutdown` to the persistent VM and
+    /// Send `HostVmRequest::Shutdown` to the persistent VM and
     /// wait for it to power off cleanly.
     Stop(StopArgs),
     /// Print the current session record (if any).
@@ -188,10 +188,10 @@ fn run_start(args: StartArgs) -> Result<()> {
         None => std::env::current_dir().context("resolving current dir for --workspace")?,
     };
 
-    let vm = LibkrunPersistentBuilderVm::new(&workspace);
+    let vm = LibkrunPersistentHostVm::new(&workspace);
     let handle = vm
         .start()
-        .context("spawning persistent builder VM (LibkrunPersistentBuilderVm::start)")?;
+        .context("spawning persistent builder VM (LibkrunPersistentHostVm::start)")?;
 
     let supervisor_pid = handle_pid(&handle);
     let record = SessionRecord {
@@ -557,7 +557,7 @@ fn handle_pid(handle: &PersistentVmHandle) -> u32 {
 #[allow(dead_code)]
 const _MARKER_CONST: &str = DISPATCH_SOCK_MARKER;
 #[allow(dead_code)]
-fn _force_read_use(r: BuilderResponseRead) -> BuilderResponseRead {
+fn _force_read_use(r: HostVmResponseRead) -> HostVmResponseRead {
     r
 }
 

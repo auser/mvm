@@ -633,7 +633,7 @@ impl BuilderVm for VzBuilderVm {
         //    flake / install jobs (the guest communicates results
         //    via the `/job` virtio-fs share, not vsock); the
         //    dispatch port (Plan 89 W2) is a persistent-VM concern
-        //    that lives on the long-lived `LibkrunPersistentBuilderVm`
+        //    that lives on the long-lived `LibkrunPersistentHostVm`
         //    path and doesn't apply here.
         let (kernel_path, kernel_cmdline) = match &image {
             BuilderVmImage::Rootfs {
@@ -848,11 +848,11 @@ fn workspace_root_from_manifest_dir() -> Option<PathBuf> {
 // VzPersistentBuilderVm — Plan 98 Slice 2A.
 // ──────────────────────────────────────────────────────────────────
 //
-// Parallel of [`libkrun_builder::LibkrunPersistentBuilderVm`]. Same
-// dispatch-loop semantics (vsock-framed `BuilderRequest::Run` from the
+// Parallel of [`libkrun_builder::LibkrunPersistentHostVm`]. Same
+// dispatch-loop semantics (vsock-framed `HostVmRequest::Run` from the
 // host-side [`crate::persistent_builder::PersistentBuilderSupervisor`]
 // → in-guest `mvm-builder-init` runs cmd.sh / install_spec.json →
-// `BuilderResponse::Result` back over the same vsock), only the host
+// `HostVmResponse::Result` back over the same vsock), only the host
 // VMM differs. Locked decision §5 of Plan 98: keep the drivers
 // parallel rather than collapse them behind a trait — mirrors the
 // one-shot pattern shipped by Plan 97 Phase C.
@@ -934,7 +934,7 @@ impl VzPersistentBuilderVm {
     /// through the dispatch socket that
     /// [`VzPersistentVmHandle::dispatch_socket_path`] points at.
     ///
-    /// Layered like [`LibkrunPersistentBuilderVm::start`]:
+    /// Layered like [`LibkrunPersistentHostVm::start`]:
     /// pre-flight checks (Vz available, workspace dir exists,
     /// supervisor binary resolvable) → image + nix-store lock
     /// acquisition → state dir + job dir staging →
@@ -1250,7 +1250,7 @@ impl VzPersistentVmHandle {
 
     /// Per-VM job directory bound at `/job` (and `/out`) inside the
     /// guest. Hosts stage per-dispatch artifacts here before
-    /// sending the matching `BuilderRequest::Run`.
+    /// sending the matching `HostVmRequest::Run`.
     pub fn job_dir(&self) -> &Path {
         &self.job_dir
     }
@@ -1262,7 +1262,7 @@ impl VzPersistentVmHandle {
     }
 
     /// Block until the supervisor child exits. Normal way to reach
-    /// this is the supervisor receiving `BuilderRequest::Shutdown`,
+    /// this is the supervisor receiving `HostVmRequest::Shutdown`,
     /// the guest dispatch loop processing it + replying `Bye`, then
     /// `mvm-builder-init` calling `reboot(RB_POWER_OFF)`, then the
     /// Vz supervisor exiting `main`. Consumes the child; subsequent

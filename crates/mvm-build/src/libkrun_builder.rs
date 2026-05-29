@@ -1206,7 +1206,7 @@ fn resolve_supervisor_path() -> Result<PathBuf, BuilderVmError> {
 /// Plan 89 W3 part 4 — spawn the supervisor with the given
 /// `cfg` piped to its stdin, return the live `Child` *without*
 /// waiting on it. Persistent-VM callers
-/// ([`LibkrunPersistentBuilderVm::start`]) consume the child via
+/// ([`LibkrunPersistentHostVm::start`]) consume the child via
 /// [`PersistentVmHandle`]; the single-shot
 /// [`spawn_supervisor_and_wait`] calls this then runs the wait
 /// loop on top.
@@ -1313,7 +1313,7 @@ fn spawn_supervisor_and_wait(
 }
 
 /// Plan 89 W2 part 4 — spawn a background thread that reads the
-/// `BuilderResponse::Result` frame `mvm-builder-init` sends over
+/// `HostVmResponse::Result` frame `mvm-builder-init` sends over
 /// AF_VSOCK port [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`]
 /// right before reboot (W2 part 3). Returns a `Receiver` the caller
 /// drains after the supervisor exits via [`log_vsock_response_outcome`].
@@ -1334,12 +1334,12 @@ fn spawn_supervisor_and_wait(
 #[cfg(feature = "builder-vm")]
 pub fn spawn_vsock_response_listener(
     vm_state_dir: &Path,
-) -> std::sync::mpsc::Receiver<crate::builder_protocol::BuilderResponseRead> {
+) -> std::sync::mpsc::Receiver<crate::builder_protocol::HostVmResponseRead> {
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use crate::builder_protocol::{BuilderResponseRead, read_builder_response};
+    use crate::builder_protocol::{HostVmResponseRead, read_host_vm_response};
 
     let (tx, rx) = mpsc::channel();
     let socket_path = vm_state_dir.join(format!(
@@ -1356,12 +1356,12 @@ pub fn spawn_vsock_response_listener(
             let start = Instant::now();
             let result = loop {
                 if start.elapsed() > connect_deadline {
-                    break BuilderResponseRead::Timeout;
+                    break HostVmResponseRead::Timeout;
                 }
                 match UnixStream::connect(&socket_path) {
                     Ok(mut stream) => {
                         let _ = stream.set_read_timeout(Some(read_timeout));
-                        break read_builder_response(&mut stream);
+                        break read_host_vm_response(&mut stream);
                     }
                     Err(_) => std::thread::sleep(poll_interval),
                 }
@@ -1388,13 +1388,13 @@ pub fn spawn_vsock_response_listener(
 /// signal.
 #[cfg(feature = "builder-vm")]
 pub fn log_vsock_response_outcome(
-    rx: std::sync::mpsc::Receiver<crate::builder_protocol::BuilderResponseRead>,
+    rx: std::sync::mpsc::Receiver<crate::builder_protocol::HostVmResponseRead>,
     file_exit_code: Option<i32>,
 ) {
-    use crate::builder_protocol::{BuilderResponse, BuilderResponseRead};
+    use crate::builder_protocol::{HostVmResponse, HostVmResponseRead};
 
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(BuilderResponseRead::Frame(BuilderResponse::Result {
+        Ok(HostVmResponseRead::Frame(HostVmResponse::Result {
             exit_code,
             job_timings,
             boot_timings,
@@ -1404,7 +1404,7 @@ pub fn log_vsock_response_outcome(
                 vsock_exit_code = exit_code,
                 build_ms = job_timings.build_ms,
                 boot_timings_present = boot_timings.is_some(),
-                "received BuilderResponse::Result via vsock dispatch channel (W2 part 3)"
+                "received HostVmResponse::Result via vsock dispatch channel (W2 part 3)"
             );
             if let Some(file_code) = file_exit_code
                 && file_code != exit_code
@@ -1417,19 +1417,19 @@ pub fn log_vsock_response_outcome(
                 );
             }
         }
-        Ok(BuilderResponseRead::Frame(other)) => {
+        Ok(HostVmResponseRead::Frame(other)) => {
             tracing::debug!(
                 ?other,
                 "vsock dispatch: non-Result frame ignored in single-shot"
             );
         }
-        Ok(BuilderResponseRead::EmptyEof) => {
+        Ok(HostVmResponseRead::EmptyEof) => {
             tracing::debug!(
                 "vsock dispatch: guest closed without sending — \
                  pre-W2-part-3 image, expected"
             );
         }
-        Ok(BuilderResponseRead::Timeout) => {
+        Ok(HostVmResponseRead::Timeout) => {
             tracing::debug!("vsock dispatch: receive thread timed out");
         }
         Err(_) => {
@@ -1678,7 +1678,7 @@ fn path_to_str<'a>(p: &'a Path, field: &str) -> Result<&'a str, BuilderVmError> 
 }
 
 // ============================================================
-// Plan 89 W3 part 4 — LibkrunPersistentBuilderVm
+// Plan 89 W3 part 4 — LibkrunPersistentHostVm
 // ============================================================
 
 /// Filename of the marker the host stages under `<job_dir>/` to
@@ -1694,7 +1694,7 @@ pub const DISPATCH_SOCK_MARKER: &str = "dispatch.sock.marker";
 /// produces a different shape of dispatch: instead of running a
 /// single cmd.sh / install_spec and powering off, the guest
 /// detects `<job_dir>/<DISPATCH_SOCK_MARKER>` and enters the
-/// dispatch loop that reads `BuilderRequest` frames over
+/// dispatch loop that reads `HostVmRequest` frames over
 /// AF_VSOCK port [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`].
 ///
 /// The caller pairs this with a `PersistentBuilderSupervisor`
@@ -1709,7 +1709,7 @@ pub const DISPATCH_SOCK_MARKER: &str = "dispatch.sock.marker";
 ///   part 8 — security amendments F2/F7).
 #[cfg(feature = "builder-vm")]
 #[derive(Debug, Clone)]
-pub struct LibkrunPersistentBuilderVm {
+pub struct LibkrunPersistentHostVm {
     vcpus: u8,
     memory_mib: u32,
     nix_store_mib: u32,
@@ -1720,7 +1720,7 @@ pub struct LibkrunPersistentBuilderVm {
 }
 
 #[cfg(feature = "builder-vm")]
-impl LibkrunPersistentBuilderVm {
+impl LibkrunPersistentHostVm {
     /// Construct a persistent builder VM rooted at `workspace_root`.
     /// Defaults match [`LibkrunBuilderVm::default`] for vCPUs / RAM /
     /// nix-store image size.
@@ -1762,7 +1762,7 @@ impl LibkrunPersistentBuilderVm {
     /// return a handle whose `dispatch_socket_path` the W3 part 1
     /// supervisor connects to. The returned `Child` is alive
     /// until either the guest dispatch loop processes a
-    /// `BuilderRequest::Shutdown` (clean exit) or the caller
+    /// `HostVmRequest::Shutdown` (clean exit) or the caller
     /// invokes [`PersistentVmHandle::kill`].
     pub fn start(&self) -> Result<PersistentVmHandle, BuilderVmError> {
         if !mvm_libkrun::is_available() {
@@ -1920,7 +1920,7 @@ impl PersistentVmHandle {
     /// Per-VM job directory bound at `/job` inside the guest.
     /// Hosts stage per-dispatch artifacts (`<job_dir_relpath>/cmd.sh`,
     /// per-dispatch install specs, etc.) here before sending the
-    /// matching `BuilderRequest::Run`.
+    /// matching `HostVmRequest::Run`.
     pub fn job_dir(&self) -> &Path {
         &self.job_dir
     }
@@ -1932,7 +1932,7 @@ impl PersistentVmHandle {
     }
 
     /// Block until the supervisor child exits. Normal way to
-    /// reach this is the supervisor sending `BuilderRequest::Shutdown`,
+    /// reach this is the supervisor sending `HostVmRequest::Shutdown`,
     /// the guest dispatch loop processing it + replying `Bye`,
     /// then `mvm-builder-init` calling `reboot(RB_POWER_OFF)`,
     /// then libkrun's `krun_start_enter` returning, then the
@@ -2637,7 +2637,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Plan 89 W3 part 4 — LibkrunPersistentBuilderVm
+    // Plan 89 W3 part 4 — LibkrunPersistentHostVm
     // -----------------------------------------------------------
 
     #[test]
@@ -2686,7 +2686,7 @@ mod tests {
         // Same vcpus / memory / nix-store defaults so users moving
         // from single-shot to persistent don't see surprise
         // resource shifts.
-        let vm = LibkrunPersistentBuilderVm::new(std::env::temp_dir());
+        let vm = LibkrunPersistentHostVm::new(std::env::temp_dir());
         assert_eq!(vm.vcpus, DEFAULT_VCPUS);
         assert_eq!(vm.memory_mib, DEFAULT_MEMORY_MIB);
         assert_eq!(vm.nix_store_mib, DEFAULT_NIX_STORE_MIB);
@@ -2694,7 +2694,7 @@ mod tests {
 
     #[test]
     fn persistent_vm_with_setters_override_defaults() {
-        let vm = LibkrunPersistentBuilderVm::new(std::env::temp_dir())
+        let vm = LibkrunPersistentHostVm::new(std::env::temp_dir())
             .with_vcpus(2)
             .with_memory_mib(2048)
             .with_nix_store_mib(8192);
@@ -2715,7 +2715,7 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let vm = LibkrunPersistentBuilderVm::new(&nonexistent);
+        let vm = LibkrunPersistentHostVm::new(&nonexistent);
         match vm.start() {
             Err(BuilderVmError::ExtractionFailed(msg)) => {
                 assert!(msg.contains("workspace_root"), "msg: {msg}");

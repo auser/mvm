@@ -86,7 +86,7 @@ pub struct BuilderMounts {
 ///
 /// `Serialize`/`Deserialize` + `#[serde(deny_unknown_fields)]` were
 /// added by Plan 89 W2 so `BuilderJob` can ride inside
-/// [`crate::builder_protocol::BuilderRequest::Run`] over the
+/// [`crate::builder_protocol::HostVmRequest::Run`] over the
 /// vsock-framed dispatch channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
