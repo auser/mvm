@@ -7,6 +7,7 @@ pub mod host_signer;
 #[allow(clippy::module_inception)]
 pub mod protocol;
 pub mod routing;
+pub mod signed_config;
 pub mod signing;
 pub mod vm_backend;
 

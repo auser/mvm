@@ -12,6 +12,11 @@ authors.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
+# Plan 104 §H-L3.6 / W1b.2b.3 — `protocol::signed_config` verifies
+# subprocess startup config envelopes via Ed25519. The verify path
+# is consumed by every subprocess crate at parse time; mvm-core is
+# the natural home since it already owns the wire-format types.
+ed25519-dalek.workspace = true
 mvm-providers.workspace = true
 mvm-libkrun.workspace = true
 serde.workspace = true
@@ -31,6 +36,11 @@ tempfile.workspace = true
 # host loopback). Workspace-pinned (already used by
 # `mvm-supervisor::proxy::l4`).
 ipnet = { workspace = true }
+
+[dev-dependencies]
+# `OsRng` for generating fresh ed25519 keys in signed_config tests
+# without committing static fixtures.
+rand.workspace = true
 
 [lints]
 workspace = true
