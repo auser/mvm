@@ -1,7 +1,7 @@
 //! `mvm-broker` binary — the general-broker subprocess entry point
-//! (Plan 104 §H-L1.3, ADR-061 §"Decision").
+//! (Plan 104 §H-L1.3, ADR-061 + ADR-062 §"Decision").
 //!
-//! Spawn contract (W1a):
+//! Spawn contract:
 //!
 //! 1. The supervisor cosign-verifies this binary at spawn (§H-L3.1 —
 //!    supervisor side, lands in W1b).
@@ -18,18 +18,27 @@
 //!    the supervisor side in W1b; defensive double-attach in this
 //!    binary lands at the same time).
 //!
-//! No handlers are registered in W1a, so every call returns
-//! `Err(NotBound)`. That's the W1a acceptance criterion per Plan 104
-//! §Build sequence W1.
+//! Handlers registered at startup:
+//!
+//! - `host.audit.v1` — workload-emitted audit emission (ADR-062). Only
+//!   registered when `cfg.audit_signer_uds_path` is set, since the
+//!   handler needs a UDS path to forward to. If the supervisor spawns
+//!   without an audit-signer (test fixtures, doctor probes), the
+//!   binary logs a warn and `host.audit.v1` calls return `NotBound`.
+//!
+//! `host.time.v1`, `host.cost.v1`, and `broker.v1` are still
+//! unregistered (W3 / W4a / W3 wave the handler scaffolds).
 
 use std::io::Read;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::net::UnixListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use mvm_broker::audit_client::AuditClient;
 use mvm_broker::config::{SubprocessConfig, parse as parse_config};
+use mvm_broker::handlers::host_audit_v1::HostAuditV1Handler;
 use mvm_broker::registry::Registry;
 use mvm_broker::server::serve_on_listener;
 
@@ -72,10 +81,13 @@ fn main() -> Result<()> {
     runtime.block_on(async move {
         let listener = UnixListener::bind(&cfg.uds_path)
             .with_context(|| format!("mvm-broker UDS bind failed on {}", cfg.uds_path.display()))?;
-        let registry = Arc::new(Registry::new());
+        let mut registry = Registry::new();
+        register_handlers(&mut registry, &cfg);
+        let registry = Arc::new(registry);
         info!(
             uds_path = %cfg.uds_path.display(),
-            "mvm-broker listening; no handlers registered (W1a — every call returns NotBound)"
+            handlers_registered = !registry.is_empty(),
+            "mvm-broker listening"
         );
         if let Err(e) = serve_on_listener(
             listener,
@@ -93,4 +105,27 @@ fn main() -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Register every handler that has a runtime dependency satisfied by
+/// the inbound `SubprocessConfig`. Anything missing logs a warn and
+/// leaves the registry without that handler; callers get
+/// `Err(NotBound)` for the missing service.
+fn register_handlers(registry: &mut Registry, cfg: &SubprocessConfig) {
+    match &cfg.audit_signer_uds_path {
+        Some(path) => {
+            let client = AuditClient::new(path.clone());
+            registry.register(Arc::new(HostAuditV1Handler::new(client)));
+            info!(
+                audit_signer_uds_path = %path.display(),
+                "host.audit.v1 handler registered"
+            );
+        }
+        None => {
+            warn!(
+                "host.audit.v1 NOT registered: SubprocessConfig.audit_signer_uds_path missing; \
+                 calls will return NotBound"
+            );
+        }
+    }
 }
