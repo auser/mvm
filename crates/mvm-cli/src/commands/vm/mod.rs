@@ -26,6 +26,7 @@ pub(super) mod run_plan;
 pub(super) mod sandbox;
 pub(super) mod session;
 pub(super) mod set_ttl;
+pub(super) mod tenant_resolution;
 pub(super) mod up;
 pub(super) mod volume;
 pub(super) mod wait;

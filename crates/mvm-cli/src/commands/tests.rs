@@ -2540,11 +2540,18 @@ fn _runparams_has_lifetime() {
 // ---- Plan-64 W3 admission flags ----
 
 #[test]
-fn test_up_tenant_defaults_to_local() {
+fn test_up_tenant_parse_default_is_none() {
+    // Plan 113 §Task 6 / ADR-064 §Decision 9 — the clap field is
+    // `Option<String>`; the `"local"` default has moved into
+    // `vm::tenant_resolution::resolve_tenant` so the 4-level
+    // precedence (built-in → config.toml → env → flag) can apply.
     let cli = Cli::try_parse_from(["mvmctl", "up"]).expect("parse");
     match cli.command {
         Commands::Up(up::Args { tenant, .. }) => {
-            assert_eq!(tenant, "local", "tenant defaults to 'local' per ADR-002");
+            assert!(
+                tenant.is_none(),
+                "tenant parse default is None; resolver fills `local` per ADR-064 §Decision 9",
+            );
         }
         _ => panic!("Expected Up command"),
     }
@@ -2554,7 +2561,9 @@ fn test_up_tenant_defaults_to_local() {
 fn test_up_tenant_override_via_flag() {
     let cli = Cli::try_parse_from(["mvmctl", "up", "--tenant", "acme"]).expect("parse");
     match cli.command {
-        Commands::Up(up::Args { tenant, .. }) => assert_eq!(tenant, "acme"),
+        Commands::Up(up::Args { tenant, .. }) => {
+            assert_eq!(tenant.as_deref(), Some("acme"))
+        }
         _ => panic!("Expected Up command"),
     }
 }
