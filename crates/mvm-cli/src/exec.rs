@@ -548,6 +548,13 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     // from the host — shell out into the VM instead.
     let (verity_path, roothash) = mvm_backend::microvm::probe_verity_sidecar(&rootfs);
 
+    // Plan 112 Phase 3c — template-restore VMs run without plan admission
+    // (this exec path predates plan-64). Leave tenant_id / plan_json /
+    // bundle_json at their None defaults (via `..Default::default()`) so
+    // the libkrun/Vz backends take the legacy `run_supervisor` dispatch.
+    // A future change to route template restores through admission would
+    // add an `admit_for_run` call here and a `populate_audit_substrate`
+    // invocation after the struct literal.
     let start_config = VmStartConfig {
         name: vm_name.clone(),
         rootfs_path: rootfs.clone(),
@@ -814,6 +821,12 @@ pub fn boot_session_vm(
 
     let (verity_path, roothash) = mvm_backend::microvm::probe_verity_sidecar(&rootfs);
 
+    // Plan 112 Phase 3c — session VMs are short-lived MCP-driven boots
+    // that don't go through plan admission. Leave tenant_id / plan_json
+    // / bundle_json at their None defaults so the libkrun supervisor
+    // stays on the legacy path. Adding session VMs to the audit chain is
+    // a separate scope decision (would require synthesis input +
+    // admission inside `boot_session_vm`).
     let start_config = VmStartConfig {
         name: vm_name.clone(),
         rootfs_path: rootfs.clone(),
