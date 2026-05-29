@@ -21,6 +21,7 @@ use super::host_signer::load_or_init_at;
 use super::managed_secrets::lower_workload_secrets;
 use super::plan_admission::{
     AdmittedPlan, BundleAdmissionContext, InMemoryNonceLedger, SystemClock, admit_for_run,
+    populate_audit_substrate,
 };
 use super::plan_builder::SynthesisInput;
 use super::policy_resolver::{
@@ -1303,7 +1304,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             deps_volume: deps_volume_binding.clone(),
         })?;
 
-        let start_config = mvm_core::vm_backend::VmStartConfig {
+        let mut start_config = mvm_core::vm_backend::VmStartConfig {
             name: vm_name.clone(),
             rootfs_path: rootfs,
             kernel_path: Some(kernel),
@@ -1311,6 +1312,13 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             memory_mib: direct_mem,
             ..Default::default()
         };
+        // Plan 112 Phase 3c — when admission produced an AdmissionContext,
+        // thread tenant_id / plan_json / bundle_json so libkrun/Vz take
+        // the bridge-factory path. None keeps the legacy supervisor path
+        // for no-admission flows.
+        if let Some(ctx) = admission.as_ref() {
+            populate_audit_substrate(&mut start_config, &ctx.admitted)?;
+        }
 
         let backend = AnyBackend::from_hypervisor(effective_hypervisor);
         if let Err(e) = backend.start(&start_config) {
@@ -1710,7 +1718,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         emit_launched_if(&admission_main, effective_hypervisor);
     } else {
         let (verity_path, roothash) = microvm::probe_verity_sidecar(&rootfs_path);
-        let start_config = VmStartParams {
+        let mut start_config = VmStartParams {
             name: vm_name,
             rootfs_path,
             vmlinux_path,
@@ -1729,6 +1737,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             port_mappings: &port_mappings,
         }
         .into_start_config();
+        // Plan 112 Phase 3c — thread audit substrate from admission_main
+        // through to backend.start() so libkrun/Vz take the bridge-factory
+        // path. None keeps the legacy supervisor path for no-admission flows.
+        if let Some(ctx) = admission_main.as_ref() {
+            populate_audit_substrate(&mut start_config, &ctx.admitted)?;
+        }
 
         // Apple Container with -d: install a launchd agent instead of
         // starting the VM in this process. The agent runs as a proper
@@ -2026,7 +2040,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                     continue;
                 }
             };
-            let w_start_config = VmStartParams {
+            let mut w_start_config = VmStartParams {
                 name: vm_name_owned.clone(),
                 rootfs_path: result.rootfs_path,
                 vmlinux_path: result.vmlinux_path,
@@ -2045,6 +2059,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 port_mappings: &w_port_mappings,
             }
             .into_start_config();
+            // Plan 112 Phase 3c — watch-loop re-boot uses its own fresh
+            // admission (watch_admission); same substrate threading as the
+            // main path. None → legacy supervisor path.
+            if let Some(ctx) = watch_admission.as_ref() {
+                populate_audit_substrate(&mut w_start_config, &ctx.admitted)?;
+            }
             let w_backend = AnyBackend::from_hypervisor(effective_hypervisor);
             if let Err(e) = w_backend.start(&w_start_config) {
                 emit_failed_if(&watch_admission, "backend-start", &e);
