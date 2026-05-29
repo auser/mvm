@@ -69,6 +69,9 @@ Specify size with `--volume`:
 mvmctl up --flake . --volume ./data:/data:1024
 ```
 
+For managed encrypted local volumes and workspace cleanup policy, see
+[Persistent workspaces](/guides/persistent-workspaces/).
+
 ## Filesystem Layout
 
 ```

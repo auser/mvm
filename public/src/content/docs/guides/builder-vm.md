@@ -104,6 +104,32 @@ The builder VM and runtime microVM have different jobs:
 
 Do not benchmark the builder VM when you want runtime boot time. The builder VM exists so that the host can ask for Linux builds without becoming a Linux build machine itself.
 
+## Persistent builder personas
+
+There are two builder personas in the developer experience:
+
+| Persona | Command shape | Interaction model | Purpose |
+|---|---|---|---|
+| Developer builder VM | `cargo run -- dev up` / `mvmctl dev up` | Persistent and debuggable; may open an interactive shell with `--shell`. | Keep the Linux development/build boundary warm while a developer iterates. |
+| Build worker VM | `cargo run -- build` / `mvmctl build` | Persistent but non-interactive. | Run normal Nix/image build jobs without making the user manage the VM. |
+
+The low-level persistent-builder controls already exist:
+
+```bash
+mvmctl persistent-builder start --workspace .
+mvmctl persistent-builder status
+mvmctl persistent-builder submit --flake path:/work --attr packages.aarch64-linux.default
+mvmctl persistent-builder stop
+```
+
+`mvmctl build` also has an explicit escape hatch:
+
+```bash
+mvmctl build --no-persistent-builder
+```
+
+The intended top-level DX is that developers do not need to invoke the low-level controls for normal use. `dev up` should ensure the interactive/developer builder is present, and `build` should use a persistent non-interactive builder by default when the platform supports it. If the persistent path is unavailable, the command should say why it fell back rather than silently changing the trust and performance model.
+
 ## Communication Model
 
 From the user's perspective, the interface is the host command:

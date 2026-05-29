@@ -8,7 +8,9 @@ mvm does **not** currently support native Windows as a local microVM host. The s
 - macOS Apple Silicon.
 - Native Linux with `/dev/kvm`.
 
-WSL2 with nested KVM is a future/experimental backend candidate, not a support promise. A managed Linux builder VM on Hyper-V is also future work.
+WSL2 with nested KVM is a future/experimental backend candidate, not a support promise. A managed Linux builder VM on Hyper-V is also future work, tracked in [mvm#428](https://github.com/tinylabscom/mvm/issues/428).
+
+For the full host/backend matrix, see [Platform support](/reference/platform-support/).
 
 ## Current Windows Guidance
 
@@ -62,6 +64,8 @@ The Docker tier exists as a convenience, not a sandbox. If your workload involve
 There isn't a maintained native-Windows microVM stack we support today. Hyper-V is the likely future Windows direction, but as a **managed Linux builder/backend VM**, not as part of the libkrun path.
 
 That future backend needs its own lifecycle, filesystem, networking, and trust model. Until it lands, native Windows remains unsupported.
+
+Tracking issue: [Future work: Windows host support via Windows Hypervisor Platform](https://github.com/tinylabscom/mvm/issues/428).
 
 ## Troubleshooting
 

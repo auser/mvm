@@ -3,7 +3,7 @@ title: "WSL2 notes for mvm"
 description: "Experimental WSL2 notes for mvm. WSL2 nested KVM is future backend work, not a supported local host today."
 ---
 
-This page captures WSL2 research notes for future Windows support. WSL2 is **not** a supported local microVM host today.
+This page captures WSL2 research notes for future Windows support. WSL2 is **not** a supported local microVM host today. Native Windows host support is tracked in [mvm#428](https://github.com/tinylabscom/mvm/issues/428).
 
 ## Why WSL2 for mvm
 
@@ -82,6 +82,8 @@ Two Windows paths remain plausible future work:
 - Hyper-V managed Linux builder/backend VM, with its own lifecycle and trust model.
 
 Neither path is part of the supported local platform matrix today.
+
+Tracking issue: [Future work: Windows host support via Windows Hypervisor Platform](https://github.com/tinylabscom/mvm/issues/428).
 
 ## See also
 

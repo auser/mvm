@@ -1,16 +1,44 @@
 ---
 title: CI/CD ephemeral builder
-description: Use mvm as a per-job clean builder in CI
+description: Use mvm in CI without preserving accidental runtime state.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+CI should prefer disposable runtime guests and explicit build artifacts.
 
-Lean on `guides/verify-release.md`.
+## Basic CI shape
 
-Cross-references:
-- guides/verify-release.md
--->
+```sh
+export MVM_DATA_DIR="$PWD/.mvm-ci"
 
-> This page is a placeholder. Content is being written — see plan 62.
+mvmctl doctor --json
+mvmctl build ./ci-worker --json
+mvmctl run --timeout 600 --receipt /tmp/mvm-run-receipt.json -- ./scripts/test.sh
+```
+
+Keep generated receipts as build artifacts when they are useful for audit or
+debugging. Do not persist the full runtime state unless the job explicitly
+needs a cache.
+
+## Cache policy
+
+It is reasonable to cache:
+
+- Nix store/substituter state in the builder environment;
+- downloaded release artifacts after verification;
+- manifest build slots for trusted branches.
+
+Avoid caching:
+
+- guest runtime directories from untrusted jobs;
+- snapshots that may contain secrets or source code;
+- broad host directories mounted read-write into the guest.
+
+## Cleanup
+
+```sh
+mvmctl down
+mvmctl manifest prune --orphans --dry-run
+mvmctl cache prune --orphan-builds
+```
+
+Use dry-run first on shared runners.

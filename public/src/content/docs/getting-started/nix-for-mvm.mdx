@@ -283,7 +283,7 @@ mvmctl forward hello -p 9090:9090
 mvmctl down hello
 ```
 
-The first build downloads dependencies and takes a few minutes. Subsequent builds with the same `flake.lock` are near-instant thanks to Nix caching.
+The first build downloads dependencies and takes a few minutes. Subsequent builds with the same `flake.lock` can be much faster because Nix reuses cached inputs and build outputs.
 
 :::tip[Run in the background]
 Add `-d` to run detached (like `docker run -d`):

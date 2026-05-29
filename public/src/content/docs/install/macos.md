@@ -5,6 +5,8 @@ description: "mvm on macOS supports Apple Silicon through Hypervisor.framework-b
 
 mvm on macOS is supported on **Apple Silicon (M-series)**. The local builder/runtime path uses Apple's Hypervisor.framework via Apple Container and libkrun-backed components. No Docker Desktop is required for the supported path.
 
+For the full host/backend matrix, see [Platform support](/reference/platform-support/).
+
 Intel Macs are not a supported local microVM host. Use a Linux machine with `/dev/kvm` or a remote Linux builder/runtime if you need first-class isolation from Intel macOS.
 
 ## Prerequisites

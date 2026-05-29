@@ -1,8 +1,105 @@
 ---
-title: mvm — MicroVM CLI
-description: Build and run microVMs on macOS and Linux with reproducible Nix flakes.
+title: mvm
+description: Security-first microVM sandboxes with a local runtime, Nix-first builds, OCI compatibility, and cold-mode recovery.
 template: splash
 hero:
   title: mvm
-  tagline: MicroVMs, Made Simple
+  tagline: Security-first sandboxes for every agent
 ---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+`mvm` is the local microVM runtime for agent and application sandboxes. It
+builds reproducible Linux guest images through a dedicated builder boundary,
+runs them with hardware isolation where available, records auditable runtime
+decisions, and can preserve state through cold-mode snapshot recovery.
+
+The default posture is security first: explicit policy, bounded resources,
+reproducible build inputs, no plaintext secrets in examples, and clear labels
+when an SDK helper is current versus a parity target.
+
+Current local targets are Linux execution and macOS. Windows is future work
+tracked in [mvm#428](https://github.com/tinylabscom/mvm/issues/428), not
+shipped support, until the implementation lands.
+
+## Quick start
+
+The current high-level SDK surface supports sandbox creation, file writes,
+command start, record mode, live mode, and cleanup helpers. Use plan mode first
+when you want admission and artifact inspection before booting a VM.
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+import mvm
+
+with mvm.Sandbox.create(
+    "python-3.12",
+    workload_id="quickstart",
+) as sandbox:
+    sandbox.files.write("/work/main.py", "print('hello from mvm')")
+    sandbox.commands.start(["python", "/work/main.py"])
+```
+
+```sh
+mvmctl run --mode plan ./quickstart.py
+mvmctl run --mode live ./quickstart.py
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { Sandbox } from "mvm-sdk";
+
+using sandbox = Sandbox.create("node-22", {
+  workloadId: "quickstart",
+});
+sandbox.files.write("/work/main.js", "console.log('hello from mvm')");
+sandbox.commands.start(["node", "/work/main.js"]);
+```
+
+```sh
+mvmctl run --mode plan ./quickstart.ts
+mvmctl run --mode live ./quickstart.ts
+```
+
+</TabItem>
+</Tabs>
+
+Runtime SDK scripts execute on the host process that starts them. Keep generated
+or untrusted program text inside files or commands sent to the guest.
+
+## Why this model
+
+| Property | Product behavior |
+| --- | --- |
+| Embeddable runtime | Use the CLI or language SDKs from local developer tools, CI jobs, agent loops, and test harnesses. |
+| Reproducible builds | Prefer pinned Nix inputs for guest images; use OCI images as a compatibility path with digest pinning and audit evidence. |
+| Stateful recovery | Stop, cold-store, snapshot, and restore sandbox state intentionally instead of hiding persistence behind an implicit cache. |
+| Hardware isolation | Run untrusted code inside a Linux guest boundary rather than in the host process. |
+| Audit everywhere | Preserve policy decisions, artifact identity, command outcomes, receipts, and retention choices. |
+| Secure defaults | Deny network by default, pass secrets by reference, bound outputs, and make cleanup explicit. |
+
+## Start here
+
+| Path | Use it when |
+| --- | --- |
+| [Installation](/getting-started/installation/) | You need the CLI and local runtime prerequisites. |
+| [Builder VM](/guides/builder-vm/) | You want to understand secure Linux image builds from a macOS or Linux host. |
+| [SDK overview](/sdk/) | You want the runtime SDK and decorator SDK model. |
+| [Nix and OCI](/guides/nix-and-oci/) | You need the Nix-first posture and OCI compatibility rules. |
+| [Cold mode](/working/cold-mode/) | You need pause, snapshot, and restore semantics. |
+| [Security claim ledger](/security/claim-ledger/) | You want to know which claims are shipped, preview, or planned. |
+
+## The model
+
+```text
+Developer or SDK
+  -> mvm host control plane
+  -> builder VM for Linux Nix builds
+  -> signed/audited runtime artifact
+  -> microVM backend
+  -> optional cold-mode snapshot recovery
+```

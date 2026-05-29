@@ -1,0 +1,96 @@
+---
+title: Programmatic use
+description: Drive mvmctl from scripts, CI jobs, and local automation.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Use `mvmctl` as the stable automation boundary when a language SDK does not
+yet expose the lifecycle operation you need.
+
+For a comparison of local control entry points, see
+[Control surfaces](/architecture/control-surfaces/).
+
+## Prefer JSON when available
+
+```sh
+mvmctl ls --json
+mvmctl build ./my-app --json
+mvmctl manifest info ./my-app --json
+mvmctl boot-report devbox --json
+mvmctl run --dry-run --json -- python task.py
+```
+
+JSON output is intended for scripts. Human output can change for readability.
+
+## Exit codes
+
+Treat non-zero exit as failure. Some commands use conventional `sysexits`
+values where the CLI can distinguish data errors, temporary failures, and
+timeouts; scripts should still branch on the command-specific JSON or stderr
+message when they need detail.
+
+For guest process execution, preserve the guest exit code separately from the
+host transport result when the command provides it.
+
+## State isolation for tests
+
+Use per-run state directories in CI so local developer state is not touched:
+
+```sh
+export MVM_DATA_DIR="$PWD/.mvm-test"
+export CARGO_TARGET_DIR="$PWD/.mvm-test/target"
+export CARGO_HOME="$PWD/.mvm-test/cargo"
+```
+
+The repository's `scripts/dev-env.sh`, `bin/dev`, and `just dev-*` wrappers
+apply this pattern for worktree development.
+
+## Secrets
+
+Do not pass secrets through argv. Prefer the local secret store:
+
+```sh
+printf '%s' "$TOKEN" | mvmctl secret put api-token --value -
+mvmctl secret get api-token
+```
+
+`secret get` checks presence and does not print the value.
+
+## Safe subprocess pattern
+
+Use argv arrays, not shell string interpolation:
+
+<Tabs syncKey="host-automation-language">
+<TabItem label="Python">
+
+```python
+import subprocess
+
+result = subprocess.run(
+    ["mvmctl", "manifest", "info", "./my-app", "--json"],
+    check=True,
+    text=True,
+    capture_output=True,
+)
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { spawnSync } from "node:child_process";
+
+const result = spawnSync("mvmctl", ["manifest", "info", "./my-app", "--json"], {
+  encoding: "utf8",
+});
+
+if (result.status !== 0) {
+  throw new Error(result.stderr);
+}
+```
+
+</TabItem>
+</Tabs>
+
+If you must invoke a shell, keep user input out of the shell string.

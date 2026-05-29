@@ -1,0 +1,187 @@
+---
+title: Observability and results
+description: Correlate command results, logs, receipts, audit IDs, boot reports, and metrics without exposing payload data.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Observability should explain what happened without copying sensitive payloads
+into every system that watches a sandbox. A result object, audit record, log
+line, metric, and receipt each have a different job.
+
+Use this guide when an SDK, agent tool, CI job, or service wrapper needs to
+return command status and enough evidence to debug or verify the run later.
+
+## Evidence model
+
+| Evidence | Best for | Do not store |
+| --- | --- | --- |
+| Command result | Immediate caller decision: success, failure, timeout. | Unbounded stdout/stderr or raw secrets. |
+| Receipt | Portable verification for one run. | Raw argv, env values, stdout, stderr, or host paths. |
+| Audit ID | Correlating local lifecycle and policy events. | Guest payload bytes. |
+| Logs | Operator debugging. | Unredacted secrets, full model prompts, large file contents. |
+| Boot report | Readiness and startup debugging. | Application payloads. |
+| Metrics | Dashboards, alerts, trend analysis. | Labels with argv, env values, file contents, or secret names. |
+
+Keep identifiers everywhere. Keep payloads only where the caller explicitly
+asked for bounded output.
+
+## CLI result workflow
+
+For a one-shot command:
+
+```sh
+mvmctl run \
+  --profile restrictive \
+  --json \
+  --receipt /tmp/agent-run-receipt.json \
+  -- python /work/task.py
+```
+
+Then verify and inspect:
+
+```sh
+mvmctl receipt verify /tmp/agent-run-receipt.json
+mvmctl audit tail -n 20
+mvmctl metrics --json
+```
+
+Store the receipt path, exit status, run identifier, audit identifier, and
+timeout state with the job record. Do not copy raw command output into audit
+metadata or metric labels.
+
+## Named sandbox workflow
+
+For a long-running sandbox:
+
+```sh
+mvmctl up ./service --name service-dev --metrics-port 9100
+mvmctl wait service-dev --for all
+mvmctl boot-report service-dev --json
+mvmctl logs service-dev -n 200
+mvmctl metrics --json
+```
+
+Use:
+
+- `boot-report` for launch and readiness questions;
+- `logs` for operator debugging;
+- `metrics` for health and trend data;
+- `audit tail` and `audit verify` for policy and lifecycle evidence.
+
+## SDK result target
+
+Runtime SDKs should converge on a bounded result shape:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+result = sandbox.commands.run(
+    ["python", "/work/task.py"],
+    timeout_seconds=30,
+    max_output_bytes=65536,
+)
+
+job_record = {
+    "sandbox_id": sandbox.id,
+    "exit_code": result.exit_code,
+    "timed_out": result.timed_out,
+    "stdout": redact(result.stdout),
+    "stderr": redact(result.stderr),
+    "run_id": result.run_id,
+    "audit_id": result.audit_id,
+    "receipt": result.receipt_path,
+}
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+const result = await sandbox.commands.run(["node", "/work/task.js"], {
+  timeoutSeconds: 30,
+  maxOutputBytes: 65536,
+});
+
+const jobRecord = {
+  sandbox_id: sandbox.id,
+  exit_code: result.exitCode,
+  timed_out: result.timedOut,
+  stdout: redact(result.stdout),
+  stderr: redact(result.stderr),
+  run_id: result.runId,
+  audit_id: result.auditId,
+  receipt: result.receiptPath,
+};
+```
+
+</TabItem>
+</Tabs>
+
+This is a product target. Check [Lifecycle matrix](/sdk/lifecycle-matrix/) and
+[Operations cookbook](/sdk/operations-cookbook/) before treating a helper as
+shipped in a specific language.
+
+## Redaction rules
+
+Redact before data leaves the process that received it:
+
+- secrets and credential-like strings;
+- model prompts or user data unless the caller explicitly asked for them;
+- guest file contents in error messages;
+- long stdout/stderr beyond a configured byte budget;
+- host paths that reveal local usernames or workspace layout;
+- network URLs with embedded credentials or tokens.
+
+If redaction fails or times out, return a redaction failure instead of sending
+unreviewed output to a model, ticket, trace, or shared log.
+
+## Metrics rules
+
+Good metric labels:
+
+- backend name;
+- lifecycle state;
+- policy profile;
+- result class;
+- exit status bucket;
+- timeout boolean;
+- image or artifact hash prefix when policy allows it.
+
+Bad metric labels:
+
+- command argv;
+- environment values;
+- secret names or values;
+- stdout or stderr fragments;
+- file paths containing user data;
+- model prompts, URLs with tokens, or request bodies.
+
+Metrics are for aggregate behavior. Use receipts and audit IDs for drill-down.
+
+## Failure classification
+
+Return typed failures to callers:
+
+| Failure | Example caller action |
+| --- | --- |
+| Validation failed | Reject the model/tool request before launch. |
+| Policy denied | Ask for a reviewed policy change or remove the operation. |
+| Build failed | Inspect build logs and artifact inputs. |
+| Boot not ready | Inspect boot report, backend logs, and guest readiness. |
+| Command failed | Return bounded stderr/stdout and exit code. |
+| Timeout | Stop, snapshot, or retry intentionally. |
+| Transport failed | Retry only if the operation is idempotent. |
+| Cleanup failed | Mark retained state sensitive and ask an operator to clean up. |
+
+Do not collapse these into one generic runtime error. Policy denial, command
+failure, timeout, and cleanup failure all imply different next steps.
+
+## Related pages
+
+- [Audit and receipts](/guides/audit-and-receipts/)
+- [Errors and metrics](/sdk/errors-metrics/)
+- [SDK operations cookbook](/sdk/operations-cookbook/)
+- [Agent tool contract](/guides/agent-tool-contract/)
+- [Lifecycle states](/working/lifecycle-states/)

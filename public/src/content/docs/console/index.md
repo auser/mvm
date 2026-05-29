@@ -1,23 +1,49 @@
 ---
 title: Console
-description: Interactive shell access to a running microVM
+description: Interactive shell access to a running mvm microVM.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+The console is the human debugging path into a running microVM. Use it when
+you need a terminal, a shell prompt, or a one-off command with terminal
+semantics.
 
-Section landing — what the console is (PTY-over-vsock interactive
-shell), the accessible-vs-sealed gate (dev images expose a console;
-production sealed images refuse), and how this differs from the
-programmatic `mvmctl vm proc` surface in "Working in the MicroVM."
+Programmatic automation should usually use `mvmctl exec`, `mvmctl proc`, or
+the SDK runtime surface instead. Those paths are easier to script, test, and
+audit.
 
-Cross-references:
-- console/attach
-- console/transparent-rebuild
-- working/commands
-- ADR-013 §"Guest agent supervision"
-- plan 60 W6.2 (`mvmctl console` accessible/sealed gate)
--->
+## Security model
 
-> This page is a placeholder. Content is being written — see plan 62.
+Console access is intentionally gated by the image mode. Development images can
+expose a console; sealed production images should refuse interactive shell
+access and rely on declared entrypoints, logs, guest RPC, and audit records.
+
+That distinction matters because an interactive shell is broad authority inside
+the guest. It is useful for debugging, but it is not the default control plane
+for production workloads.
+
+## Common commands
+
+```sh
+mvmctl up ./my-app --name devbox
+mvmctl console devbox
+mvmctl console devbox --command "uname -a"
+```
+
+Use `--command` for a one-shot shell command when you want console transport
+but not an interactive session. Use `mvmctl exec` for normal automation.
+
+## When to use which surface
+
+| Need | Prefer |
+| --- | --- |
+| Human debugging | `mvmctl console <name>` |
+| Scripted command execution | `mvmctl exec <name> -- <cmd>` |
+| Process lifecycle control | `mvmctl proc start/list/wait/kill` |
+| File transfer | `mvmctl fs` or `mvmctl cp` |
+| Service logs | `mvmctl logs <name>` |
+
+## Related pages
+
+- [Attach to a microVM](/console/attach/)
+- [Run commands & processes](/working/commands/)
+- [Filesystem operations](/working/filesystem/)

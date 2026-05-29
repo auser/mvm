@@ -1,19 +1,42 @@
 ---
-title: Sandbox for an AI agent
-description: Run an AI agent's tool calls inside a microVM
+title: AI agent sandbox
+description: Run agent tool code in an mvm microVM with explicit policy.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+Use this pattern when an agent needs Linux tools but generated code should not
+run directly on the host.
 
-End-to-end: agent-driven shell exec, file writes, network policy.
-Lean on the AI-agent workload framing in plan 60 §"Product
-positioning".
+For a stricter model-facing tool API, see [Agent tool contract](/guides/agent-tool-contract/).
 
-Cross-references:
-- plan 60
-- ADR-007
--->
+## Scaffold
 
-> This page is a placeholder. Content is being written — see plan 62.
+```sh
+mvmctl init ./agent-tool --preset python
+cd agent-tool
+$EDITOR flake.nix
+mvmctl build
+```
+
+Keep the flake pinned. Add only the packages the tool needs.
+
+## Run a tool call
+
+```sh
+mvmctl up . --name agent-tool
+mvmctl exec agent-tool -- python /work/tool.py
+```
+
+For one-off calls:
+
+```sh
+mvmctl run --timeout 20 -- python -c 'print("bounded tool call")'
+```
+
+## Security checklist
+
+- Validate model tool inputs before invoking `mvmctl`.
+- Start without network access unless the tool needs a named endpoint.
+- Keep host mounts narrow and read-only where possible.
+- Use secret references rather than plaintext command args.
+- Redact stdout/stderr before adding it to model context.
+- Stop, destroy, or cold-pause intentionally after the task.

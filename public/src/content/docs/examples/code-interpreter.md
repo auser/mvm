@@ -1,17 +1,38 @@
 ---
 title: Code interpreter pattern
-description: Stateful Python/JS execution inside a microVM
+description: Run user-provided code in a bounded mvm sandbox.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+A code interpreter accepts source text, runs it, and returns output. The
+important rule is that user code runs in the guest, not in the host process.
 
-Pattern for kernel-style stateful exec, streaming output. Generic
-— no vendor names.
+## One-shot interpreter
 
-Cross-references:
-- plan 41 (function-call entrypoints)
--->
+```sh
+mvmctl run --timeout 10 -- python - <<'PY'
+print("hello from inside the sandbox")
+PY
+```
 
-> This page is a placeholder. Content is being written — see plan 62.
+Use this shape for stateless calls where every invocation should start clean.
+
+## Persistent interpreter
+
+```sh
+mvmctl init ./interpreter --preset python
+mvmctl build ./interpreter
+mvmctl up ./interpreter --name interpreter
+mvmctl exec interpreter -- python /work/run_cell.py
+```
+
+Use a named VM when you intentionally want cached packages, files, or session
+state across cells.
+
+## Security checklist
+
+- Enforce input size limits before invoking the sandbox.
+- Set a timeout.
+- Bound stdout/stderr returned to the caller.
+- Disable network unless the interpreter needs named endpoints.
+- Never pass host credentials through argv.
+- Delete or snapshot state intentionally.

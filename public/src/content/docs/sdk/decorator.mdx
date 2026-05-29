@@ -1,0 +1,107 @@
+---
+title: Decorator SDK
+description: Declare reproducible mvm workloads in Python or TypeScript and compile them into Workload IR without running untrusted code.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+The decorator SDK is the build-time authoring surface. It lets a developer describe a workload next to the function or service it runs, then compile that declaration into the same Workload IR consumed by `mvmctl build` and `mvmctl up`.
+
+This is the declarative side of the product: code-first workload declaration, resource selection, image selection, and deploy metadata. The security difference is intentional: the static compiler reads source and extracts literal declarations without importing the module.
+
+For the full source-to-IR-to-build flow, see [Declaration workflow](/sdk/declaration-workflow/).
+For concrete declaration patterns, see [Declaration cookbook](/sdk/declaration-cookbook/).
+For host execution, guest execution, and artifact boundary rules, see [SDK security model](/sdk/security-model/).
+
+## Declaration examples
+
+<Tabs syncKey="decorator-declaration-language">
+<TabItem label="Python">
+
+```python
+import mvm
+
+@mvm.app(
+    name="agent-tool",
+    source=mvm.local_path("."),
+    image=mvm.nix_packages(["python312", "uv"]),
+    resources=mvm.resources(cpu_cores=1, memory_mb=512),
+    network=mvm.network(mode="deny", allow_https=["api.openai.com"]),
+    env={
+        "OPENAI_API_KEY": mvm.secret("openai-api-key"),
+    },
+    entrypoint=mvm.entrypoint_function(
+        module="tool",
+        function="run",
+        primary=True,
+    ),
+)
+def run(prompt: str) -> str:
+    ...
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import * as mvm from "mvm-sdk";
+
+export const run = mvm.app({
+  name: "agent-tool",
+  source: mvm.localPath("."),
+  image: mvm.nixPackages(["nodejs_22", "pnpm"]),
+  resources: mvm.resources({ cpu_cores: 1, memory_mb: 512 }),
+  network: mvm.network({ mode: "deny", allow_https: ["api.openai.com"] }),
+  env: {
+    OPENAI_API_KEY: mvm.secret("openai-api-key"),
+  },
+  entrypoint: mvm.entrypointFunction({
+    module: "tool",
+    function: "run",
+    primary: true,
+  }),
+})((prompt: string): string => {
+  return prompt;
+});
+```
+
+</TabItem>
+</Tabs>
+
+Compile and inspect:
+
+```sh
+mvmctl compile tool.py --out /tmp/agent-tool
+mvmctl build /tmp/agent-tool
+mvmctl up agent-tool
+```
+
+## Why static compile matters
+
+The safe path is static analysis: `mvmctl compile` reads the declaration and emits IR without importing and executing the user's source file. That keeps untrusted or side-effecting module import code out of the host process.
+
+Record-mode and live-mode runtime scripts exist for the imperative `Sandbox.create(...)` workflow, but they have a different trust posture because the user's script runs on the host process invoking the SDK. Prefer the static declaration form for security-sensitive deployable workloads.
+
+## Declaration fields
+
+| Field | Purpose | Security notes |
+| --- | --- | --- |
+| `source` | Files to package. | Should avoid broad host directories such as `$HOME`. |
+| `image` | Nix package set or OCI source. | Nix is preferred; OCI refs should be immutable for production. |
+| `resources` | CPU, memory, rootfs sizing. | Bounds prevent accidental host pressure. |
+| `network` | Egress and port policy. | Default should be deny unless explicitly opened. |
+| `env` | Literal values and secret references. | Use `mvm.secret`, not plaintext credentials. |
+| `entrypoint` | Function or command dispatch. | Dispatch runs in the guest microVM. |
+| hooks | Build/start/readiness/stop hooks. | Hooks must not bypass policy or fetch unpinned code. |
+
+## Relationship to runtime SDK
+
+The decorator SDK declares what to build and run. The runtime SDK owns a sandbox lifecycle from application code. They can be combined: a decorator declaration can produce a reproducible artifact, and a runtime SDK client can launch that artifact under explicit policy.
+
+## Related pages
+
+- [Declaration workflow](/sdk/declaration-workflow/)
+- [Declaration cookbook](/sdk/declaration-cookbook/)
+- [Runtime modes](/sdk/runtime-modes/)
+- [SDK security model](/sdk/security-model/)
+- [From Workload IR to MicroVM Image](/guides/ir-to-image/)

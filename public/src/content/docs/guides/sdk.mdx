@@ -3,6 +3,8 @@ title: SDK — Python and TypeScript
 description: Declare microVM workloads with the mvm Python and TypeScript SDKs. Decorator-style author surface; mvmctl compile / deploy compiles the same source statically without executing it.
 ---
 
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
 The mvm SDK lets you declare a microVM workload from a single
 decorated function in Python or TypeScript. Two routes from the same
 source file produce the same `Workload` IR:
@@ -13,7 +15,10 @@ source file produce the same `Workload` IR:
 - **Static compile**: `mvmctl compile app.py` walks the AST without
   importing the script. Same IR; the host never runs user code.
 
-## Python
+## Declaration
+
+<Tabs syncKey="declaration-language">
+<TabItem label="Python">
 
 ```python
 import mvm
@@ -48,7 +53,8 @@ mvmctl up hello-app
 mvmctl invoke hello-app --input name='ari'
 ```
 
-## TypeScript
+</TabItem>
+<TabItem label="TypeScript">
 
 ```ts
 import * as mvm from "mvm-sdk";
@@ -67,6 +73,18 @@ export const greet = mvm.app({
 })((name: string): string => `hello ${name}`);
 ```
 
+Build, run, invoke:
+
+```sh
+mvmctl compile examples/node/hello-app/app.ts --out /tmp/hello-app
+mvmctl build /tmp/hello-app
+mvmctl up hello-app
+mvmctl invoke hello-app --input name='ari'
+```
+
+</TabItem>
+</Tabs>
+
 ## Helper allowlist
 
 Both SDKs ship a closed set of helpers the static parser also
@@ -79,7 +97,7 @@ recognizes. Anything else in decorator kwarg position is rejected:
 | `nix_packages([...])`   | `Image::NixPackages`     | direct passthrough                             |
 | `resources(...)`        | `Resources`              | `cpu`/`memory_mb`/`rootfs_size_mb`             |
 | `network(mode=, ports=)`| `Network`                | `none` \| `bridge` \| `host`                   |
-| `secret(name, var=)`    | `EnvValue::SecretRef`    | host-mediated secret ref; guest sees placeholder only |
+| `secret(name, var=)`    | `EnvValue::SecretRef`    | host-mediated secret ref; guest sees opaque token only |
 | `literal(value)`        | `EnvValue::Literal`      | parity with `secret(...)`                      |
 | `hook(cmd)`             | `HookCmd`                | str → Shell; list → Argv                       |
 
@@ -100,18 +118,18 @@ the compiler merges them into the rootfs before the consuming app's
 hooks, in attachment order. The result lands in `launch.json` for the
 Nix factory to bake into `/etc/mvm/hooks/<phase>.sh`.
 
-## Deploy
+## Build artifacts
 
-Deployment to the hosted control plane is an `mvmd` responsibility. Use
-`mvmctl compile` to produce local build artifacts; mvmd consumes the same SDK
-compile/deploy libraries when it packages and accepts workloads.
+Use `mvmctl compile` to produce local build artifacts that can be reviewed,
+signed, built, and launched through the normal `mvm` workflow. Treat packaging
+and rollout as a separate admission step, not as part of declaration parsing.
 
 ## Secret semantics
 
 `mvm.secret(...)` names a managed secret reference, not a raw secret
 value.
 
-- The guest sees a normal env var name and an opaque placeholder
+- The guest sees a normal env var name and an opaque token
   value.
 - The raw secret stays on the host side.
 - Request-time release is supported only on host-mediated outbound

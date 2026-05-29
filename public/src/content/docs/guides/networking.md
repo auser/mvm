@@ -60,6 +60,7 @@ For debugging dev builds, use `mvmctl logs <name>` to view guest console output,
 ## Network Policies
 
 By default, microVMs have unrestricted internet access via NAT. Use `--network-preset` or `--network-allow` to restrict outbound traffic:
+For a deny-first review workflow, see [Network egress policy](/guides/network-egress-policy/).
 
 ```bash
 # Built-in presets

@@ -1,17 +1,67 @@
 ---
 title: Limits & resources
-description: CPU, memory, disk, and network limits
+description: CPU, memory, disk, network, and backend limits for local mvm workloads.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+Resource limits come from the manifest, CLI overrides, backend support, and
+host capacity. Do not treat a value as guaranteed just because the CLI accepts
+it; the selected backend still has to support the shape.
 
-Practical limits per backend; host requirements.
+## Manifest sizing
 
-Cross-references:
-- crates/mvm-core/src/metering.rs
-- crates/mvm-supervisor/src/instance_sampler.rs
--->
+```toml
+vcpus = 2
+mem = "1024M"
+data_disk = "0"
+```
 
-> This page is a placeholder. Content is being written — see plan 62.
+Use CLI overrides for local experimentation:
+
+```sh
+mvmctl build ./my-app --vcpus 4 --mem 2G --data-disk 8G
+mvmctl up ./my-app --cpus 4 --memory 2G
+```
+
+Commit the manifest values once the sizing is intentional.
+
+## Backend limits
+
+| Backend | Best for | Important limit |
+| --- | --- | --- |
+| Firecracker on Linux/KVM | Strongest local microVM isolation. | Requires `/dev/kvm` and Linux host support. |
+| Apple Virtualization / libkrun | macOS development and supported non-Linux paths. | Feature parity differs by macOS version and backend. |
+| Docker fallback | Convenience on hosts without microVM support. | Not a microVM isolation tier. |
+
+Always verify the active posture with:
+
+```sh
+mvmctl doctor
+```
+
+## Files and volumes
+
+Keep host mounts narrow. Use `mvmctl fs`, `mvmctl cp`, and declared volumes
+instead of broad writable host shares when running untrusted code.
+
+Snapshots and cold-mode artifacts may contain guest memory, generated files,
+and credentials present inside the guest. Treat them as sensitive state.
+
+## Network
+
+Network policy should start narrow and open only required destinations or
+ports. Port forwarding is explicit:
+
+```sh
+mvmctl forward devbox -p 8080:8080
+```
+
+Prefer loopback host binds for local development unless public exposure is an
+intentional part of the workflow.
+
+## Operational guidance
+
+- Leave CPU and memory headroom for the host and builder VM.
+- Size disk for the Nix store, rootfs artifacts, snapshots, and logs.
+- Use cleanup and manifest-prune commands for old build slots.
+- Do not publish performance or cold-start claims without naming backend,
+  artifact, host, and readiness boundary.

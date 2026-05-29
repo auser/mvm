@@ -1,0 +1,182 @@
+---
+title: Declaration workflow
+description: Compile Python and TypeScript workload declarations into Workload IR and staged build artifacts without importing user modules.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+The declaration workflow is the security-first path for deployable workloads.
+You write a small code declaration, `mvmctl compile` extracts the supported
+literal shape, and the result becomes Workload IR plus staged build artifacts.
+
+Use this path when you want code-first ergonomics without treating module import
+side effects as part of the build.
+
+## Workflow
+
+```sh
+mvmctl compile ./tool.py --out /tmp/tool-build
+mvmctl build /tmp/tool-build
+mvmctl up /tmp/tool-build --name tool-dev
+```
+
+The compile step accepts:
+
+- a Python declaration script with `@mvm.app(...)`;
+- a TypeScript declaration script with `mvm.app({...})(fn)`;
+- a Workload IR JSON file;
+- `-` for Workload IR JSON on stdin;
+- a runtime recording via `--from-recording <path>`.
+
+For declaration scripts, the compiler reads the source and extracts the
+supported declaration shape. For runtime recordings, the compiler lowers the
+recorded `Sandbox.create(...)` operations into Workload IR.
+
+## Language declarations
+
+<Tabs syncKey="declaration-language">
+<TabItem label="Python">
+
+```python
+import mvm
+
+@mvm.app(
+    name="agent-tool",
+    source=mvm.local_path("."),
+    image=mvm.nix_packages(["python312", "uv"]),
+    resources=mvm.resources(cpu_cores=1, memory_mb=512),
+    network=mvm.network(mode="deny"),
+    env={
+        "MODEL_PATH": mvm.literal("/data/model.bin"),
+        "API_KEY": mvm.secret("agent-api-key"),
+    },
+    entrypoint=mvm.entrypoint_function(
+        module="tool",
+        function="run",
+        primary=True,
+    ),
+)
+def run(prompt: str) -> str:
+    return prompt.upper()
+```
+
+Compile it:
+
+```sh
+mvmctl compile ./tool.py --out /tmp/agent-tool
+```
+
+The compiler handles the declaration. The function body is workload code; it is
+not run as part of static declaration extraction.
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import * as mvm from "mvm-sdk";
+
+export const run = mvm.app({
+  name: "agent-tool",
+  source: mvm.localPath("."),
+  image: mvm.nix_packages(["nodejs_22"]),
+  resources: mvm.resources({ cpu_cores: 1, memory_mb: 512 }),
+  network: mvm.network({ mode: "deny" }),
+  entrypoint: mvm.entrypoint_function({
+    module: "tool",
+    function: "run",
+    primary: true,
+  }),
+})((prompt: string): string => prompt.toUpperCase());
+```
+
+Compile it:
+
+```sh
+mvmctl compile ./tool.ts --out /tmp/agent-tool
+```
+
+For TypeScript, install a project-local runner when a script needs runtime
+recording fallback:
+
+```sh
+npm install --save-dev tsx
+```
+
+</TabItem>
+</Tabs>
+
+Static declaration extraction should be the default for deployable code. Runtime
+recording is useful for imperative sandbox scripts, but it has a different trust
+posture because the script executes on the host.
+
+## IR and archive inputs
+
+Compile a Workload IR file directly:
+
+```sh
+mvmctl compile --from-ir ./workload.json --out /tmp/agent-tool
+```
+
+Compile IR from stdin:
+
+```sh
+cat ./workload.json | mvmctl compile - --out /tmp/agent-tool
+```
+
+Compile a deterministic archive:
+
+```sh
+mvmctl compile --from-ir ./workload.json --out /tmp/agent-tool.tgz
+```
+
+Compile from an explicit runtime recording:
+
+```sh
+mvmctl compile --from-recording ./recording.json --out /tmp/agent-tool
+```
+
+Use IR inputs when another tool already produced the workload contract. Use
+recording inputs when an imperative sandbox script is the source of truth.
+
+## What compile produces
+
+The compile output is a staged build directory or deterministic archive. It
+contains the generated build inputs, launch metadata, and source bundle needed by
+the Nix-first image pipeline.
+
+Treat this output as a build artifact:
+
+- do not commit generated build directories by default;
+- do pin dependency inputs in the declaration and lockfiles;
+- do review generated IR when onboarding a new workload;
+- do rebuild when declaration, source, policy, or lockfiles change.
+
+## Static declarations versus runtime recordings
+
+| Property | Static declaration | Runtime recording |
+| --- | --- | --- |
+| Source shape | `@mvm.app(...)` or `mvm.app({...})(fn)`. | `Sandbox.create(...)` script. |
+| Host execution | Declaration extraction does not import the user module. | The SDK script runs on the host. |
+| Best for | Deployable workloads, review, CI admission. | Imperative local sandbox orchestration. |
+| Output | Workload IR and staged build inputs. | Runtime recording lowered to Workload IR. |
+
+Prefer static declarations when the workload will be reviewed, built in CI, or
+shared with another operator.
+
+## Security checklist
+
+- Keep declaration arguments literal and reviewable.
+- Use secret references, not raw credentials.
+- Use deny-by-default network policy unless a workload needs explicit egress.
+- Prefer Nix package images for reproducible builds.
+- Use digest-pinned OCI inputs only when demonstrating OCI compatibility.
+- Validate and review the generated IR before broadening policy.
+- Keep runtime recording scripts trusted because they execute on the host.
+
+## Related pages
+
+- [Decorator SDK](/sdk/decorator/)
+- [Declaration cookbook](/sdk/declaration-cookbook/)
+- [Runtime modes](/sdk/runtime-modes/)
+- [From Workload IR to MicroVM Image](/guides/ir-to-image/)
+- [Policy profiles](/guides/policy-profiles/)

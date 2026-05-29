@@ -209,7 +209,7 @@ PID 1 must be uid 0 (kernel mandate). Everything else can — and by default in 
 | `mvm-guest-agent` | 990 | Vsock RPC handler (never needs root); supervised by `/init` |
 | Entrypoint (workload) | **0 in dev**, **1000 in prod** | Your service or shell |
 
-> **Agent binary status:** as of Phase 1 W6.1.1 the agent at `/usr/local/bin/mvm-guest-agent` is a **placeholder stub** — a sh script that logs startup and sleeps. The supervision pattern is real (init forks it under uid 990 before setpriv-exec'ing the entrypoint); the vsock RPC surface lands when W6.1.2 swaps in the cross-compiled Rust binary. Every derivation surfaces `passthru.mvm.agentBinary = "stub" | "real"` so production deployments can refuse to boot a stub image.
+> **Agent binary status:** as of Phase 1 W6.1.1 the agent at `/usr/local/bin/mvm-guest-agent` is a **stub** — a sh script that logs startup and sleeps. The supervision pattern is real (init forks it under uid 990 before setpriv-exec'ing the entrypoint); the vsock RPC surface lands when W6.1.2 swaps in the cross-compiled Rust binary. Every derivation surfaces `passthru.mvm.agentBinary = "stub" | "real"` so production deployments can refuse to boot a stub image.
 
 The dev/prod default split is intentional:
 

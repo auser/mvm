@@ -1,20 +1,62 @@
 ---
 title: Run commands & processes
-description: Run shell commands in a microVM, stream output, manage background processes
+description: Run commands in a microVM and choose the right command surface.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+`mvm` has two command styles:
 
-Document `mvmctl vm proc` workflows: one-shot exec, streaming
-stdout/stderr, background processes, sending stdin. Pull examples
-from `crates/mvm-cli/src/commands/vm/proc.rs`.
+- one-shot sandboxes that boot, run a command, and exit;
+- commands inside an already-running named microVM.
 
-Cross-references:
-- guides/exec.md
-- crates/mvm-cli/src/commands/vm/proc.rs
-- crates/mvm-guest/src/process_rpc.rs
--->
+Use one-shot mode for isolated code execution. Use named-VM commands when you are working with persistent state, services, logs, or cold-mode recovery.
 
-> This page is a placeholder. Content is being written — see plan 62.
+## One-shot run
+
+```sh
+mvmctl run -- uname -a
+mvmctl run --profile restrictive -- python -c 'print("hello")'
+mvmctl run --timeout 30 --receipt /tmp/run-receipt.json -- python task.py
+```
+
+`mvmctl run` produces a transient sandbox. It can write a signed receipt with invocation hashes, output hashes, and exit status. Raw argv, env values, stdout, stderr, and host paths are not stored in the receipt.
+
+Use dry-run mode to inspect policy effects without booting:
+
+```sh
+mvmctl run --dry-run --json -- python task.py
+```
+
+## Named VM commands
+
+```sh
+mvmctl up ./my-app --name agent-sandbox
+mvmctl exec agent-sandbox -- python /work/task.py
+mvmctl logs agent-sandbox -f
+```
+
+Use this path when the VM has state, files, services, or snapshots that should survive across commands.
+
+## Profiles
+
+| Profile | Use it when | Notes |
+| --- | --- | --- |
+| `restrictive` | Running generated or untrusted code. | No env injection and no host directory shares. |
+| `standard` | Normal local runs. | Explicit env is allowed; host shares must be read-only. |
+| `dev` | Iterating on a local project. | Writable host shares are allowed. |
+| `permissive` | Last-resort debugging. | Requires explicit acknowledgement. |
+
+## Security notes
+
+- Prefer argv arrays and explicit command arguments.
+- Avoid passing secrets through command-line args.
+- Use receipts for automation and audit correlation.
+- Keep writable host shares out of untrusted runs.
+- Treat stdout and stderr as sensitive because guest code controls them.
+
+## Related pages
+
+- [Sandbox management](/working/sandbox-management/)
+- [Filesystem operations](/working/filesystem/)
+- [Policy profiles](/guides/policy-profiles/)
+- [Audit and receipts](/guides/audit-and-receipts/)
+- [Error handling](/tutorials/error-handling/)

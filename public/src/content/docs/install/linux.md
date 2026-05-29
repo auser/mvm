@@ -5,6 +5,8 @@ description: "mvm on Linux is the Tier 1 production target — Firecracker + KVM
 
 Linux is mvm's Tier 1 target. The full security posture (verified boot, jailer, seccomp tier "strict") and the project's tightest boot-time budget (≤ 200ms cold on Firecracker; ≤ 30ms snapshot-cloned) hold here. Other platforms get the same API surface via [ADR-013](/contributing/adr/013-libkrun-pivot/), but Linux is where mvm runs at full pace.
 
+For the full host/backend matrix, see [Platform support](/reference/platform-support/).
+
 ## Prerequisites
 
 You'll need:

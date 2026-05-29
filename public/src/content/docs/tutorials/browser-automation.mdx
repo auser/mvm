@@ -1,0 +1,74 @@
+---
+title: Browser automation
+description: Run browser automation inside a microVM with explicit credential, download, network, and persistence boundaries.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Browser automation is useful for agents, scraping, UI tests, and computer-use workflows. It is also high-risk because browsers handle cookies, downloads, credentials, and untrusted web content.
+
+## Build a browser-capable image
+
+Use a Nix flake target that includes the browser runtime and automation library:
+
+```sh
+cargo run -- build --flake . --profile browser
+```
+
+The build runs through the builder VM. The browser runs later inside the runtime microVM.
+
+## Run the automation
+
+```sh
+cargo run -- up browserbox --flake . --profile browser
+cargo run -- exec browserbox -- node /work/automation.js
+```
+
+## Security checklist
+
+- Use a dedicated sandbox per browser session unless state reuse is intentional.
+- Keep credentials out of the base image.
+- Prefer short-lived secret references over copied cookie files.
+- Restrict egress to the target domains when possible.
+- Treat downloads as untrusted files.
+- Snapshot browser state only when you are comfortable retaining cookies, cache, local storage, and downloaded content.
+
+## Planned runtime SDK shape
+
+> **Status:** Planned lifecycle API.
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+browser = Sandbox.create(
+    image="nix:./flake#browser",
+    network=NetworkPolicy.deny_by_default().allow_https("example.com"),
+)
+
+try:
+    browser.files.write("/work/automation.py", script.encode())
+    result = browser.exec(["python", "/work/automation.py"])
+finally:
+    browser.stop()
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+const browser = await Sandbox.create({
+  image: "nix:./flake#browser",
+  network: NetworkPolicy.denyByDefault().allowHttps("example.com"),
+});
+
+try {
+  await browser.files.write("/work/automation.js", script);
+  const result = await browser.exec(["node", "/work/automation.js"]);
+} finally {
+  await browser.stop();
+}
+```
+
+</TabItem>
+</Tabs>

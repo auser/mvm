@@ -74,20 +74,21 @@ mvmctl build --flake . --profile minimal
 mvmctl up --flake .
 ```
 
-## 4. Templates
+## 4. Manifests
 
-Build a base image once and share it across machines:
+A manifest is the project-local build contract. It sits next to `flake.nix`
+and records the flake target plus runtime sizing:
 
 ```bash
-mvmctl template create base-worker \
-    --flake . \
-    --profile minimal \
-    --role worker \
-    --cpus 2 --mem 1024
-
-mvmctl template build base-worker
-mvmctl up --manifest base-worker
+mvmctl init base-worker --preset worker
+cd base-worker
+$EDITOR mvm.toml
+mvmctl build
+mvmctl up
 ```
+
+Use `mvmctl manifest ls` and `mvmctl manifest info` to inspect built
+manifest slots. See [Manifests](/guides/manifests/) for the full flow.
 
 ## 5. Image Catalog
 

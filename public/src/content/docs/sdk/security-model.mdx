@@ -1,0 +1,133 @@
+---
+title: SDK security model
+description: Host execution, guest execution, secrets, network, audit, and state-retention rules for SDK workflows.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+The SDKs are developer ergonomics on top of the same local microVM model as
+`mvmctl`. They should make secure workflows easier, but they do not move trust
+boundaries by themselves. The important question for every SDK workflow is:
+which code runs on the host, which code runs in the guest, and which artifacts
+cross the boundary.
+
+## Trust boundaries
+
+| Boundary | What runs there | Security rule |
+| --- | --- | --- |
+| SDK client process | Python, TypeScript, or Rust code that calls the SDK. | Treat runtime SDK scripts as host code. Run only code you trust on developer machines and CI hosts. |
+| Static declaration compiler | Source parser and declaration extractor. | Prefer this path for deployable workloads because it can read declarations without importing user modules. |
+| Build boundary | Builder VM and build pipeline. | Linux builds, Nix evaluation, image assembly, and artifact verification belong in the builder boundary. |
+| Guest microVM | Workload entrypoints, generated code, tools, and services. | Guest code is isolated by the backend and policy; it is still allowed to create sensitive output. |
+| Host control plane | CLI admission, filesystem transfer, logs, receipts, policy, and backend control. | Every crossing should be explicit, bounded, and auditable. |
+
+## Mode safety
+
+| Mode | Host executes user SDK script | Guest executes workload | Use when |
+| --- | --- | --- | --- |
+| Static declaration | No module import | No | You need reviewable workload declarations and build inputs. |
+| Record | Yes | No | You trust the SDK script and want Workload IR or compile input. |
+| Plan | Yes | No | You trust the SDK script and want admission review before launch. |
+| Live | Yes | Yes | You trust the SDK script and are ready for VM boot, file writes, logs, audit events, and cleanup. |
+
+Runtime scripts are not a sandbox for the SDK script itself. They are a way to
+record or drive sandbox operations. The microVM boundary applies once admitted
+work executes in the guest.
+
+## Data crossing rules
+
+| Data | Direction | Rule |
+| --- | --- | --- |
+| Command args | Host to guest | Keep secrets out of argv; they are easy to log and audit. |
+| Environment | Host to guest | Prefer secret references or managed injection over plaintext values. |
+| File writes | Host to guest | Use narrow paths; reject traversal and broad host-directory mirroring. |
+| File reads | Guest to host | Treat returned bytes as untrusted and possibly sensitive. |
+| Logs | Guest/control plane to host | Redact credentials and bound log size before attaching logs to automation. |
+| Ports | Guest to host/network | Require explicit bindings and policy for every exposed service. |
+| Receipts and audit IDs | Runtime to host | Preserve them with job records so actions can be traced later. |
+| Snapshots and cold state | Guest/backend to host storage | Treat as sensitive state; memory and files can contain credentials and user data. |
+
+## Secure SDK defaults
+
+SDK examples should follow these defaults:
+
+- prefer static declarations for workloads that come from users, agents, or
+  review queues;
+- prefer Nix flake targets for reproducible, auditable images;
+- pin OCI inputs by digest when using compatibility images in production;
+- deny network access unless a workload declares the exact egress it needs;
+- use secret references rather than string literals in source code;
+- set explicit TTL, cleanup, or detach policy for every sandbox;
+- preserve receipt and audit identifiers in result objects;
+- require explicit snapshot retention and deletion choices;
+- surface backend capability errors instead of silently falling back to a less
+  secure lifecycle path.
+
+## Error handling
+
+SDK errors should distinguish:
+
+- policy denial;
+- build or admission failure;
+- guest command failure;
+- timeout;
+- transport failure;
+- cleanup failure;
+- snapshot or restore mismatch;
+- unsupported backend capability.
+
+Do not convert these into a single generic exception in application code. The
+caller needs different recovery behavior for policy denial, guest failure,
+transport failure, and cleanup failure.
+
+## Example policy posture
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+from mvm import NetworkPolicy, Sandbox, SecretRef
+
+with Sandbox.create(
+    image="nix:./flake#agent-runtime",
+    network=NetworkPolicy.deny_by_default().allow_https("api.openai.com"),
+    secrets={"OPENAI_API_KEY": SecretRef("openai-api-key")},
+    ttl_seconds=1800,
+) as sandbox:
+    result = sandbox.commands.run(["python", "/work/tool.py"], timeout_seconds=30)
+    print(result.stdout)
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { NetworkPolicy, Sandbox, SecretRef } from "@mvm/sdk";
+
+using sandbox = await Sandbox.create({
+  image: "nix:./flake#agent-runtime",
+  network: NetworkPolicy.denyByDefault().allowHttps("api.openai.com"),
+  secrets: { OPENAI_API_KEY: SecretRef.from("openai-api-key") },
+  ttlSeconds: 1800,
+});
+
+const result = await sandbox.commands.run(["node", "/work/tool.js"], {
+  timeoutSeconds: 30,
+});
+console.log(result.stdout);
+```
+
+</TabItem>
+</Tabs>
+
+This is the target SDK shape. Check [Lifecycle matrix](/sdk/lifecycle-matrix/)
+before treating a helper as shipped in a particular language.
+
+## Related pages
+
+- [Runtime modes](/sdk/runtime-modes/)
+- [Runtime SDK](/sdk/runtime/)
+- [Decorator SDK](/sdk/decorator/)
+- [Lifecycle matrix](/sdk/lifecycle-matrix/)
+- [Policy profiles](/guides/policy-profiles/)
+- [Audit and receipts](/guides/audit-and-receipts/)

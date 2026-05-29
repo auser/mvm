@@ -1,0 +1,84 @@
+---
+title: Code execution
+description: Execute commands and scripts inside an mvm microVM while keeping host state and secrets out of the default path.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Code execution is the core sandbox operation: run a process inside the guest and collect its exit code, stdout, and stderr.
+
+## CLI flow
+
+```sh
+cargo run -- up codebox --flake .
+cargo run -- exec codebox -- python - <<'PY'
+print("hello from the guest")
+PY
+```
+
+`exec` runs in the guest microVM. The host process sends the request through the guest control path and receives structured output.
+
+## Planned runtime SDK shape
+
+> **Status:** Planned lifecycle API.
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+from mvm import NetworkPolicy, Sandbox
+
+sandbox = Sandbox.create(
+    image="nix:./flake#python-tool",
+    network=NetworkPolicy.deny_by_default(),
+)
+
+try:
+    result = sandbox.exec(["python", "-c", "print('hello')"])
+    print(result.stdout)
+finally:
+    sandbox.stop()
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { Sandbox, NetworkPolicy } from "@mvm/sdk";
+
+const sandbox = await Sandbox.create({
+  image: "nix:./flake#python-tool",
+  network: NetworkPolicy.denyByDefault(),
+});
+
+try {
+  const result = await sandbox.exec(["python", "-c", "print('hello')"]);
+  console.log(result.stdout);
+} finally {
+  await sandbox.stop();
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Timeouts and errors
+
+Every execution path should carry:
+
+- command args;
+- timeout;
+- exit status;
+- stdout/stderr;
+- audit/run identifier;
+- redacted error detail.
+
+Do not put secrets in command args. Args are often visible in logs, metrics, audit labels, shell history, or process listings.
+
+## Security checklist
+
+- Use a fresh or cold-restored sandbox for untrusted code.
+- Keep network disabled unless the code needs it.
+- Prefer file upload/download over broad host mounts.
+- Redact stdout/stderr before sending it to an LLM transcript.
+- Destroy or snapshot intentionally; do not leave state ambiguous.

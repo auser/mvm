@@ -1,9 +1,14 @@
 ---
 title: Config & Secrets Injection
-description: Inject custom files onto microVM drives at boot time.
+description: Inject custom config files and tightly scoped secret files onto microVM drives at boot time.
 ---
 
 mvm supports injecting custom files onto the guest's config and secrets drives at boot time. Files are written to the drive images before the VM starts.
+
+Prefer managed secret references for credentials. Use secrets drives when a
+workload genuinely needs file-shaped material such as certificates or a
+compatibility config file. See [Secrets and credentials](/guides/secrets-and-credentials/)
+for the reference-first model.
 
 ## CLI Usage
 
@@ -11,7 +16,7 @@ mvm supports injecting custom files onto the guest's config and secrets drives a
 mkdir -p /tmp/my-config /tmp/my-secrets
 
 echo '{"gateway": {"port": 8080}}' > /tmp/my-config/app.json
-echo 'API_KEY=sk-...' > /tmp/my-secrets/app.env
+echo 'API_KEY_REF=openai-api-key' > /tmp/my-secrets/app.env
 
 mvmctl up --manifest my-app \
     --volume /tmp/my-config:/mnt/config \
@@ -23,7 +28,7 @@ The `--volume` (`-v` for short) flag uses the format `host_dir:/guest/path`:
 | Guest path | Drive | Permissions | Purpose |
 |---|---|---|---|
 | `/mnt/config` | `/dev/vdb` | Read-only (0444) | Application configuration |
-| `/mnt/secrets` | `/dev/vdc` | Read-only (0400) | API keys, tokens, credentials |
+| `/mnt/secrets` | `/dev/vdc` | Read-only (0400) | File-shaped secret material |
 
 Every file in the host directory is written to the corresponding drive image. For persistent volumes with explicit size, use the 3-part format: `--volume host:/guest/path:size`.
 
@@ -61,7 +66,7 @@ The managed-secret model is:
 
 1. Store a secret ref locally with `mvmctl secret put <name>`
 2. Declare that ref in `mvm.toml` or with `mvm.secret(...)`
-3. The guest sees only a normal env var name with an opaque placeholder
+3. The guest sees only a normal env var name with an opaque token
 4. Host-mediated surfaces such as `mvm.web_fetch` and `mvm.web_search`
    release the real value at request time when policy allows it
 
@@ -87,8 +92,8 @@ worked LLM-agent example showing the pattern end-to-end.
 ### Running with host-mounted config and secrets
 
 ```bash
-mvmctl template build openclaw
-mvmctl up --manifest openclaw --name oc \
+mvmctl build ./openclaw
+mvmctl up ./openclaw --name oc \
     -v nix/examples/openclaw/config:/mnt/config \
     -v nix/examples/openclaw/secrets:/mnt/secrets \
     -p 3000:3000
@@ -110,13 +115,13 @@ cat > /tmp/my-config/app.json << 'EOF'
 { "feature_flag": "value" }
 EOF
 
-# Create secrets — typically a .env file the service sources
+# Create a secret-reference file the service understands
 mkdir -p /tmp/my-secrets
-cat > /tmp/my-secrets/api-keys.env << 'EOF'
-ANTHROPIC_API_KEY=sk-ant-...
+cat > /tmp/my-secrets/secret-refs.env << 'EOF'
+ANTHROPIC_API_KEY_REF=anthropic-api-key
 EOF
 
-mvmctl up --manifest openclaw --name oc \
+mvmctl up ./openclaw --name oc \
     -v /tmp/oc-config:/mnt/config \
     -v /tmp/oc-secrets:/mnt/secrets \
     -p 3000:3000
@@ -127,15 +132,16 @@ A typical `mkGuest` service uses `preStart` to check for
 `command` script sources `/mnt/secrets/<env-file>` if present so
 environment variables are available to the service process.
 
-### Using snapshots for fast startup
+### Using snapshots for faster startup
 
-Build the template with `--snapshot` to capture a running VM state.
-Subsequent runs restore from the snapshot instead of cold-booting,
-reducing startup time from minutes to **1-2 seconds**:
+Build the manifest with `--snapshot` on a backend that supports it to capture a
+running VM state. Subsequent runs can restore from the snapshot instead of
+cold-booting. Published latency numbers must name the backend, host, artifact,
+and readiness boundary.
 
 ```bash
-mvmctl template build openclaw --snapshot
-mvmctl up --manifest openclaw --name oc \
+mvmctl build ./openclaw --snapshot
+mvmctl up ./openclaw --name oc \
     -v nix/examples/openclaw/config:/mnt/config \
     -v nix/examples/openclaw/secrets:/mnt/secrets \
     -p 3000:3000
@@ -145,7 +151,7 @@ When restoring from a snapshot with `-v` mounts, the guest agent
 automatically remounts config/secrets drives and restarts services
 with the fresh data.
 
-#### Snapshots + dynamic mounts = instant boots with flexible config
+#### Snapshots + dynamic mounts
 
 **Key insight:** the snapshot stores OS and application state
 (memory, running processes, compiled code caches), but **config and

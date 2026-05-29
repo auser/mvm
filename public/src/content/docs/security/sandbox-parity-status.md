@@ -39,7 +39,7 @@ requires editing both the marker and the visible cell.
 | `claims-hygiene`      | Public docs clearly distinguish Shipped, Preview, Planned, and Not claimed.                                              | **Shipped** |
 | `oci-ingest`          | Run digest-pinned OCI images in microVMs without Docker as the runtime.                                                  | **Planned** |
 | `network-policy`      | Deny-by-default egress with DNS pinning, SNI/Host enforcement, metadata endpoint protection, and audit.                  | **Planned** |
-| `secret-non-leakage`  | Workloads receive opaque placeholders; real secret values are substituted only by trusted host-side policy.              | **Planned** |
+| `secret-non-leakage`  | Workloads receive opaque secret tokens; real secret values are substituted only by trusted host-side policy.             | **Planned** |
 | `sdk-lifecycle`       | Python/TypeScript/Rust SDKs create, run, inspect, snapshot, and stop sandboxes with cleanup bound to the parent process. | **Planned** |
 | `cold-start`          | Latency numbers produced by a reproducible harness, split by fresh boot, guest-agent-ready, snapshot restore, warm pool. | **Planned** |
 | `filesystem-backends` | Local, encrypted, object-store, and in-memory filesystem substrates share one contract; mountable vs API-only is stated. | **Planned** |
@@ -100,21 +100,21 @@ Tracking work:
 Today, manually mounted secret files are still readable by the guest
 that receives them. ADR-048 §"Non-goals" explicitly states mvm will
 **not claim** secret non-leakage for that manual file-materialization
-path. The placeholder + host-side substitution path is Planned for
+path. The opaque-token + host-side substitution path is Planned for
 managed secret refs.
 
-To move to Preview: ship the `SecretPlaceholder` type, host-side
+To move to Preview: ship the managed secret token type, host-side
 grant registry, and L7-proxy substitution for at least one provider
 end-to-end, behind a default-off feature flag.
 
-To move to Shipped: the default flow is placeholder-based; redaction
+To move to Shipped: the default flow uses opaque tokens; redaction
 wrappers cover plan JSON, logs, audit, errors, cache keys, route
 labels, and panic output; hostile-guest exfiltration tests run in
 CI; explicit guest-visible file mounts remain manual opt-ins and are
 documented as such.
 
 Tracking work:
-[Plan 74 W3](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-claim-safe-sandbox-parity.md#w3--secret-placeholders-and-host-side-substitution).
+[Plan 74 W3](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-claim-safe-sandbox-parity.md).
 
 ### `sdk-lifecycle` — Planned
 
