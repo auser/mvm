@@ -389,3 +389,48 @@ uid because of a use case we didn't foresee):
   discourse (e.g. <https://emirb.github.io/blog/microvm-2026/>);
   the same defense-in-depth pattern is used by Fly.io Sprites,
   AWS Lambda SnapStart, Vercel Sandbox, and Kata Containers.
+
+## Appendix: Cardoso minimum-viable-policy checklist
+
+Maps Cardoso's five-bullet "minimum viable policy" from
+[A field guide to sandboxes for AI][cardoso] (2026-01-05) to mvm's
+posture against the 13 CI-enforced claims in §"The CI-enforced
+claims." Source-of-truth gap analysis at
+[`specs/research/sandboxes-for-ai-cardoso-gap-analysis.md`](../research/sandboxes-for-ai-cardoso-gap-analysis.md);
+workstream tracker at
+[`specs/plans/111-cardoso-gap-coordination.md`](../plans/111-cardoso-gap-coordination.md).
+
+[cardoso]: https://www.luiscardoso.dev/blog/sandboxes-for-ai
+
+| Cardoso bullet | mvm status | Mechanism / claim | Evidence |
+|---|---|---|---|
+| Default-deny outbound, then allowlist (or policy proxy) | **pass** | **claim 10** | `policy_default_is_deny_all`; `test_resolve_network_policy_default_is_deny_all`; `mvmctl up` warns on `unrestricted` policy with explicit env opt-out. DNS / broker / vsock carve-out audit tracked in Plan 111 Workstream A. |
+| No long-lived credentials; short-lived scoped tokens | **pass** | **claim 8** + **claim 13** | G4 validity window + nonce on signed `ExecutionPlan`; Plan 104 `host.secrets.v1` returns destination-bound, time-bound signed credentials; raw secret bytes never leave the supervisor's address space. |
+| Workspace-only filesystem; no host mounts beyond explicit shares | **pass** | **claim 1** | Per-service uid; seccomp `standard`; setpriv `--no-new-privs`; read-only bind-mounts on `/etc/{passwd,group,nsswitch.conf}`. |
+| Resource limits: CPU / memory / disk / timeouts / PIDs | **partial** | CPU + memory + disk wired; `ExecutionPlan.resources` scaffolded; `timeout_seconds` / `pid_limit` not populated | Plan 37 §3.3 to be extended; ADR-041 schema table to be amended (Plan 111 Workstream C). |
+| Observability — log process tree, network egress, failures | **pass** | **claim 8** + **claim 10** + **claim 12** | Chain-signed `~/.mvm/audit/<tenant>.jsonl`; `mvmctl audit verify` exits non-zero on tampering; service-call entries via `audit_chain_contains_service_call_entries`. |
+
+### Beyond Cardoso's minimum
+
+Properties mvm enforces that Cardoso's framework does not ask for.
+Listed here for the audit-cleanly reader.
+
+| Property | mvm status | Mechanism / claim |
+|---|---|---|
+| Hermetic builds — host environment never influences artifact | **pass** | "No host Nix, ever" (CLAUDE.md); source-checkout builds never depend on mvm-published artifacts (ADR-046) |
+| Signed admission-checked execution plans | **pass** | claim 8 |
+| Signed re-verified content-addressed bundles | **pass** | claim 9 |
+| Hash-locked, SBOM-bound, CVE-scanned, attested dependency volumes | **pass** | claim 11 (ADR-047) |
+| dm-verity rootfs that panics on tamper | **pass** | claim 3 |
+| Reproducibility double-build of host code | **pass** | claim 7 |
+| Production guest agent ships without `do_exec` | **pass** | claim 4 |
+| Host-side broker dispatch is binding-gated and audited | **pass** | claim 12 (Plan 104 / ADR-059) |
+| No raw secret crosses the broker channel | **pass** | claim 13 (Plan 104 / ADR-049 / ADR-059) |
+
+### Cardoso three-question summary
+
+| Question | mvm answer |
+|---|---|
+| What is shared between this code and the host? | KVM `/dev/kvm` ioctls (Linux); Hypervisor.framework calls (macOS Vz / libkrun); vsock for control plane + brokered host services (binding-gated per claim 12); one explicit virtio-fs share per declared mount. Host filesystem is never ambient. |
+| What can the code touch? | Whatever the signed `ExecutionPlan` admits: declared shares, declared egress allowlist (claim 10), declared volumes, declared `host.*` brokered services (claim 12 binding). No raw devices. No host process namespace. No host network namespace. |
+| What survives between runs? | Volumes the plan declares persistent (sealed deps volumes are RO and hash-locked per claim 11). Everything else is ephemeral by default. Snapshot/restore on workload microVMs not yet exposed — see Plan 111 Workstream B. SDK workload hooks (`before_build` / `before_start` / `after_start` / `before_stop` in `crates/mvm-sdk/src/compile/hooks.rs`) shape what runs at launch, not what survives across launches. |
