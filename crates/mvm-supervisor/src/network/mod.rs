@@ -342,6 +342,116 @@ impl ObserverAllowlist {
     }
 }
 
+/// Production entry — resolves the admitted plan's `network_policy` ref
+/// through the existing policy bundle convention (`<tenant>:<workload>`
+/// at `~/.mvm/policies/<tenant>/<workload>.toml`), reads the bundle's
+/// `network.observers` list, resolves each name through the
+/// `ObserverAllowlist`, capability-gates against the leaf, and returns
+/// the `Vec<Arc<dyn Observer>>` for `BridgeConfig.observers`.
+///
+/// The leaf capability is fixed at construction-time per backend:
+/// libkrun + Firecracker leaves report `payload_tap: true`; Vz drainer
+/// reports `payload_tap: false` (ADR-064 §Decision 8 / §Out of scope).
+///
+/// `local-default` plan refs short-circuit to empty observers without
+/// consulting the allowlist, so callers can use `resolve_observer_chain_from_plan`
+/// first to decide whether to load the allowlist at all.
+pub fn from_admitted(
+    plan: &mvm_plan::ExecutionPlan,
+    leaf_caps: ProviderCapabilities,
+    allowlist: &ObserverAllowlist,
+) -> Result<Vec<Arc<dyn Observer>>, BuildError> {
+    let observer_names = resolve_observer_chain_from_plan(plan)?;
+    if observer_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pipe = Pipeline::new();
+    for name in observer_names {
+        let obs = allowlist.resolve(&name)?;
+        pipe = pipe.observe(obs, leaf_caps)?;
+    }
+    Ok(pipe.build_observers())
+}
+
+/// Reads the policy bundle referenced by `plan.network_policy` and
+/// returns its `network.observers` list.
+///
+/// For the `local-default` plan ref (used by Stage 0 / dev mode), the
+/// observer chain is empty — and the allowlist is not consulted.
+///
+/// `mvm-supervisor` cannot depend on `mvm-cli` (would close a cycle:
+/// `mvm-cli → mvm-supervisor → mvm-cli`). Inline the same parse logic
+/// here: `"<tenant>:<workload>"` → `~/.mvm/policies/<tenant>/<workload>.toml`.
+/// Task 5 of Plan 113 adds `observers: Vec<String>` to
+/// `mvm_policy::NetworkPolicy`; this `BundleShim` reads the same field
+/// without requiring Task 5 to be done first. The shim stays private
+/// to this function so Task 5 can refactor cleanly to the real type.
+///
+/// `pub` (not `pub(crate)`) because `run_with_bridge` in the leaf bin
+/// crate `mvm-libkrun-supervisor` calls this to decide whether to
+/// load the allowlist at all — preserving the local-default
+/// short-circuit at the bin boundary.
+pub fn resolve_observer_chain_from_plan(
+    plan: &mvm_plan::ExecutionPlan,
+) -> Result<Vec<String>, BuildError> {
+    const LOCAL_DEFAULT: &str = "local-default";
+    let policy_ref = &plan.network_policy.0;
+    if policy_ref == LOCAL_DEFAULT {
+        return Ok(Vec::new());
+    }
+    let (tenant, workload) = match policy_ref.split_once(':') {
+        Some((t, w))
+            if !t.is_empty()
+                && !w.is_empty()
+                && !t.contains('/')
+                && !w.contains('/')
+                && !t.contains('\\')
+                && !w.contains('\\') =>
+        {
+            (t, w)
+        }
+        _ => {
+            return Err(BuildError::AllowlistRead {
+                path: policy_ref.clone(),
+                detail: format!("network_policy ref {policy_ref:?} is not in tenant:workload form"),
+            });
+        }
+    };
+    let home = std::env::var("HOME").map_err(|_| BuildError::AllowlistRead {
+        path: "$HOME unset".to_string(),
+        detail: "HOME is unset; cannot resolve policy bundle path".to_string(),
+    })?;
+    let path = std::path::PathBuf::from(home)
+        .join(".mvm/policies")
+        .join(tenant)
+        .join(format!("{workload}.toml"));
+    if !path.exists() {
+        return Err(BuildError::AllowlistRead {
+            path: path.display().to_string(),
+            detail: format!("policy bundle for {tenant}:{workload} not found at the expected path"),
+        });
+    }
+    let body = std::fs::read_to_string(&path).map_err(|e| BuildError::AllowlistRead {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    #[derive(serde::Deserialize)]
+    struct BundleShim {
+        #[serde(default)]
+        network: NetworkShim,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct NetworkShim {
+        #[serde(default)]
+        observers: Vec<String>,
+    }
+    let shim: BundleShim = toml::from_str(&body).map_err(|e| BuildError::AllowlistRead {
+        path: path.display().to_string(),
+        detail: format!("toml parse: {e}"),
+    })?;
+    Ok(shim.network.observers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +685,105 @@ mod tests {
         } else {
             panic!("wrong error: {err:?}");
         }
+    }
+
+    // Plan 113 §Task 4 — `from_admitted` + `resolve_observer_chain_from_plan`.
+
+    fn test_execution_plan_with_policy(policy_ref: &str) -> mvm_plan::ExecutionPlan {
+        use chrono::TimeZone;
+        use mvm_plan::{
+            AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement,
+            ExecutionPlan, FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PlanSeccompTier, PolicyRef,
+            PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef,
+            TenantId, TimeoutSpec, WorkloadId,
+        };
+        ExecutionPlan {
+            schema_version: SCHEMA_VERSION,
+            plan_id: PlanId("test-plan".into()),
+            plan_version: 1,
+            tenant: TenantId("test".into()),
+            workload: WorkloadId("test-workload".into()),
+            runtime_profile: RuntimeProfileRef("firecracker".into()),
+            image: SignedImageRef {
+                name: "img".into(),
+                sha256: "0".repeat(64),
+                cosign_bundle: None,
+            },
+            resources: Resources {
+                cpus: 1,
+                mem_mib: 256,
+                disk_mib: 1024,
+                timeouts: TimeoutSpec {
+                    boot_secs: 30,
+                    exec_secs: 60,
+                },
+            },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
+            network_policy: PolicyRef(policy_ref.into()),
+            fs_policy: FsPolicyRef("local-default".into()),
+            secrets: Vec::new(),
+            egress_policy: PolicyRef("local-default".into()),
+            tool_policy: PolicyRef("local-default".into()),
+            artifact_policy: ArtifactPolicy {
+                capture_paths: vec![],
+                retention_days: 0,
+            },
+            audit_labels: std::collections::BTreeMap::new(),
+            key_rotation: KeyRotationSpec { interval_days: 0 },
+            attestation: AttestationRequirement {
+                mode: AttestationMode::Noop,
+            },
+            release_pin: None,
+            post_run: PostRunLifecycle {
+                destroy_on_exit: true,
+                snapshot_on_idle: false,
+                idle_secs: 0,
+            },
+            valid_from: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            valid_until: chrono::Utc.with_ymd_and_hms(2026, 5, 1, 1, 0, 0).unwrap(),
+            nonce: Nonce::from_bytes([0xab; 16]),
+            bundle: None,
+            deps_volume: None,
+        }
+    }
+
+    #[test]
+    fn resolve_observer_chain_local_default_returns_empty() {
+        let plan = test_execution_plan_with_policy("local-default");
+        let names = resolve_observer_chain_from_plan(&plan).expect("local-default ok");
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn resolve_observer_chain_malformed_ref_errors() {
+        let plan = test_execution_plan_with_policy("not-a-policy-ref");
+        let err = resolve_observer_chain_from_plan(&plan).expect_err("must refuse malformed");
+        if let BuildError::AllowlistRead { detail, .. } = err {
+            assert!(detail.contains("tenant:workload"), "got: {detail}");
+        } else {
+            panic!("wrong error: {err:?}");
+        }
+    }
+
+    #[test]
+    fn from_admitted_local_default_returns_empty_observer_vec() {
+        // The local-default plan ref short-circuits BEFORE the allowlist is
+        // consulted; we still pass a valid allowlist so the call type-checks.
+        let f = write_allowlist(
+            "schema_version = 1\n[[observer]]\nname = \"flow-count-metrics\"\n",
+            0o600,
+        );
+        let alw = ObserverAllowlist::load_from_path(f.path()).expect("allowlist");
+
+        let plan = test_execution_plan_with_policy("local-default");
+        let caps = ProviderCapabilities {
+            flow_events: true,
+            payload_tap: true,
+        };
+        let observers = from_admitted(&plan, caps, &alw).expect("from_admitted");
+        assert!(observers.is_empty());
     }
 }

@@ -216,6 +216,41 @@ fn run_with_bridge(cfg: SupervisorConfig) -> Result<std::convert::Infallible> {
         "starting bridge-mode libkrun supervisor"
     );
 
+    // Plan 113 §Task 4 — observer chain from admitted plan + host
+    // allowlist. `resolve_observer_chain_from_plan` returns an empty
+    // Vec for the `local-default` plan ref WITHOUT consulting the
+    // allowlist; only non-default refs trigger the
+    // `~/.mvm/observers/allowlist.toml` load. This preserves the
+    // Stage 0 / dev-mode path (and the Plan 112 phase3c dispatch
+    // smoke, which uses a placeholder plan that fails decode before
+    // reaching this code).
+    //
+    // Leaf capabilities are fixed per backend: libkrun reports
+    // `payload_tap: true`. The Vz drainer (Plan 113 §Task 10) will
+    // set `payload_tap: false` from its own bin.
+    let leaf_caps = mvm_supervisor::network::ProviderCapabilities {
+        flow_events: true,
+        payload_tap: true,
+    };
+    let observer_names = mvm_supervisor::network::resolve_observer_chain_from_plan(&plan)
+        .context("resolve observer chain from admitted plan")?;
+    let observers = if observer_names.is_empty() {
+        Vec::new()
+    } else {
+        let allowlist = mvm_supervisor::network::ObserverAllowlist::load_from_host_config()
+            .context("load ObserverAllowlist from ~/.mvm/observers/allowlist.toml")?;
+        let mut pipe = mvm_supervisor::network::Pipeline::new();
+        for name in observer_names {
+            let obs = allowlist
+                .resolve(&name)
+                .context("resolve observer name in allowlist")?;
+            pipe = pipe
+                .observe(obs, leaf_caps)
+                .context("observer capability gate")?;
+        }
+        pipe.build_observers()
+    };
+
     let bridge_cfg = BridgeConfig {
         vm_name: vm_name.clone(),
         plan: Arc::new(plan),
@@ -223,12 +258,12 @@ fn run_with_bridge(cfg: SupervisorConfig) -> Result<std::convert::Infallible> {
         audit_socket,
         signer,
         policy: Arc::new(AllowAll),
-        // Plan 113 / ADR-064 — observers stay empty here until Task 4
-        // wires `Pipeline::from_admitted` to resolve them from the
-        // tenant policy bundle via the host allowlist. An empty `Vec`
-        // preserves pre-Plan-113 behavior exactly: signer_task fans
-        // out to zero observers, then signs the chain entry.
-        observers: Vec::new(),
+        // Plan 113 / ADR-064 — observers resolved above from the
+        // admitted plan's `network_policy` ref through the host
+        // allowlist. Empty for `local-default` plans (preserves
+        // pre-Plan-113 behavior); non-empty for tenant policies that
+        // reference an allowlisted observer by name.
+        observers,
     };
 
     run_supervisor_with_bridge(&cfg, move |bridge_fds| {
