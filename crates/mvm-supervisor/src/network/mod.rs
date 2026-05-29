@@ -195,8 +195,21 @@ impl ObserverAllowlist {
     /// wins over system-wide `/etc/mvm/observers/allowlist.toml`. Missing both
     /// surfaces a `BuildError::AllowlistRead` error explaining what the operator
     /// must create.
+    ///
+    /// HOME must be set for the per-user path to be considered. If HOME is
+    /// unset we refuse outright — we don't fall back to `/tmp` or any other
+    /// default, because a writable-by-anyone fallback directory would let a
+    /// local user place a malicious allowlist that any process running with
+    /// HOME unset (e.g. a misconfigured systemd unit or chroot) would trust.
+    /// Operator action in that case is "set HOME" or "place
+    /// /etc/mvm/observers/allowlist.toml" — both are explicit.
     pub(crate) fn load_from_host_config() -> Result<Self, BuildError> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let home = std::env::var("HOME").map_err(|_| BuildError::AllowlistRead {
+            path: "$HOME unset".to_string(),
+            detail: "HOME environment variable is not set; cannot resolve user allowlist path. \
+                     Either set HOME or run with /etc/mvm/observers/allowlist.toml present."
+                .into(),
+        })?;
         let user_path = std::path::PathBuf::from(home).join(".mvm/observers/allowlist.toml");
         if user_path.exists() {
             return Self::load_from_path(&user_path);
@@ -213,25 +226,61 @@ impl ObserverAllowlist {
         })
     }
 
+    /// Load and parse a single allowlist file.
+    ///
+    /// Hardened against TOCTOU + symlink races: the file is opened ONCE with
+    /// `O_NOFOLLOW` (so a symlink at `path` is rejected at open time with
+    /// `ELOOP`), then both the permission check and the content read use
+    /// that single file descriptor. This eliminates the window where an
+    /// attacker could swap the file between a `fs::metadata(path)` check
+    /// and a later `fs::read_to_string(path)`.
+    ///
+    /// Additionally verifies the file's UID matches the effective UID — a
+    /// config file owned by another user is not operator-trusted input,
+    /// even if its mode bits look correct.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self, BuildError> {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
-        let perm = std::fs::metadata(path)
+
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
             .map_err(|e| BuildError::AllowlistRead {
                 path: path.display().to_string(),
                 detail: e.to_string(),
-            })?
-            .permissions();
-        let mode = perm.mode() & 0o777;
+            })?;
+        let meta = f.metadata().map_err(|e| BuildError::AllowlistRead {
+            path: path.display().to_string(),
+            detail: e.to_string(),
+        })?;
+        let mode = meta.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Err(BuildError::AllowlistRead {
                 path: path.display().to_string(),
                 detail: format!("mode {mode:o}; expected 0600 (host-operator-trusted input)"),
             });
         }
-        let body = std::fs::read_to_string(path).map_err(|e| BuildError::AllowlistRead {
-            path: path.display().to_string(),
-            detail: e.to_string(),
-        })?;
+        let file_uid = meta.uid();
+        // SAFETY: `geteuid` is always safe — POSIX guarantees it cannot fail
+        // and has no side effects.
+        let effective_uid = unsafe { libc::geteuid() };
+        if file_uid != effective_uid {
+            return Err(BuildError::AllowlistRead {
+                path: path.display().to_string(),
+                detail: format!(
+                    "file uid {file_uid} does not match effective uid {effective_uid}; refusing"
+                ),
+            });
+        }
+        let mut body = String::new();
+        f.read_to_string(&mut body)
+            .map_err(|e| BuildError::AllowlistRead {
+                path: path.display().to_string(),
+                detail: e.to_string(),
+            })?;
         let parsed: AllowlistFile =
             toml::from_str(&body).map_err(|e| BuildError::AllowlistRead {
                 path: path.display().to_string(),
@@ -448,6 +497,70 @@ mod tests {
         let err = ObserverAllowlist::load_from_path(f.path()).expect_err("must refuse unknown");
         if let BuildError::AllowlistRead { detail, .. } = err {
             assert!(detail.contains("egress-redactor"), "detail was: {detail}");
+        } else {
+            panic!("wrong error: {err:?}");
+        }
+    }
+
+    /// Security regression: `load_from_path` must refuse to follow a symlink.
+    /// An attacker who can drop a symlink at the well-known allowlist path
+    /// (e.g. via a parent-directory race) could otherwise redirect us to a
+    /// file they control. `O_NOFOLLOW` causes the open call itself to fail
+    /// with `ELOOP` before we ever read metadata or content.
+    #[test]
+    fn allowlist_refuses_symlink_via_nofollow() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.toml");
+        std::fs::write(&target, "schema_version = 1\n").unwrap();
+        let mut perm = std::fs::metadata(&target).unwrap().permissions();
+        perm.set_mode(0o600);
+        std::fs::set_permissions(&target, perm).unwrap();
+
+        let link = dir.path().join("allowlist.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err =
+            ObserverAllowlist::load_from_path(&link).expect_err("symlink must be refused at open");
+        if let BuildError::AllowlistRead { detail, .. } = err {
+            // The OS-level error string varies (Linux: "Too many levels of
+            // symbolic links", macOS: "Too many levels of symbolic links" or
+            // similar). Asserting the variant + that we never reached the
+            // schema-parse stage is the contract.
+            assert!(
+                !detail.contains("schema_version"),
+                "must not have parsed content; detail was: {detail}"
+            );
+        } else {
+            panic!("wrong error: {err:?}");
+        }
+    }
+
+    /// Security regression: `load_from_path` must refuse a file whose UID
+    /// differs from the effective UID. A config file owned by another user
+    /// is not operator-trusted input even if its mode bits look correct.
+    ///
+    /// Skipped when not running as root because changing a file's owner to
+    /// a different UID requires `CAP_CHOWN`.
+    #[test]
+    fn allowlist_refuses_wrong_uid() {
+        // SAFETY: `geteuid` is always safe (see `load_from_path`).
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let f = write_allowlist("schema_version = 1\n", 0o600);
+        // SAFETY: `chown` is safe to call with a valid CString path; we
+        // change to uid 1 (typically "daemon" or "bin"), gid -1 (no change).
+        let c_path = std::ffi::CString::new(f.path().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::chown(c_path.as_ptr(), 1, u32::MAX) };
+        assert_eq!(rc, 0, "chown to uid 1 must succeed when running as root");
+
+        let err = ObserverAllowlist::load_from_path(f.path())
+            .expect_err("file owned by other uid must be refused");
+        if let BuildError::AllowlistRead { detail, .. } = err {
+            assert!(
+                detail.contains("uid") && detail.contains("refusing"),
+                "detail was: {detail}"
+            );
         } else {
             panic!("wrong error: {err:?}");
         }
