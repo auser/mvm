@@ -1,5 +1,5 @@
 [package]
-name = "mvm-builder-init"
+name = "mvm-host-vm-init"
 version.workspace = true
 edition.workspace = true
 description = "PID 1 for the libkrun builder VM — mounts /nix, runs /job/cmd.sh, powers off (Plan 72 W3)"
@@ -16,7 +16,7 @@ authors.workspace = true
 # from a Linux nix-build environment.
 
 [[bin]]
-name = "mvm-builder-init"
+name = "mvm-host-vm-init"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]

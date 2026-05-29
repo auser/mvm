@@ -75,6 +75,21 @@ pub enum HostVmRequest {
         job_dir_relpath: String,
     },
     Shutdown,
+    /// Plan 107 W6 / A2 — start a Firecracker workload microVM
+    /// inside the host VM. Payload carries only the workload id
+    /// today; A2.2 extends with the spawn config (kernel, rootfs,
+    /// vcpus, memory, kernel cmdline extras).
+    WorkloadStart {
+        workload_id: String,
+    },
+    /// Plan 107 W6 / A2 — stop a running workload microVM.
+    WorkloadStop {
+        workload_id: String,
+    },
+    /// Plan 107 W6 / A2 — query a workload microVM's status.
+    WorkloadStatus {
+        workload_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -121,8 +136,26 @@ pub fn parse(bytes: &[u8]) -> Result<HostVmRequest, ParseError> {
     match kind.as_str() {
         "shutdown" => Ok(HostVmRequest::Shutdown),
         "run" => parse_run(text),
+        "workload_start" => parse_workload(text, |workload_id| HostVmRequest::WorkloadStart {
+            workload_id,
+        }),
+        "workload_stop" => parse_workload(text, |workload_id| HostVmRequest::WorkloadStop {
+            workload_id,
+        }),
+        "workload_status" => parse_workload(text, |workload_id| HostVmRequest::WorkloadStatus {
+            workload_id,
+        }),
         other => Err(ParseError::UnknownKind(other.to_string())),
     }
+}
+
+fn parse_workload(
+    text: &str,
+    ctor: impl FnOnce(String) -> HostVmRequest,
+) -> Result<HostVmRequest, ParseError> {
+    let workload_id =
+        find_string_value(text, "workload_id").ok_or(ParseError::MissingRunField("workload_id"))?;
+    Ok(ctor(workload_id))
 }
 
 fn parse_run(text: &str) -> Result<HostVmRequest, ParseError> {

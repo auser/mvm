@@ -21,17 +21,17 @@ const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
 const BUILDER_VM_PROVENANCE_FILE: &str = ".mvm-provenance.json";
 /// Heuristic needle for `rootfs_contains_builder_init`. We used to scan
-/// for the contiguous bytes `/sbin/mvm-builder-init`, but ext4 stores
+/// for the contiguous bytes `/sbin/mvm-host-vm-init`, but ext4 stores
 /// each path component as a separate dirent — `sbin` and
-/// `mvm-builder-init` are never adjacent in the raw image — so a
-/// freshly-built rootfs that *has* the binary at `/sbin/mvm-builder-init`
-/// would fail the check. The basename `mvm-builder-init` is what
+/// `mvm-host-vm-init` are never adjacent in the raw image — so a
+/// freshly-built rootfs that *has* the binary at `/sbin/mvm-host-vm-init`
+/// would fail the check. The basename `mvm-host-vm-init` is what
 /// actually appears in the dirent (one of the file's `/etc/.../...`
 /// references is the embedded debug strings inside the Rust binary
 /// itself). The dev-prebuilt seed image case continues to work because
 /// the basename appears there too. False-positive risk is negligible:
-/// nothing else in the rootfs is named exactly `mvm-builder-init`.
-const BUILDER_INIT_PATH: &[u8] = b"mvm-builder-init";
+/// nothing else in the rootfs is named exactly `mvm-host-vm-init`.
+const HOST_VM_INIT_PATH: &[u8] = b"mvm-host-vm-init";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -1044,7 +1044,7 @@ fn download_published_stage0_bootstrap_image()
     let kernel = prebuilt_dir.join("vmlinux");
     let rootfs = prebuilt_dir.join("rootfs.ext4");
     ui::warn(
-        "No local Stage 0 dev image contains /sbin/mvm-builder-init; \
+        "No local Stage 0 dev image contains /sbin/mvm-host-vm-init; \
          downloading the verified published dev image as a bootstrap seed only. \
          The builder VM image will still be built from this source checkout.",
     );
@@ -1118,8 +1118,8 @@ fn find_local_fallback_image_with(
 }
 
 fn rootfs_contains_builder_init(rootfs: &std::path::Path) -> Result<bool> {
-    file_contains_bytes(rootfs, BUILDER_INIT_PATH)
-        .with_context(|| format!("scanning {} for /sbin/mvm-builder-init", rootfs.display()))
+    file_contains_bytes(rootfs, HOST_VM_INIT_PATH)
+        .with_context(|| format!("scanning {} for /sbin/mvm-host-vm-init", rootfs.display()))
 }
 
 fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> Result<bool> {
@@ -2265,7 +2265,7 @@ fn resolve_builder_vm_bootstrap_action(
 
 #[cfg(feature = "builder-vm")]
 const STAGE0_BOOTSTRAP_CMDLINE: &str =
-    "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
+    "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-host-vm-init";
 
 // Plan 77 W5 — Stage 0 seed contract.
 //
@@ -2274,7 +2274,7 @@ const STAGE0_BOOTSTRAP_CMDLINE: &str =
 // `bootstrap_builder_vm_image_via_dev_image_stage0` launches libkrun
 // against a seed image, [`validate_stage0_seed_contract`] reads the
 // sidecar and refuses to proceed if the seed predates the contract
-// (e.g. lacks `/sbin/mvm-builder-init`, which would kernel-panic at
+// (e.g. lacks `/sbin/mvm-host-vm-init`, which would kernel-panic at
 // PID 1). The check is a pure host-side file read — no VM boot, no
 // nix evaluation, no network — so the new failure path costs
 // milliseconds and surfaces a precise, actionable error before any
@@ -2314,7 +2314,7 @@ const STAGE0_ACCEPTED_IMAGE_KINDS: &[&str] = &["dev", "ur-seed"];
 /// is a metadata check, not a filesystem walk. See Plan 77 security
 /// consideration 13.
 #[cfg(feature = "builder-vm")]
-const STAGE0_REQUIRED_INIT_PATHS: &[&str] = &["/sbin/mvm-builder-init"];
+const STAGE0_REQUIRED_INIT_PATHS: &[&str] = &["/sbin/mvm-host-vm-init"];
 
 #[cfg(feature = "builder-vm")]
 #[derive(Debug, serde::Deserialize)]
@@ -2479,7 +2479,7 @@ impl std::error::Error for SeedContractError {
 ///
 /// Validates the `manifest.json` sidecar that the dev-image flake
 /// emits next to `rootfs.ext4`. On success, the seed is contractually
-/// compatible with the Stage 0 boot expectations (`/sbin/mvm-builder-init`
+/// compatible with the Stage 0 boot expectations (`/sbin/mvm-host-vm-init`
 /// as PID 1, etc.). On failure, the caller bails before any libkrun
 /// boot — turning what would be a 10-minute kernel-panic hang into a
 /// 2-second diagnosable error.
@@ -2559,7 +2559,7 @@ fn validate_stage0_seed_contract(
 fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
     if !rootfs_contains_builder_init(seed_rootfs)? {
         anyhow::bail!(
-            "Stage 0 seed rootfs at {} does not contain /sbin/mvm-builder-init; \
+            "Stage 0 seed rootfs at {} does not contain /sbin/mvm-host-vm-init; \
              this dev image cannot bootstrap the source-checkout builder VM cache.",
             seed_rootfs.display()
         );
@@ -2743,7 +2743,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     let (kernel, rootfs, source_label) = find_or_download_stage0_bootstrap_image().context(
         "source checkout builder VM cache is missing and no local Stage 0 dev image cache was found \
          under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/ \
-         that contains /sbin/mvm-builder-init. Failed to acquire a verified published dev-image \
+         that contains /sbin/mvm-host-vm-init. Failed to acquire a verified published dev-image \
          seed as the bootstrap fallback.",
     )?;
 
@@ -2751,7 +2751,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
         .with_context(|| format!("preparing Stage 0 seed manifest for {source_label}"))?;
 
     // Plan 77 W5 — preflight seed contract check. Catches the
-    // contract-stale dev-image-rootfs case (no `/sbin/mvm-builder-init`
+    // contract-stale dev-image-rootfs case (no `/sbin/mvm-host-vm-init`
     // -> kernel panics at PID 1, host hangs in `Child::wait` on the
     // libkrun supervisor) before any VM boot. The check runs before
     // staging-dir creation so a clean abort doesn't leave half-built
@@ -3139,7 +3139,7 @@ fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
     })?;
     if !rootfs_contains_builder_init(&rootfs)? {
         anyhow::bail!(
-            "Stage 0 builder VM artifact {} is missing /sbin/mvm-builder-init",
+            "Stage 0 builder VM artifact {} is missing /sbin/mvm-host-vm-init",
             rootfs.display()
         );
     }
@@ -3553,13 +3553,13 @@ fn stage0_dir_size_bytes(path: &std::path::Path) -> u64 {
 ///    which packages get installed.
 /// 2. The workspace `Cargo.lock` — `rustPlatform.buildRustPackage`
 ///    consumes it for the dep closure of every Rust binary baked
-///    into the rootfs (`mvm-builder-init`, `mvm-egress-proxy`).
-/// 3. The Rust sources of the in-VM binaries (`crates/mvm-builder-init/`,
+///    into the rootfs (`mvm-host-vm-init`, `mvm-egress-proxy`).
+/// 3. The Rust sources of the in-VM binaries (`crates/mvm-host-vm-init/`,
 ///    `crates/mvm-egress-proxy/`) — these are the actual PID-1 +
 ///    egress-proxy binaries the rootfs runs.
 ///
 /// Pre-2026-05 this function only hashed (1), with the result that
-/// contributor edits to `crates/mvm-builder-init/src/main.rs` (or
+/// contributor edits to `crates/mvm-host-vm-init/src/main.rs` (or
 /// any other Rust source baked into the rootfs) silently reused the
 /// cached `rootfs.ext4`. The bug burned the PR #420 dev-loop
 /// repeatedly: every test required manually `rm -rf
@@ -3624,7 +3624,7 @@ fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
     // closure `rustc` actually sees. `README.md`, `CHANGELOG.md`,
     // and other crate-root files don't influence the baked binary,
     // so they don't bust the Stage 0 cache (Plan 93 Phase 0).
-    for crate_name in ["mvm-builder-init", "mvm-egress-proxy"] {
+    for crate_name in ["mvm-host-vm-init", "mvm-egress-proxy"] {
         let crate_dir = workspace_root.join("crates").join(crate_name);
         if !crate_dir.is_dir() {
             anyhow::bail!(
@@ -4327,9 +4327,9 @@ mod dev_status_image_tests {
         let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
         rootfs[EXT4_MAGIC_OFFSET] = 0x53;
         rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
-        let init_offset = rootfs.len() - BUILDER_INIT_PATH.len() - 1;
-        rootfs[init_offset..init_offset + BUILDER_INIT_PATH.len()]
-            .copy_from_slice(BUILDER_INIT_PATH);
+        let init_offset = rootfs.len() - HOST_VM_INIT_PATH.len() - 1;
+        rootfs[init_offset..init_offset + HOST_VM_INIT_PATH.len()]
+            .copy_from_slice(HOST_VM_INIT_PATH);
         std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
     }
 
@@ -4341,7 +4341,7 @@ mod dev_status_image_tests {
 
     /// Stage the workspace prerequisites that `builder_vm_source_fingerprint`
     /// (post-PR #422) reads in addition to the flake dir itself:
-    /// `Cargo.lock` at the workspace root + stub `mvm-builder-init` and
+    /// `Cargo.lock` at the workspace root + stub `mvm-host-vm-init` and
     /// `mvm-egress-proxy` crate dirs. Without this, any test that calls
     /// the fingerprint helper against a fresh tempdir-rooted flake at
     /// `<tmp>/nix/images/builder-vm` blows up with
@@ -4354,7 +4354,7 @@ mod dev_status_image_tests {
     fn write_builder_vm_workspace_prereqs(workspace_root: &std::path::Path) {
         std::fs::write(workspace_root.join("Cargo.lock"), "# stub Cargo.lock\n")
             .expect("write Cargo.lock");
-        for crate_name in ["mvm-builder-init", "mvm-egress-proxy"] {
+        for crate_name in ["mvm-host-vm-init", "mvm-egress-proxy"] {
             let src = workspace_root.join("crates").join(crate_name).join("src");
             std::fs::create_dir_all(&src).expect("mkdir crate src");
             std::fs::write(
@@ -4505,9 +4505,9 @@ mod dev_status_image_tests {
         let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
         rootfs[EXT4_MAGIC_OFFSET] = 0x53;
         rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
-        let init_offset = rootfs.len() - BUILDER_INIT_PATH.len() - 1;
-        rootfs[init_offset..init_offset + BUILDER_INIT_PATH.len()]
-            .copy_from_slice(BUILDER_INIT_PATH);
+        let init_offset = rootfs.len() - HOST_VM_INIT_PATH.len() - 1;
+        rootfs[init_offset..init_offset + HOST_VM_INIT_PATH.len()]
+            .copy_from_slice(HOST_VM_INIT_PATH);
         std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
     }
 
@@ -4706,7 +4706,7 @@ mod dev_status_image_tests {
         let err = ensure_stage0_seed_manifest(&rootfs)
             .expect_err("seed without builder init must be rejected");
         assert!(
-            format!("{err:#}").contains("/sbin/mvm-builder-init"),
+            format!("{err:#}").contains("/sbin/mvm-host-vm-init"),
             "error should name missing Stage 0 init path: {err:#}"
         );
     }
@@ -5247,9 +5247,9 @@ mod builder_vm_bootstrap_tests {
         let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
         rootfs[EXT4_MAGIC_OFFSET] = 0x53;
         rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
-        let init_offset = rootfs.len() - BUILDER_INIT_PATH.len() - 1;
-        rootfs[init_offset..init_offset + BUILDER_INIT_PATH.len()]
-            .copy_from_slice(BUILDER_INIT_PATH);
+        let init_offset = rootfs.len() - HOST_VM_INIT_PATH.len() - 1;
+        rootfs[init_offset..init_offset + HOST_VM_INIT_PATH.len()]
+            .copy_from_slice(HOST_VM_INIT_PATH);
         std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
     }
 
@@ -5582,7 +5582,7 @@ mod builder_vm_bootstrap_tests {
     /// tmp/
     ///   Cargo.lock
     ///   crates/
-    ///     mvm-builder-init/{Cargo.toml,src/main.rs}
+    ///     mvm-host-vm-init/{Cargo.toml,src/main.rs}
     ///     mvm-egress-proxy/{Cargo.toml,src/main.rs}
     ///   nix/images/builder-vm/{flake.nix,flake.lock}
     /// ```
@@ -5592,7 +5592,7 @@ mod builder_vm_bootstrap_tests {
     fn write_builder_vm_workspace(tmp: &std::path::Path) -> std::path::PathBuf {
         std::fs::write(tmp.join("Cargo.lock"), "# stub Cargo.lock\n").expect("write Cargo.lock");
 
-        for crate_name in ["mvm-builder-init", "mvm-egress-proxy"] {
+        for crate_name in ["mvm-host-vm-init", "mvm-egress-proxy"] {
             let src = tmp.join("crates").join(crate_name).join("src");
             std::fs::create_dir_all(&src).expect("mkdir crate src");
             std::fs::write(
@@ -5647,7 +5647,7 @@ mod builder_vm_bootstrap_tests {
     }
 
     #[test]
-    fn builder_vm_source_fingerprint_changes_with_mvm_builder_init_source() {
+    fn builder_vm_source_fingerprint_changes_with_mvm_host_vm_init_source() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let flake = write_builder_vm_workspace(tmp.path());
         let first = builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("fingerprint");
@@ -5656,7 +5656,7 @@ mod builder_vm_bootstrap_tests {
         // the PID-1 binary source and `mvmctl dev up` silently
         // serves the stale cached rootfs.
         std::fs::write(
-            tmp.path().join("crates/mvm-builder-init/src/main.rs"),
+            tmp.path().join("crates/mvm-host-vm-init/src/main.rs"),
             "fn main() { println!(\"hello from edited builder-init\"); }\n",
         )
         .expect("rewrite main.rs");
@@ -5664,7 +5664,7 @@ mod builder_vm_bootstrap_tests {
 
         assert_ne!(
             first, second,
-            "edit to mvm-builder-init source must invalidate the builder-vm cache key"
+            "edit to mvm-host-vm-init source must invalidate the builder-vm cache key"
         );
     }
 
@@ -5700,8 +5700,8 @@ mod builder_vm_bootstrap_tests {
         // must NOT bust the Stage 0 cache — a contributor tweaking
         // docs shouldn't eat a 10-30 minute rebuild.
         std::fs::write(
-            tmp.path().join("crates/mvm-builder-init/README.md"),
-            "# mvm-builder-init\n\nAdded docs.\n",
+            tmp.path().join("crates/mvm-host-vm-init/README.md"),
+            "# mvm-host-vm-init\n\nAdded docs.\n",
         )
         .expect("write README");
         std::fs::write(
@@ -5729,8 +5729,8 @@ mod builder_vm_bootstrap_tests {
         // what rustPlatform.buildRustPackage produces, so the
         // fingerprint must pick it up.
         std::fs::write(
-            tmp.path().join("crates/mvm-builder-init/Cargo.toml"),
-            "[package]\nname = \"mvm-builder-init\"\nversion = \"0.0.1\"\n",
+            tmp.path().join("crates/mvm-host-vm-init/Cargo.toml"),
+            "[package]\nname = \"mvm-host-vm-init\"\nversion = \"0.0.1\"\n",
         )
         .expect("rewrite Cargo.toml");
         let second = builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("fingerprint");
@@ -5745,7 +5745,7 @@ mod builder_vm_bootstrap_tests {
     fn builder_vm_source_fingerprint_errors_when_cargo_toml_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let flake = write_builder_vm_workspace(tmp.path());
-        std::fs::remove_file(tmp.path().join("crates/mvm-builder-init/Cargo.toml"))
+        std::fs::remove_file(tmp.path().join("crates/mvm-host-vm-init/Cargo.toml"))
             .expect("rm Cargo.toml");
 
         let err = builder_vm_source_fingerprint(flake.to_str().unwrap())
@@ -5766,7 +5766,7 @@ mod builder_vm_bootstrap_tests {
         // changes the closure rustc sees, so the fingerprint must
         // reflect new files, not just modifications of existing ones.
         std::fs::write(
-            tmp.path().join("crates/mvm-builder-init/src/new_module.rs"),
+            tmp.path().join("crates/mvm-host-vm-init/src/new_module.rs"),
             "pub fn whatever() {}\n",
         )
         .expect("write new_module.rs");
@@ -5774,7 +5774,7 @@ mod builder_vm_bootstrap_tests {
 
         assert_ne!(
             first, second,
-            "new file in mvm-builder-init must invalidate the builder-vm cache key"
+            "new file in mvm-host-vm-init must invalidate the builder-vm cache key"
         );
     }
 
@@ -5810,11 +5810,11 @@ mod builder_vm_bootstrap_tests {
         // Place a `target/` both at the crate root (outside the
         // narrowed walk) and inside `src/` (inside the walk, exercising
         // the explicit skip).
-        let crate_target = tmp.path().join("crates/mvm-builder-init/target/debug");
+        let crate_target = tmp.path().join("crates/mvm-host-vm-init/target/debug");
         std::fs::create_dir_all(&crate_target).expect("mkdir crate target");
         std::fs::write(crate_target.join("garbage.rlib"), vec![0u8; 4096])
             .expect("write crate target garbage");
-        let src_target = tmp.path().join("crates/mvm-builder-init/src/target/debug");
+        let src_target = tmp.path().join("crates/mvm-host-vm-init/src/target/debug");
         std::fs::create_dir_all(&src_target).expect("mkdir src/target");
         std::fs::write(src_target.join("junk.rlib"), vec![0u8; 4096])
             .expect("write src/target garbage");
@@ -5841,10 +5841,10 @@ mod builder_vm_bootstrap_tests {
         // (outside the narrowed walk) and inside `src/` (inside the
         // walk, exercising the explicit skip).
         for path in [
-            "crates/mvm-builder-init/.swp",
-            "crates/mvm-builder-init/.DS_Store",
-            "crates/mvm-builder-init/src/.DS_Store",
-            "crates/mvm-builder-init/src/main.rs.swp",
+            "crates/mvm-host-vm-init/.swp",
+            "crates/mvm-host-vm-init/.DS_Store",
+            "crates/mvm-host-vm-init/src/.DS_Store",
+            "crates/mvm-host-vm-init/src/main.rs.swp",
         ] {
             std::fs::write(tmp.path().join(path), b"junk").expect("write hidden");
         }
@@ -5876,12 +5876,12 @@ mod builder_vm_bootstrap_tests {
     fn builder_vm_source_fingerprint_errors_when_in_vm_crate_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let flake = write_builder_vm_workspace(tmp.path());
-        std::fs::remove_dir_all(tmp.path().join("crates/mvm-builder-init")).expect("rm crate dir");
+        std::fs::remove_dir_all(tmp.path().join("crates/mvm-host-vm-init")).expect("rm crate dir");
 
         let err = builder_vm_source_fingerprint(flake.to_str().unwrap())
             .expect_err("missing in-VM crate dir must be a hard error");
         assert!(
-            err.to_string().contains("mvm-builder-init"),
+            err.to_string().contains("mvm-host-vm-init"),
             "error must name the missing crate: {err}"
         );
     }
@@ -6323,7 +6323,7 @@ mod builder_vm_bootstrap_tests {
       "contract_version": 2,
       "image_kind": "dev",
       "system": "aarch64-linux",
-      "init_paths": ["/sbin/mvm-builder-init"]
+      "init_paths": ["/sbin/mvm-host-vm-init"]
     }"#;
 
     #[test]
@@ -6341,7 +6341,7 @@ mod builder_vm_bootstrap_tests {
           "schema_version": 1,
           "contract_version": 2,
           "image_kind": "dev",
-          "init_paths": ["/sbin/mvm-builder-init"]
+          "init_paths": ["/sbin/mvm-host-vm-init"]
         }"#;
         let rootfs = write_seed_manifest_fixture(tmp.path(), manifest);
         validate_stage0_seed_contract(&rootfs)
@@ -6381,7 +6381,7 @@ mod builder_vm_bootstrap_tests {
               "schema_version": {},
               "contract_version": 2,
               "image_kind": "dev",
-              "init_paths": ["/sbin/mvm-builder-init"]
+              "init_paths": ["/sbin/mvm-host-vm-init"]
             }}"#,
             STAGE0_SUPPORTED_MANIFEST_SCHEMA + 1
         );
@@ -6398,7 +6398,7 @@ mod builder_vm_bootstrap_tests {
           "schema_version": 1,
           "contract_version": 2,
           "image_kind": "builder-vm",
-          "init_paths": ["/sbin/mvm-builder-init"]
+          "init_paths": ["/sbin/mvm-host-vm-init"]
         }"#;
         let rootfs = write_seed_manifest_fixture(tmp.path(), manifest);
         let err = validate_stage0_seed_contract(&rootfs).expect_err("wrong image_kind must fail");
@@ -6414,7 +6414,7 @@ mod builder_vm_bootstrap_tests {
               "schema_version": 1,
               "contract_version": {},
               "image_kind": "dev",
-              "init_paths": ["/sbin/mvm-builder-init"]
+              "init_paths": ["/sbin/mvm-host-vm-init"]
             }}"#,
             STAGE0_REQUIRED_CONTRACT_VERSION - 1
         );
@@ -6445,7 +6445,7 @@ mod builder_vm_bootstrap_tests {
         let SeedContractError::MissingInitPath { missing, .. } = &err else {
             panic!("expected MissingInitPath, got {err:?}");
         };
-        assert_eq!(*missing, "/sbin/mvm-builder-init");
+        assert_eq!(*missing, "/sbin/mvm-host-vm-init");
         assert_eq!(err.audit_reason(), "seed_contract_missing_init_path");
     }
 
@@ -6489,7 +6489,7 @@ mod builder_vm_bootstrap_tests {
             },
             SeedContractError::MissingInitPath {
                 manifest_path: rootfs.clone(),
-                missing: "/sbin/mvm-builder-init",
+                missing: "/sbin/mvm-host-vm-init",
                 present: vec!["/sbin/other".to_string()],
             },
         ];

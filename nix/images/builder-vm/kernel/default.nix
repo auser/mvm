@@ -10,7 +10,7 @@
 #
 # Why slim:
 #   The stock `pkgs.linuxPackages.kernel` ships hundreds of `=m`
-#   modules we never load. With a stock kernel, `mvm-builder-init`
+#   modules we never load. With a stock kernel, `mvm-host-vm-init`
 #   has to modprobe each module it needs at the right time (overlay
 #   before mount, vsock before socket(), iptables before rule
 #   install) and the guest needs a `/lib/modules/<kver>/` tree

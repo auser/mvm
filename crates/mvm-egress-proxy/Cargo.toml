@@ -12,13 +12,13 @@ authors.workspace = true
 # libkrun builder VM as the only legal egress path during the
 # application-deps install. On macOS / Windows the binary still
 # compiles (workspace ergonomics for contributors) but `main()`
-# prints a hint and exits 1, mirroring `mvm-builder-init`. The
+# prints a hint and exits 1, mirroring `mvm-host-vm-init`. The
 # allowlist + CONNECT-parser modules are pure-Rust and cross-
 # platform so `cargo test` exercises them on every developer host.
 #
 # No tokio: a CONNECT proxy is one thread per accepted socket
 # (`std::net::TcpListener` + `std::thread::spawn`), so we save
-# the ~3 MiB closure tokio drags in. mvm-builder-init's size
+# the ~3 MiB closure tokio drags in. mvm-host-vm-init's size
 # budget cares about the init binary, not this one — but keeping
 # the proxy slim too means a `nix build` of the builder VM
 # rootfs doesn't balloon either.

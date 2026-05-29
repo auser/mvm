@@ -216,7 +216,7 @@ pub struct KrunDisk {
 /// - `tag = "job"`   → per-build job dir with `cmd.sh` / `env` / `result`
 ///
 /// Read/write semantics at the guest are controlled by `mount` flags
-/// inside the guest (`mvm-builder-init` mounts each tag with the
+/// inside the guest (`mvm-host-vm-init` mounts each tag with the
 /// right flags); libkrun's `krun_add_virtiofs` does not currently
 /// expose a `readonly` toggle on the host side.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

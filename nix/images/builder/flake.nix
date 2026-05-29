@@ -102,7 +102,7 @@
       # Stage 0 bootstrap support: source checkouts must not download
       # a published builder-VM image. When the real builder-VM cache is
       # empty, mvmctl can boot an already-cached dev image with
-      # `init=/sbin/mvm-builder-init` and ask it to build
+      # `init=/sbin/mvm-host-vm-init` and ask it to build
       # `nix/images/builder-vm`. That requires the dev image to carry
       # the same PID-1 binary, even though normal `mvmctl dev up`
       # boots via `/init`.
@@ -111,17 +111,17 @@
           pkgs = import nixpkgs { inherit system; };
         in
         pkgs.rustPlatform.buildRustPackage {
-          pname = "mvm-builder-init";
+          pname = "mvm-host-vm-init";
           version = "0.14.0";
           src = workspace;
           cargoLock = {
             lockFile = workspace + "/Cargo.lock";
           };
-          buildAndTestSubdir = "crates/mvm-builder-init";
+          buildAndTestSubdir = "crates/mvm-host-vm-init";
           doCheck = false;
           meta = {
             description = "PID-1 for local builder VM bootstrap";
-            mainProgram = "mvm-builder-init";
+            mainProgram = "mvm-host-vm-init";
           };
         };
 
@@ -142,8 +142,8 @@
             packages = builderPackages pkgs;
             kernel = kernelPkg;
             extraFiles = {
-              "/sbin/mvm-builder-init" =
-                "${builderInit}/bin/mvm-builder-init";
+              "/sbin/mvm-host-vm-init" =
+                "${builderInit}/bin/mvm-host-vm-init";
             };
           };
           kernelFile =
@@ -212,7 +212,7 @@
               "contract_version": 2,
               "image_kind": "dev",
               "system": "${system}",
-              "init_paths": ["/sbin/mvm-builder-init"]
+              "init_paths": ["/sbin/mvm-host-vm-init"]
             }
             MANIFEST
             chmod 0644 $out/manifest.json

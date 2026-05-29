@@ -9,7 +9,7 @@
 //! 2. Binds the proxy at [`mvm_egress_proxy::DEFAULT_BIND`] (or
 //!    `MVM_EGRESS_BIND` if set — gated the same way for tests).
 //! 3. Prints `mvm-egress-proxy: listening on <addr>` to stdout so
-//!    the parent (mvm-builder-init) can scrape the addr if it
+//!    the parent (mvm-host-vm-init) can scrape the addr if it
 //!    needs to confirm.
 //! 4. Waits for SIGTERM / SIGINT.
 //!
@@ -61,7 +61,7 @@ mod linux {
         };
         println!("mvm-egress-proxy: listening on {}", handle.local_addr);
 
-        // Park until SIGTERM / SIGINT. mvm-builder-init signals
+        // Park until SIGTERM / SIGINT. mvm-host-vm-init signals
         // SIGTERM after the installer exits; we shut the listener
         // down cleanly and join the accept thread before exiting.
         let stop = Arc::new(AtomicBool::new(false));
@@ -116,7 +116,7 @@ mod linux {
     /// Install SIGINT + SIGTERM handlers that flip `stop` so the
     /// main loop exits. Best-effort: if `signal_hook`-style setup
     /// fails we fall back to a no-op handler — the proxy then
-    /// only exits on kill -9, which mvm-builder-init does as the
+    /// only exits on kill -9, which mvm-host-vm-init does as the
     /// SIGTERM fallback anyway.
     fn install_signal_handlers(stop: Arc<AtomicBool>) {
         // SAFETY: setting a signal handler is unsafe because the
@@ -159,7 +159,7 @@ mod tests {
     // The library tests in `proxy.rs` cover the proxy lifecycle
     // end-to-end. The binary's `main()` is a thin wrapper around
     // `mvm_egress_proxy::start` + a signal-driven park loop; the
-    // signal path is exercised by mvm-builder-init's integration
+    // signal path is exercised by mvm-host-vm-init's integration
     // test (`install::tests::proxy_lifecycle_wraps_installer`).
     // No standalone binary test fixture lives here.
 }

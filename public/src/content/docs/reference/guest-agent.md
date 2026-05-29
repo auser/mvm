@@ -83,7 +83,7 @@ and backpressure behavior below.
 | `Exec` / `RunCode` (dev-only) | Single request → `ExecResult { exit_code, stdout, stderr }` | Each captured stream capped by the dev caps; total response bounded by `MAX_FRAME_SIZE` | One-shot capture; no streaming | Response itself is the terminal | None — dev-only, not exercised in prod. | No. Hash of stdout/stderr can be receipted; raw bytes are not audited. |
 | Console PTY traffic | Bidirectional bytes over a dedicated vsock port (`ConsoleOpen` allocates it) | Per-frame cap defined by the console transport, not `MAX_FRAME_SIZE` | TTY-shaped reads | Caller closes (`ConsoleClose`) or PTY exits | None — interactive, not buffered. | No. Console bytes never enter audit. |
 | Port-forward TCP traffic | Bidirectional bytes over the vsock port returned by `StartPortForward` | None — raw TCP | TCP-shaped reads | TCP teardown | None — kernel TCP. | No. Forwarded bytes never enter audit. |
-| Builder output (builder VM only) | Streamed during `mvm-builder-init` builds | Frame cap on the builder vsock channel | Lines / records | Builder's terminal status | None today; builder egress events (plan 74 W8) will surface backpressure. | No. Build logs are stored next to the receipt; raw bytes never get into audit detail strings. |
+| Builder output (builder VM only) | Streamed during `mvm-host-vm-init` builds | Frame cap on the builder vsock channel | Lines / records | Builder's terminal status | None today; builder egress events (plan 74 W8) will surface backpressure. | No. Build logs are stored next to the receipt; raw bytes never get into audit detail strings. |
 
 ### Redaction invariant
 

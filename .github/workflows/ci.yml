@@ -426,7 +426,7 @@ jobs:
             builder_vm:
               - 'nix/images/builder-vm/**'
               - 'nix/lib/**'
-              - 'crates/mvm-builder-init/**'
+              - 'crates/mvm-host-vm-init/**'
 
       - name: Install Nix
         if: steps.filter.outputs.builder_vm == 'true' || github.ref == 'refs/heads/main'

@@ -49,7 +49,7 @@ pub const DEFAULT_BUILDER_VM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// disable the safety net.
 pub const MVM_BUILDER_VM_TIMEOUT_SECS_ENV: &str = "MVM_BUILDER_VM_TIMEOUT_SECS";
 
-/// Per-job dir filename mvm-builder-init detects to dispatch
+/// Per-job dir filename mvm-host-vm-init detects to dispatch
 /// through the application-dependency install pipeline (Plan 73
 /// Followup B.2). Migrated from `libkrun_builder.rs` because the
 /// install spec staging is a hypervisor-agnostic concern that
@@ -86,14 +86,14 @@ impl<'a> BuilderVmRuntime<'a> {
 }
 
 /// Stage the per-job dir inside `~/.cache/mvm/builder-vm/jobs/<id>/`
-/// so the in-guest `mvm-builder-init` finds the right artifact
+/// so the in-guest `mvm-host-vm-init` finds the right artifact
 /// for dispatch:
 ///
 /// - [`BuilderJob::Flake`] → writes `cmd.sh` (the in-guest nix-build
-///   script). mvm-builder-init runs it after `/work` `/out` `/job`
+///   script). mvm-host-vm-init runs it after `/work` `/out` `/job`
 ///   virtio-fs shares are mounted.
 /// - [`BuilderJob::Install`] → copies the caller's install-spec JSON
-///   to `<job_dir>/install_spec.json`. mvm-builder-init detects the
+///   to `<job_dir>/install_spec.json`. mvm-host-vm-init detects the
 ///   filename and dispatches the application-dep install pipeline
 ///   (Plan 73 Followup B.2) instead of `cmd.sh`.
 ///
@@ -114,7 +114,7 @@ pub fn stage_job_dir(job_dir: &Path, job: &BuilderJob) -> Result<(), BuilderVmEr
         BuilderJob::Install { spec_path } => {
             // Copy the caller's spec into the per-job dir so the
             // virtio-fs share carries it into the guest at
-            // `/job/install_spec.json`. `mvm-builder-init`
+            // `/job/install_spec.json`. `mvm-host-vm-init`
             // (Plan 73 Followup B.2) detects that filename and
             // dispatches through the install pipeline instead of
             // running cmd.sh.
@@ -139,7 +139,7 @@ pub fn stage_job_dir(job_dir: &Path, job: &BuilderJob) -> Result<(), BuilderVmEr
     Ok(())
 }
 
-/// Render the `cmd.sh` body the in-guest `mvm-builder-init` runs
+/// Render the `cmd.sh` body the in-guest `mvm-host-vm-init` runs
 /// for a [`BuilderJob::Flake`]. Inlined as a separate function so
 /// tests can assert the rendered output without touching the
 /// filesystem.
@@ -151,7 +151,7 @@ fn render_flake_cmd_sh(flake_ref: &str, attr_path: &str) -> String {
 # Runs inside the builder VM under `/bin/sh -eu`. The host wires
 # /work (workspace), /out (artifact dir), /job (this dir) as
 # virtio-fs shares; /nix is a persistent virtio-blk overlay
-# handled by mvm-builder-init.
+# handled by mvm-host-vm-init.
 set -eu
 
 FLAKE_REF='{flake_ref}'
@@ -269,8 +269,8 @@ pub fn shell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-/// Parsed `<job_dir>/result` written by `mvm-builder-init` (Plan 72
-/// W3). Shape matches the JSON `mvm-builder-init::linux::write_result`
+/// Parsed `<job_dir>/result` written by `mvm-host-vm-init` (Plan 72
+/// W3). Shape matches the JSON `mvm-host-vm-init::linux::write_result`
 /// emits. The guest PID 1 writes this on every code path that reaches
 /// `power_off`; the host-side helper reads it to learn the guest's
 /// exit code and the cmd.sh stderr-tail ringbuffer for diagnostics.
@@ -288,7 +288,7 @@ pub struct JobResult {
 
 /// Read and parse `<job_dir>/result`. The guest's PID 1 writes this
 /// on every code path that reaches `power_off`; absence here means
-/// the VM crashed before `mvm-builder-init` could finalize.
+/// the VM crashed before `mvm-host-vm-init` could finalize.
 ///
 /// Error mapping mirrors the original libkrun-side implementation:
 /// missing file → [`BuilderVmError::NixBuildFailed`] (it's almost
@@ -300,7 +300,7 @@ pub fn read_job_result(job_dir: &Path) -> Result<JobResult, BuilderVmError> {
     let body = std::fs::read_to_string(&path).map_err(|e| {
         BuilderVmError::NixBuildFailed(format!(
             "guest did not write {}: {e} \
-             (the VM may have crashed before mvm-builder-init could finalize)",
+             (the VM may have crashed before mvm-host-vm-init could finalize)",
             path.display()
         ))
     })?;
@@ -312,7 +312,7 @@ pub fn read_job_result(job_dir: &Path) -> Result<JobResult, BuilderVmError> {
     })
 }
 
-/// Filename of the install report `mvm-builder-init` writes into
+/// Filename of the install report `mvm-host-vm-init` writes into
 /// `artifact_out/` after the install pipeline finishes. The host
 /// reads + parses this to decide whether the install succeeded.
 pub const INSTALL_RESULT_FILENAME: &str = "result.json";
@@ -410,14 +410,14 @@ fn extract_nix_store_hash(store_path: &str) -> Option<&str> {
 }
 
 /// Parsed shape of `<artifact_out>/result.json` — the install report
-/// `mvm-builder-init::install::InstallReport::to_json` emits. Field
+/// `mvm-host-vm-init::install::InstallReport::to_json` emits. Field
 /// set kept in sync with the writer; an additive change to the writer
 /// (B.2.x egress allowlist diagnostics, for example) needs a matching
 /// `#[serde(default)]` field here.
 #[derive(Debug, Deserialize)]
 pub struct InstallResultReport {
     pub installer_exit_code: i32,
-    /// Set when `mvm-builder-init` synthesizes a failure report (e.g.
+    /// Set when `mvm-host-vm-init` synthesizes a failure report (e.g.
     /// installer binary missing on PATH). Surfaced in the host-side
     /// error message.
     #[serde(default)]
@@ -425,7 +425,7 @@ pub struct InstallResultReport {
 }
 
 /// Finalize an install job (Plan 73 Followup B.2): validate the
-/// install report `mvm-builder-init` wrote to
+/// install report `mvm-host-vm-init` wrote to
 /// `<artifact_out>/result.json`, fail closed on
 /// `installer_exit_code != 0`, and return
 /// [`BuilderArtifacts::InstallVolume`] pointing at the directory.
@@ -463,7 +463,7 @@ pub fn finalize_install_job(artifact_out: &Path) -> Result<BuilderArtifacts, Bui
     }
 
     // The four sealed-volume artifacts must all be present —
-    // mvm-builder-init emits stubs on missing optional tooling
+    // mvm-host-vm-init emits stubs on missing optional tooling
     // (SBOM / CVE) so absence here means the guest crashed mid-
     // pipeline. seal_volume would catch this too, but failing
     // closed at the builder layer pins the error to the right
@@ -487,7 +487,7 @@ pub fn finalize_install_job(artifact_out: &Path) -> Result<BuilderArtifacts, Bui
 /// Host-side exclusive lock on the persistent `/nix-store` sparse image.
 ///
 /// The builder VM attaches this file as a writable virtio-blk device;
-/// the guest's `mvm-builder-init` mounts it as ext4 at `/nix-store`.
+/// the guest's `mvm-host-vm-init` mounts it as ext4 at `/nix-store`.
 /// Two independent guests mounting the same ext4 image read-write can
 /// corrupt the filesystem, so the host holds an exclusive `flock` for
 /// the full VM lifetime.
@@ -628,7 +628,7 @@ pub fn supervisor_exit_error(exit_code: i32, vm_state_dir: &Path) -> BuilderVmEr
 
 /// Format the [`BuilderVmError`] returned when the guest's cmd.sh
 /// exited non-zero. `stderr_tail` is the 20-line ringbuffer
-/// `mvm-builder-init` captured from cmd.sh's stderr (Plan 72 W3) —
+/// `mvm-host-vm-init` captured from cmd.sh's stderr (Plan 72 W3) —
 /// surfaced as-is so the operator sees the last few lines without
 /// having to read the `/job/result` JSON or chase the full log.
 ///
@@ -990,7 +990,7 @@ mod tests {
     fn finalize_install_job_requires_result_json() {
         // Empty artifact dir → ExtractionFailed pointing at the
         // missing result.json. Surfaces guest crashes that prevented
-        // mvm-builder-init from finalizing the report.
+        // mvm-host-vm-init from finalizing the report.
         let scratch = tempfile::TempDir::new().unwrap();
         let err = finalize_install_job(scratch.path()).unwrap_err();
         assert!(matches!(err, BuilderVmError::ExtractionFailed(_)));
@@ -1187,7 +1187,7 @@ mod tests {
 
     #[test]
     fn shell_job_exit_error_handles_empty_tail() {
-        // mvm-builder-init writes an empty `stderr_tail` when cmd.sh
+        // mvm-host-vm-init writes an empty `stderr_tail` when cmd.sh
         // failed before producing any stderr (e.g. SIGKILL via OOM).
         // The error message should still be coherent — no trailing
         // garbage, no panic on the format!.

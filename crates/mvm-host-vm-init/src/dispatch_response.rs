@@ -4,7 +4,7 @@
 //!
 //! ## Why hand-roll
 //!
-//! `mvm-builder-init` keeps a ≤ 1.5 MiB rootfs size budget
+//! `mvm-host-vm-init` keeps a ≤ 1.5 MiB rootfs size budget
 //! (Plan 72 §W3) and deliberately does not pull `serde_json`
 //! (`Cargo.toml` comment at the deps section). The host-side
 //! consumer (`mvm_build::builder_protocol::HostVmResponse::Result`)

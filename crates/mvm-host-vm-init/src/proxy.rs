@@ -2,7 +2,7 @@
 //! pipeline (Plan 73 Followup B.2.x, ADR-047 §"Build-time gates"
 //! → "Registry allowlist").
 //!
-//! `mvm-builder-init` runs the installer (`uv` / `pnpm`) with
+//! `mvm-host-vm-init` runs the installer (`uv` / `pnpm`) with
 //! `HTTP_PROXY` + `HTTPS_PROXY` pointing at `mvm-egress-proxy`,
 //! which sits between the installer and the network and refuses
 //! anything outside ADR-047's four-hostname allowlist.
@@ -202,14 +202,14 @@ impl ProxyLifecycle for ChildProxyLifecycle {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
-                    eprintln!("mvm-builder-init: proxy try_wait failed: {e}");
+                    eprintln!("mvm-host-vm-init: proxy try_wait failed: {e}");
                     break;
                 }
             }
         }
 
         // SIGKILL fallback.
-        eprintln!("mvm-builder-init: egress proxy did not exit on SIGTERM, sending SIGKILL");
+        eprintln!("mvm-host-vm-init: egress proxy did not exit on SIGTERM, sending SIGKILL");
         let _ = child.kill();
         let _ = child.wait();
         self.started = false;
