@@ -2,7 +2,7 @@
 
 Status: ready (drop-in for a fresh AI session)
 Created: 2026-05-28
-Related: Plan 109 (the parent plan), ADR-060 (pid0 portability boundary), ADR-063 (boundary language policy), Sprint 57
+Related: Plan 109 (the parent plan), ADR-060 (pid0 portability boundary), ADR-063 (boundary language policy), Sprint 58
 
 ## What this plan is
 
@@ -20,7 +20,7 @@ The new session MUST read these in order before making any edits. Each item reso
 - [ ] [`specs/adrs/063-boundary-language-policy.md`](../adrs/063-boundary-language-policy.md) — §4 lists six required deliverables you must produce alongside any non-Rust adoption (only relevant for W2 Zig, not W2′).
 - [ ] `crates/mvm-guest/src/bin/mvm-guest-netinit.rs` + `crates/mvm-guest/src/netinit.rs` — the baseline Rust binary (~87 LoC main + ~100 LoC support) you're porting. **Stays canonical**; W2/W2′ are additions, not replacements.
 - [ ] `crates/mvm-core/src/protocol/vm_backend.rs` — the `VmCapabilities` struct + `BackendSecurityProfile` that W5's capability matrix derives from.
-- [ ] [`specs/SPRINT.md`](../SPRINT.md) Sprint 57 — where Plan 109 lives in sprint tracking. Update the workstream checkboxes there as you complete pieces.
+- [ ] [`specs/SPRINT.md`](../SPRINT.md) Sprint 58 — where Plan 109 lives in sprint tracking. Update the workstream checkboxes there as you complete pieces.
 
 ## Scope discipline (non-negotiable)
 
@@ -74,7 +74,7 @@ W5 + W2′ can run in parallel if the session is aggressive; W2 should wait unti
 - [ ] Optionally add `vsock_encryption_support: bool` to `VmCapabilities` (likely missing — Plan 109 W3 anticipates needing it). Default `true` wherever `vsock: true`.
 - [ ] Smoke checks: `cargo fmt --all -- --check` + `cargo test --workspace --no-run`.
 - [ ] Commit. Suggested message: `docs(reference): provider capability matrix (Plan 109 W5)`.
-- [ ] Update `specs/SPRINT.md` Sprint 57's success-criteria checkbox for W5.
+- [ ] Update `specs/SPRINT.md` Sprint 58's success-criteria checkbox for W5.
 - [ ] Stop. Let the user review before pressing into W2′.
 
 ---
@@ -130,7 +130,7 @@ That's it. No `tokio`, no `rtnetlink`, no `netlink-packet-route`, no `serde_json
 
 - [ ] Smoke checks: `cargo fmt --all -- --check` + `cargo test --workspace --no-run` + `cargo test -p mvm-guest-netinit-lean` (the parity test if on Linux).
 - [ ] Commit. Suggested message: `feat(mvm-guest-netinit-lean): W2′ lean Rust v2 prototype (Plan 109)`.
-- [ ] Update Sprint 57 W2′ checkbox.
+- [ ] Update Sprint 58 W2′ checkbox.
 - [ ] Stop at a natural checkpoint and let the user review before pressing into W2.
 
 ---
@@ -182,7 +182,7 @@ The Zig binary must consume Rust-canonical types. Cheapest approach:
 - [ ] **Do not propose adopting the Zig binary as the default.** Plan 109's expected outcome is Outcome B (lean Rust v2 wins).
 - [ ] **Do not delete or gate the Rust baseline.** Both binaries stay side-by-side per I4.
 - [ ] Commit. Suggested message: `feat(zig): W2 Zig netinit prototype + measurements (Plan 109)`.
-- [ ] Update Sprint 57 W2 checkbox.
+- [ ] Update Sprint 58 W2 checkbox.
 
 ---
 
