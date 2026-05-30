@@ -396,6 +396,10 @@ impl LibkrunBuilderVm {
             signing_key_path: None,
             plan: None,
             bundle: None,
+            // Plan 113 §Task 14 / ADR-064 §Decision 6 — builder VMs
+            // are always hard-fail; they don't model long-running
+            // user workloads where a restart policy would apply.
+            bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
         };
 
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
@@ -498,6 +502,10 @@ impl LibkrunBuilderVm {
             signing_key_path: None,
             plan: None,
             bundle: None,
+            // Plan 113 §Task 14 / ADR-064 §Decision 6 — builder VMs
+            // are always hard-fail; they don't model long-running
+            // user workloads where a restart policy would apply.
+            bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
         };
         // Plan 89 W2 part 4: spawn the vsock response listener
         // BEFORE the supervisor so it can connect as soon as libkrun
@@ -769,6 +777,10 @@ impl BuilderVm for LibkrunBuilderVm {
             signing_key_path: None,
             plan: None,
             bundle: None,
+            // Plan 113 §Task 14 / ADR-064 §Decision 6 — builder VMs
+            // are always hard-fail; they don't model long-running
+            // user workloads where a restart policy would apply.
+            bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
         };
         // Plan 89 W2 part 4: same dispatch-listener wiring as
         // `run_shell_script`. Drained after the supervisor exits
@@ -944,6 +956,10 @@ impl VmBackendForBuilder for LibkrunBuilderBackend {
             signing_key_path: None,
             plan: None,
             bundle: None,
+            // Plan 113 §Task 14 / ADR-064 §Decision 6 — builder VMs
+            // are always hard-fail; they don't model long-running
+            // user workloads where a restart policy would apply.
+            bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
         };
 
         let mut child = spawn_supervisor_in_background(&self.supervisor_path, &cfg)?;
@@ -1837,6 +1853,10 @@ impl LibkrunPersistentHostVm {
             signing_key_path: None,
             plan: None,
             bundle: None,
+            // Plan 113 §Task 14 / ADR-064 §Decision 6 — builder VMs
+            // are always hard-fail; they don't model long-running
+            // user workloads where a restart policy would apply.
+            bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
         };
 
         let child = spawn_supervisor_in_background(&supervisor_path, &cfg)?;

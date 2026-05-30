@@ -89,6 +89,7 @@ fn supervisor_takes_bridge_path_when_tenant_id_some() {
         // downstream on the missing kernel.
         plan: Some(serde_json::json!({"placeholder": true})),
         bundle: None,
+        bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
     };
 
     let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -162,6 +163,7 @@ fn supervisor_takes_legacy_path_when_tenant_id_none() {
         signing_key_path: None,
         plan: None,
         bundle: None,
+        bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
     };
 
     let json = serde_json::to_string_pretty(&cfg).unwrap();

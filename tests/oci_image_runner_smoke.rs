@@ -214,6 +214,7 @@ fn boot_with_libkrun(
         signing_key_path: None,
         plan: None,
         bundle: None,
+        bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
     };
     let json = serde_json::to_string(&cfg).expect("serialize supervisor config");
 
