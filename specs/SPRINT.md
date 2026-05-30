@@ -2402,7 +2402,7 @@ Phase 1 host cross-compile targets **`<arch>-unknown-linux-musl` static**, not g
 - [ ] ~~**PR-7 — two-runner reproducibility CI lane**~~ folds into ADR-064's build-time cross-compile.
 - [ ] ~~**PR-8 — `/nix` warm-reuse contract**~~ re-scoped under ADR-064's single-flake model.
 - [ ] **Phase 1 re-plan** — implement [ADR-064](adrs/064-single-builder-dev-image.md) as the new Phase 1, coordinated with the `specs/prompts/93-phase-1-2-3-fast-secure-dev.md` track (do not race it).
-- [ ] **PR-9 — handshake pipelining + guest bind-first** (Phase 2 Lever 2; keep Ed25519 auth-before-trust).
+- [~] **PR-9 — adaptive readiness poll** (Phase 2 Lever 2). Landed: `adaptive_backoff` + `wait_for_guest_agent` rewired (20ms→500ms cap; cuts up to ~480ms dead time per readiness detection; timing-only, connect→negotiate ordering untouched). Deferred (tracked): the `connect_and_authenticate` combiner and the guest `socket/bind/listen`-first reorder — both touch the sealed-prod Ed25519 auth path / agent main and need a live VM to validate.
 - [ ] **PR-10 — warm pool of supervisors** `--warm-pool-size N` default 0 (Phase 2 Lever 3; guests unbooted until admission; control UDS reuses `deny_unknown_fields` parser + new fuzz target).
 
 ### Deferred (tracked in Plan 93 §deferred follow-ups)

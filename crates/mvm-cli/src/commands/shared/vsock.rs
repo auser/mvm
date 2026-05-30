@@ -20,6 +20,16 @@ pub fn wait_for_guest_agent(vm_id: &str, timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let transport = AppleContainerTransport::new(vm_id);
 
+    // Plan 93 Phase 2 Lever 2: adaptive backoff instead of a fixed
+    // 500 ms poll. A guest that binds in ~80 ms used to wait up to a
+    // full 500 ms before the next probe noticed; the backoff starts at
+    // 20 ms and grows to the same 500 ms cap, so the common fast-boot
+    // case is detected far sooner while a slow guest still polls at the
+    // old steady cadence. This is a timing change only — the
+    // connect→`negotiate_protocol` ordering (and the
+    // ProtocolHello/Ack contract) is untouched; no RPC is issued before
+    // negotiation succeeds.
+    let mut attempt: u32 = 0;
     while std::time::Instant::now() < deadline {
         if let Ok(mut s) = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)
             && mvm_guest::vsock::negotiate_protocol(
@@ -30,7 +40,8 @@ pub fn wait_for_guest_agent(vm_id: &str, timeout_secs: u64) -> bool {
         {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(mvm_guest::vsock::adaptive_backoff(attempt));
+        attempt = attempt.saturating_add(1);
     }
     false
 }
