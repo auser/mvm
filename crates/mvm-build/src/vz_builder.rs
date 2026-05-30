@@ -474,6 +474,7 @@ impl VzBuilderVm {
     fn validate_mounts(&self, mounts: &BuilderMounts) -> Result<(), BuilderVmError> {
         ensure_utf8_path(&mounts.flake_src, "flake_src")?;
         ensure_utf8_path(&mounts.artifact_out, "artifact_out")?;
+        ensure_utf8_path(&mounts.host_bin_dir, "host_bin_dir")?;
         if let Some(store) = &mounts.host_nix_store {
             ensure_utf8_path(store, "host_nix_store")?;
         }
@@ -487,6 +488,12 @@ impl VzBuilderVm {
             return Err(BuilderVmError::ExtractionFailed(format!(
                 "flake source must be a directory: {}",
                 mounts.flake_src.display()
+            )));
+        }
+        if !mounts.host_bin_dir.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "host_bin_dir must be an existing directory: {}",
+                mounts.host_bin_dir.display()
             )));
         }
         std::fs::create_dir_all(&mounts.artifact_out).map_err(|e| {
@@ -679,6 +686,15 @@ impl BuilderVm for VzBuilderVm {
                 tag: "job".to_string(),
                 host_path: job_dir.clone(),
                 read_only: false,
+            },
+            // Plan 115 / ADR-064: mount the extracted host-vm binaries
+            // at /mvm-bins inside the builder VM (read-only). The cmd.sh
+            // sees MVM_HOST_BIN_DIR=/mvm-bins so the flake can reference
+            // the correct pre-compiled binaries.
+            BuilderVmMount {
+                tag: "mvm-bins".to_string(),
+                host_path: mounts.host_bin_dir.clone(),
+                read_only: true,
             },
         ];
 
@@ -1472,10 +1488,13 @@ mod tests {
     #[test]
     fn vz_builder_vm_validate_mounts_rejects_missing_flake_src() {
         let scratch = tempfile::TempDir::new().unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: scratch.path().join("does-not-exist"),
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let err = VzBuilderVm::new().validate_mounts(&mounts).unwrap_err();
         assert!(
@@ -1489,10 +1508,13 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let flake = scratch.path().join("flake-file");
         std::fs::write(&flake, b"not a dir").unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: flake,
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let err = VzBuilderVm::new().validate_mounts(&mounts).unwrap_err();
         assert!(
@@ -1507,10 +1529,13 @@ mod tests {
         let flake = scratch.path().join("flake");
         std::fs::create_dir(&flake).unwrap();
         let artifact_out = scratch.path().join("nested").join("out");
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: flake,
             host_nix_store: None,
             artifact_out: artifact_out.clone(),
+            host_bin_dir: host_bins,
         };
         VzBuilderVm::new().validate_mounts(&mounts).unwrap();
         assert!(artifact_out.is_dir(), "artifact_out must be created");
@@ -1572,10 +1597,13 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let flake = scratch.path().join("flake");
         std::fs::create_dir(&flake).unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: flake,
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let job = BuilderJob::Flake {
             flake_ref: "path:.".into(),
@@ -1611,10 +1639,13 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let flake = scratch.path().join("flake");
         std::fs::create_dir(&flake).unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: flake,
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let job = BuilderJob::Flake {
             flake_ref: "path:.".into(),

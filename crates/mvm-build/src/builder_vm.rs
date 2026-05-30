@@ -68,6 +68,11 @@ pub struct BuilderMounts {
     /// here. ADR-013 step 5 extracts from this path back to the
     /// host's per-build artifact directory.
     pub artifact_out: PathBuf,
+    /// Plan 115 / ADR-064: dir containing the mvm host-vm binaries
+    /// extracted from mvmctl's embedded payload, mounted read-only at
+    /// `/mvm-bins` inside the builder VM and exposed via
+    /// `MVM_HOST_BIN_DIR=/mvm-bins` to the flake's `cmd.sh`.
+    pub host_bin_dir: PathBuf,
 }
 
 /// What the builder is asked to produce.
@@ -854,6 +859,7 @@ mod tests {
             flake_src: PathBuf::from("/tmp/flake"),
             host_nix_store: None,
             artifact_out: PathBuf::from("/tmp/out"),
+            host_bin_dir: PathBuf::from("/tmp/host-bins"),
         };
         let err = stub.run_build(&job, &mounts).expect_err("stub returns err");
         assert!(matches!(err, BuilderVmError::NotYetImplemented));
@@ -872,6 +878,7 @@ mod tests {
             flake_src: PathBuf::from("/tmp/flake"),
             host_nix_store: None,
             artifact_out: PathBuf::from("/tmp/out"),
+            host_bin_dir: PathBuf::from("/tmp/host-bins"),
         };
         let err = stub.run_build(&job, &mounts).expect_err("stub returns err");
         assert!(matches!(err, BuilderVmError::NotYetImplemented));

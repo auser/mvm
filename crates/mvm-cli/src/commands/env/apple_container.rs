@@ -3068,6 +3068,14 @@ fn builder_vm_stage0_bootstrap_plan(
         .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {builder_flake_dir}"))?
         .to_path_buf();
 
+    // Plan 115 / ADR-064: extract the embedded host-vm binaries and
+    // mount them at /mvm-bins so the Stage 0 builder-vm flake can
+    // install the cross-compiled binaries into the rootfs it builds.
+    let host_bins_cache = format!("{}/host-bins", mvm_core::config::mvm_cache_dir());
+    let host_bin_dir =
+        crate::host_binaries::extract::ensure_extracted(std::path::Path::new(&host_bins_cache))
+            .map_err(|e| anyhow::anyhow!("extract embedded host-vm binaries: {e}"))?;
+
     let job = BuilderJob::Flake {
         flake_ref: "path:/work/nix/images/builder-vm".to_string(),
         attr_path: format!("packages.{}.{attr_name}", host_system_linux()),
@@ -3076,6 +3084,7 @@ fn builder_vm_stage0_bootstrap_plan(
         flake_src: workspace_root,
         host_nix_store: None,
         artifact_out: std::path::PathBuf::from(out_dir),
+        host_bin_dir,
     };
     let bootstrap_image = BuilderVmImage::new(
         bootstrap_kernel,
@@ -4173,6 +4182,15 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     // the git fetcher, which would discover `/work/.git` and trip on
     // worktree files whose `gitdir:` redirects point outside the
     // mount).
+    // Plan 115 / ADR-064: extract the embedded host-vm binaries to the
+    // host-bins cache dir and mount them at /mvm-bins inside the builder VM.
+    // The builder-vm flake's cmd.sh reads MVM_HOST_BIN_DIR=/mvm-bins to
+    // install the correct cross-compiled binaries into the rootfs.
+    let host_bins_cache = format!("{}/host-bins", mvm_core::config::mvm_cache_dir());
+    let host_bin_dir =
+        crate::host_binaries::extract::ensure_extracted(std::path::Path::new(&host_bins_cache))
+            .map_err(|e| anyhow::anyhow!("extract embedded host-vm binaries: {e}"))?;
+
     let job = BuilderJob::Flake {
         flake_ref: "path:/work/nix/images/builder".to_string(),
         attr_path: format!("packages.{}.default", host_system_linux()),
@@ -4184,6 +4202,7 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
         // Darwin-x-Linux closure mismatch on macOS anyway).
         host_nix_store: None,
         artifact_out: std::path::PathBuf::from(out_dir),
+        host_bin_dir,
     };
 
     // Plan 97 Phase C: `MVM_BUILDER_BACKEND=vz` flips the dispatch

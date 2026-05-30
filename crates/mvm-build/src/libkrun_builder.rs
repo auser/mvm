@@ -551,6 +551,7 @@ impl LibkrunBuilderVm {
         // without filesystem support for non-UTF-8 names (APFS).
         ensure_utf8_path(&mounts.flake_src, "flake_src")?;
         ensure_utf8_path(&mounts.artifact_out, "artifact_out")?;
+        ensure_utf8_path(&mounts.host_bin_dir, "host_bin_dir")?;
         if let Some(store) = &mounts.host_nix_store {
             ensure_utf8_path(store, "host_nix_store")?;
         }
@@ -564,6 +565,12 @@ impl LibkrunBuilderVm {
             return Err(BuilderVmError::ExtractionFailed(format!(
                 "flake source must be a directory: {}",
                 mounts.flake_src.display()
+            )));
+        }
+        if !mounts.host_bin_dir.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "host_bin_dir must be an existing directory: {}",
+                mounts.host_bin_dir.display()
             )));
         }
         std::fs::create_dir_all(&mounts.artifact_out).map_err(|e| {
@@ -756,6 +763,11 @@ impl BuilderVm for LibkrunBuilderVm {
             .add_virtio_fs("work", path_to_str(&mounts.flake_src, "flake_src")?)
             .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
             .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
+            // Plan 115 / ADR-064: mount the extracted host-vm binaries
+            // at /mvm-bins inside the builder VM (read-only). The cmd.sh
+            // sees MVM_HOST_BIN_DIR=/mvm-bins so the flake can reference
+            // the correct pre-compiled binaries without a host nix build.
+            .add_virtio_fs("mvm-bins", path_to_str(&mounts.host_bin_dir, "host_bin_dir")?)
             .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
         krun = apply_networking_mode(krun, &vm_state_dir)?;
@@ -1997,10 +2009,13 @@ mod tests {
         let flake = scratch.path().join("flake");
         std::fs::create_dir_all(&flake).unwrap();
         let out = scratch.path().join("out");
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         BuilderMounts {
             flake_src: flake,
             host_nix_store: None,
             artifact_out: out,
+            host_bin_dir: host_bins,
         }
     }
 
@@ -2089,10 +2104,13 @@ mod tests {
     #[test]
     fn validate_mounts_rejects_missing_flake_src() {
         let scratch = TempDir::new().unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: scratch.path().join("does-not-exist"),
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let err = LibkrunBuilderVm::default()
             .validate_mounts(&mounts)
@@ -2106,10 +2124,13 @@ mod tests {
         let scratch = TempDir::new().unwrap();
         let file = scratch.path().join("not-a-dir");
         std::fs::write(&file, b"").unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: file,
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let err = LibkrunBuilderVm::default()
             .validate_mounts(&mounts)
@@ -2143,10 +2164,14 @@ mod tests {
         // before any I/O so this still exercises the right path.
         let raw = OsStr::from_bytes(b"/tmp/non-utf8-\xff");
         let bad_path = PathBuf::from(raw);
+        let scratch = TempDir::new().unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: bad_path,
             host_nix_store: None,
             artifact_out: std::env::temp_dir().join("mvm-plan72-w1-utf8-test-out"),
+            host_bin_dir: host_bins,
         };
         let err = LibkrunBuilderVm::default()
             .validate_mounts(&mounts)
@@ -2282,10 +2307,13 @@ mod tests {
         // `validate_job`, before run_build reaches the libkrun
         // availability check or the image cache.
         let scratch = TempDir::new().unwrap();
+        let host_bins = scratch.path().join("host-bins");
+        std::fs::create_dir_all(&host_bins).unwrap();
         let mounts = BuilderMounts {
             flake_src: scratch.path().join("missing"),
             host_nix_store: None,
             artifact_out: scratch.path().join("out"),
+            host_bin_dir: host_bins,
         };
         let err = LibkrunBuilderVm::default()
             .run_build(&ok_job(), &mounts)
