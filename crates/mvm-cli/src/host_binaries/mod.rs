@@ -10,4 +10,4 @@
 
 pub mod embedded;
 pub mod manifest;
-// pub mod extract;    // added in Task 5
+pub mod extract;
