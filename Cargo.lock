@@ -3785,6 +3785,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-vz-drainer"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "mvm-plan",
+ "mvm-policy",
+ "mvm-supervisor",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mvmctl"
 version = "0.14.0"
 dependencies = [
