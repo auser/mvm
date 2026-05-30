@@ -30,6 +30,20 @@ package manager (or build passt from source — see ADR-055 references).
 
 `mvmctl doctor` probes the right gateway per OS and emits install hints when missing.
 
+For source-checkout contributors only: zig + cargo-zigbuild are needed
+at `cargo build`-of-mvmctl time so `crates/mvm-cli/build.rs` can
+cross-compile the embedded host-vm binaries (`mvm-builder-init`,
+`mvm-egress-proxy`) for aarch64-unknown-linux-gnu. See
+Plan 115 / ADR-064.
+
+```sh
+brew install zig
+cargo install cargo-zigbuild
+```
+
+End-users running a downloaded mvmctl don't need either tool — the
+binaries are already embedded.
+
 **macOS 26+ Apple Silicon** users can skip the `slp/krun/*` Homebrew trio when running with the Vz builder backend (the auto-detect default on that tier — see "Builder backend selection" below). Apple Virtualization.framework ships with the OS and needs no separate library install. The Homebrew trio is still required if you explicitly opt back into libkrun via `--builder libkrun` or `MVM_BUILDER_BACKEND=libkrun`.
 
 ## Builder backend selection (Plan 98)
