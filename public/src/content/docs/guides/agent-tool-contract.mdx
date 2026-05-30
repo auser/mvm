@@ -1,0 +1,259 @@
+---
+title: Agent tool contract
+description: A secure contract for using mvm sandboxes as LLM and coding-agent tools.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Agent integrations should expose `mvm` as a narrow tool, not as ambient shell
+access. The application owns validation, policy selection, redaction, and
+cleanup. The microVM owns guest execution.
+
+Use this contract when an LLM, coding agent, or workflow engine needs to run
+generated code, inspect files, call a command, or preserve recoverable state.
+
+## Tool boundary
+
+| Tool action | App responsibility | Sandbox responsibility |
+| --- | --- | --- |
+| Create sandbox | Choose image, policy, TTL, resource limits, and owner. | Boot the selected microVM artifact. |
+| Write input files | Validate paths, size, content type, and retention. | Receive files under guest paths. |
+| Run command | Validate argv, timeout, working dir, env refs, and output budget. | Execute inside the guest policy boundary. |
+| Read output files | Restrict paths and size; scan or redact content before model use. | Return requested bytes from guest storage. |
+| Return logs/results | Redact secrets and user data; attach audit/run IDs. | Emit command status, logs, and receipts where available. |
+| Preserve state | Decide pause, cold, snapshot, or volume retention. | Save backend-specific state. |
+| Cleanup | Stop, destroy, lock volumes, delete snapshots, or keep with explicit TTL. | Release compute and retained state according to command. |
+
+## Request schema
+
+Keep the model-facing request small and typed. Do not let the model pass raw
+host paths, arbitrary environment variables, or host network bindings.
+
+```json
+{
+  "language": "python",
+  "files": [
+    {
+      "path": "/work/main.py",
+      "content": "print('hello')"
+    }
+  ],
+  "command": ["python", "/work/main.py"],
+  "timeout_seconds": 20,
+  "network": {
+    "mode": "none"
+  },
+  "state": {
+    "retention": "destroy"
+  }
+}
+```
+
+Validation rules:
+
+- reject absolute host paths and path traversal;
+- bound file count, file size, stdout, stderr, and runtime;
+- allow only known image or flake targets;
+- require deny-by-default network unless the caller has a policy grant;
+- require secret references, not literal secret values;
+- require an explicit retention choice: destroy, stop, cold, or snapshot.
+
+## Current CLI-backed implementation
+
+Today the broadest shipped lifecycle surface is the CLI. A tool runner can use
+the CLI while preserving the same contract the SDK target should expose.
+
+```sh
+mvmctl build ./agent-tool
+mvmctl up ./agent-tool --name agent-tool-call
+mvmctl fs write agent-tool-call /work/main.py < /tmp/request-main.py
+mvmctl exec agent-tool-call --timeout 20 -- python /work/main.py
+mvmctl logs agent-tool-call
+mvmctl down agent-tool-call
+```
+
+For one-off command execution, prefer a single bounded run when the workflow
+does not need staged files or persistent state:
+
+```sh
+mvmctl run --timeout 20 -- python -c 'print("bounded tool call")'
+```
+
+Keep the sandbox name, command exit status, receipt path, and audit/run IDs with
+the agent trace when those values are available.
+
+## Runtime SDK target
+
+The SDK target should make the same contract easier to write without hiding
+security decisions:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+from mvm import NetworkPolicy, Sandbox
+
+def run_agent_tool(request: dict) -> dict:
+    checked = validate_request(request)
+
+    with Sandbox.create(
+        image=checked["image"],
+        network=NetworkPolicy.deny_by_default(),
+        ttl_seconds=checked["ttl_seconds"],
+    ) as sandbox:
+        for item in checked["files"]:
+            sandbox.files.write(item["path"], item["content"])
+
+        result = sandbox.commands.run(
+            checked["command"],
+            timeout_seconds=checked["timeout_seconds"],
+            max_output_bytes=checked["max_output_bytes"],
+        )
+
+        return {
+            "exit_code": result.exit_code,
+            "stdout": redact(result.stdout),
+            "stderr": redact(result.stderr),
+            "audit_id": result.audit_id,
+        }
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { NetworkPolicy, Sandbox } from "@mvm/sdk";
+
+async function runAgentTool(request: Record<string, unknown>) {
+  const checked = validateRequest(request);
+
+  using sandbox = await Sandbox.create({
+    image: checked.image,
+    network: NetworkPolicy.denyByDefault(),
+    ttlSeconds: checked.ttlSeconds,
+  });
+
+  for (const item of checked.files) {
+    await sandbox.files.write(item.path, item.content);
+  }
+
+  const result = await sandbox.commands.run(checked.command, {
+    timeoutSeconds: checked.timeoutSeconds,
+    maxOutputBytes: checked.maxOutputBytes,
+  });
+
+  return {
+    exit_code: result.exitCode,
+    stdout: redact(result.stdout),
+    stderr: redact(result.stderr),
+    audit_id: result.auditId,
+  };
+}
+```
+
+</TabItem>
+</Tabs>
+
+Check [Operations cookbook](/sdk/operations-cookbook/) and
+[Lifecycle matrix](/sdk/lifecycle-matrix/) before treating a helper as shipped
+in a language SDK.
+
+## Network policy
+
+Start closed:
+
+```json
+{
+  "network": {
+    "mode": "none"
+  }
+}
+```
+
+If the agent needs outbound access, issue a separate reviewed grant:
+
+```json
+{
+  "network": {
+    "mode": "bridge",
+    "allow": [
+      {
+        "host": "api.openai.com",
+        "port": 443
+      }
+    ]
+  }
+}
+```
+
+Do not let the model invent network destinations. The application should map
+approved tool capabilities to concrete policy, then pass only that policy to the
+sandbox.
+
+## Secrets
+
+Secrets should enter through references controlled by the application or
+operator, not through model output.
+
+```json
+{
+  "secrets": {
+    "OPENAI_API_KEY": {
+      "ref": "openai-api-key"
+    }
+  }
+}
+```
+
+Security rules:
+
+- never pass secrets in command args;
+- do not echo resolved secrets back to the model;
+- redact stdout, stderr, logs, error messages, and receipts before returning
+  them to a model context;
+- grant secrets per operation, not per long-lived agent identity.
+
+## State retention
+
+Choose one retention behavior per tool call:
+
+| Retention | Use when | Cleanup requirement |
+| --- | --- | --- |
+| `destroy` | The call is disposable. | Stop compute and remove retained local state. |
+| `stop` | Build artifacts can remain, but compute should stop. | Review logs, receipts, volumes, and snapshots separately. |
+| `cold` | The next call needs memory or filesystem continuity. | Treat cold state as sensitive and set a TTL. |
+| `snapshot` | A reviewer or retry path needs a named recovery point. | Store retention metadata and delete when no longer needed. |
+
+Cold state and snapshots can contain prompts, tool outputs, files, process
+memory, browser sessions, and credentials. Treat them as sensitive artifacts.
+
+## Response schema
+
+Return bounded, structured results to the model:
+
+```json
+{
+  "sandbox_id": "agent-tool-call",
+  "exit_code": 0,
+  "stdout": "redacted output",
+  "stderr": "",
+  "timed_out": false,
+  "audit_id": "run_...",
+  "retention": "destroy"
+}
+```
+
+If the run fails, distinguish policy denial, validation failure, timeout, guest
+command failure, transport failure, and cleanup failure. They require different
+retries and different user-facing messages.
+
+## Related pages
+
+- [AI agent integration](/guides/ai-agent-integration/)
+- [LLM tool integration](/tutorials/llm-tool-integration/)
+- [SDK operations cookbook](/sdk/operations-cookbook/)
+- [SDK security model](/sdk/security-model/)
+- [Network egress policy](/guides/network-egress-policy/)
+- [Audit and receipts](/guides/audit-and-receipts/)
+- [Observability and results](/guides/observability-and-results/)
+- [Lifecycle states](/working/lifecycle-states/)

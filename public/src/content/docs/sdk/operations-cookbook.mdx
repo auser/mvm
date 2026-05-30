@@ -1,0 +1,257 @@
+---
+title: SDK operations cookbook
+description: Current Python and TypeScript SDK calls, secure defaults, target helpers, and CLI fallbacks for common sandbox operations.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Use this page when you want a practical SDK operation and need to know whether
+to call the SDK today, use the CLI directly, or treat the helper as target API.
+
+The shipped SDK runtime surface is intentionally smaller than the product
+target. Current examples use `Sandbox.create(...)`, `commands.start(...)`,
+`files.write(...)`, TTLs, resources, network declarations, record mode, live
+mode, and cleanup. Higher-level helpers such as `commands.run(...)`,
+`files.read(...)`, logs, ports, and snapshots are parity targets until the
+language SDK tests prove them.
+
+## Operation status
+
+| Operation | Python today | TypeScript today | Secure fallback today |
+| --- | --- | --- | --- |
+| Create sandbox recording | `mvm.Sandbox.create(...)` | `Sandbox.create(...)` | `mvmctl compile` or `mvmctl run --mode plan` |
+| Create live sandbox | `mvmctl run --mode live ./script.py` | `mvmctl run --mode live ./script.ts` | `mvmctl up` |
+| Start command | `sandbox.commands.start([...])` | `sandbox.commands.start([...])` | `mvmctl proc start` or `mvmctl exec` |
+| Capture command result | Target `commands.run(...)` | Target `commands.run(...)` | CLI command result and receipt paths |
+| Write file | `sandbox.files.write(path, data)` | `sandbox.files.write(path, data)` | `mvmctl fs write` |
+| Read/list/remove file | Target helpers | Target helpers | `mvmctl fs read`, `mvmctl fs ls`, `mvmctl fs rm` |
+| Logs | Target helper | Target helper | `mvmctl logs` |
+| Ports | Target helper | Target helper | port-forwarding CLI commands |
+| Pause/resume | Target helper | Target helper | `mvmctl pause`, `mvmctl resume` |
+| Snapshot save/restore | Target helper | Target helper | `mvmctl snapshot save`, `mvmctl snapshot restore` |
+| Stop cleanup | context manager or `kill()` | `using`/`Symbol.dispose` or `kill()` | `mvmctl down` |
+
+## Current paths
+
+<Tabs syncKey="runtime-sdk-current-path">
+<TabItem label="Python">
+
+```python
+import mvm
+
+with mvm.Sandbox.create(
+    "python-3.12",
+    workload_id="agent-tool",
+    ttl="30m",
+    include=["src"],
+    resources=mvm.resources(cpu_cores=1, memory_mb=512, rootfs_size_mb=1024),
+    network=mvm.network(mode="deny"),
+) as sandbox:
+    sandbox.files.write("/app/main.py", "print('hello from mvm')")
+    sandbox.commands.start(
+        ["python", "/app/main.py"],
+        env={"MODE": "dev", "API_KEY": mvm.secret("api-key")},
+    )
+```
+
+Security notes:
+
+- the Python script itself runs on the host in record, plan, and live modes;
+- secret references are recorded as references, not copied as raw values;
+- `commands.start(...)` starts work, but result capture is still a parity target;
+- the context manager records or performs cleanup through `kill()`.
+
+Run modes:
+
+```sh
+mvmctl compile ./sandbox.py --out /tmp/sandbox-ir
+mvmctl run --mode plan ./sandbox.py
+mvmctl run --mode live ./sandbox.py
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { Sandbox, network, resources, secret } from "mvm-sdk";
+
+using sandbox = Sandbox.create("node-22", {
+  workloadId: "agent-tool",
+  ttl: "30m",
+  include: ["src"],
+  resources: resources({ cpu_cores: 1, memory_mb: 512, rootfs_size_mb: 1024 }),
+  network: network({ mode: "deny" }),
+});
+
+sandbox.files.write("/app/main.js", "console.log('hello from mvm')");
+sandbox.commands.start(["node", "/app/main.js"], {
+  env: { MODE: "dev", API_KEY: secret("api-key") },
+});
+```
+
+Security notes:
+
+- the TypeScript module runs on the host in runtime SDK modes;
+- `using` calls the SDK cleanup path when the scope exits;
+- use static declarations instead of runtime scripts for untrusted deployable
+  workload declarations;
+- live mode shells through the invoking `mvmctl` binary.
+
+Run modes:
+
+```sh
+mvmctl compile ./sandbox.ts --out /tmp/sandbox-ir
+mvmctl run --mode plan ./sandbox.ts
+mvmctl run --mode live ./sandbox.ts
+```
+
+</TabItem>
+</Tabs>
+
+## Target result capture
+
+The product target is a typed result helper:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+result = sandbox.commands.run(["python", "/app/main.py"], timeout_seconds=30)
+print(result.exit_code)
+print(result.stdout)
+print(result.audit_id)
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+const result = await sandbox.commands.run(["node", "/app/main.js"], {
+  timeoutSeconds: 30,
+});
+console.log(result.exitCode);
+console.log(result.stdout);
+console.log(result.auditId);
+```
+
+</TabItem>
+</Tabs>
+
+Until this helper is shipped in a language SDK, use the CLI path for result
+capture, receipts, and automation that needs exit status or bounded output.
+
+## Target file reads
+
+The product target is a symmetric file API:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+sandbox.files.write("/work/input.json", b"{}")
+data = sandbox.files.read("/work/output.json")
+entries = sandbox.files.list("/work")
+sandbox.files.remove("/work/output.json")
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+await sandbox.files.write("/work/input.json", new TextEncoder().encode("{}"));
+const data = await sandbox.files.read("/work/output.json");
+const entries = await sandbox.files.list("/work");
+await sandbox.files.remove("/work/output.json");
+```
+
+</TabItem>
+</Tabs>
+
+Until read/list/remove helpers are shipped, use the CLI filesystem commands.
+Treat bytes returned from the guest as untrusted and possibly sensitive.
+
+## Target logs and ports
+
+Logs and ports should keep policy visible:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+for event in sandbox.logs(follow=True, redact=True):
+    print(event.message)
+
+forward = sandbox.ports.forward(host="127.0.0.1", host_port=8080, guest_port=8000)
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+for await (const event of sandbox.logs({ follow: true, redact: true })) {
+  console.log(event.message);
+}
+
+const forward = await sandbox.ports.forward({
+  host: "127.0.0.1",
+  hostPort: 8080,
+  guestPort: 8000,
+});
+```
+
+</TabItem>
+</Tabs>
+
+Until language helpers are shipped, use the CLI logging and port-forwarding
+commands. Bind host ports explicitly and avoid wildcard listeners unless the
+workflow requires them.
+
+## Target lifecycle and snapshots
+
+Lifecycle helpers should expose the same state model as the CLI:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+snapshot = sandbox.snapshot(name="after-index")
+sandbox.pause()
+sandbox.resume(snapshot=snapshot.id)
+sandbox.stop()
+sandbox.destroy()
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+const snapshot = await sandbox.snapshot({ name: "after-index" });
+await sandbox.pause();
+await sandbox.resume({ snapshot: snapshot.id });
+await sandbox.stop();
+await sandbox.destroy();
+```
+
+</TabItem>
+</Tabs>
+
+Until those helpers are shipped, use:
+
+```sh
+mvmctl pause agent-sandbox
+mvmctl resume agent-sandbox
+mvmctl snapshot save agent-sandbox after-index
+mvmctl snapshot restore agent-sandbox after-index
+mvmctl down agent-sandbox
+```
+
+Snapshots and cold state can contain memory, files, process state, and
+credentials. Retention and deletion policy should be explicit in automation.
+
+## Related pages
+
+- [SDK security model](/sdk/security-model/)
+- [Runtime modes](/sdk/runtime-modes/)
+- [Lifecycle matrix](/sdk/lifecycle-matrix/)
+- [Errors and metrics](/sdk/errors-metrics/)
+- [Lifecycle states](/working/lifecycle-states/)

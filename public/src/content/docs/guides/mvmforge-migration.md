@@ -40,11 +40,11 @@ surface.
   collapse the most common `image=` decoration into a single call.
 - Lifecycle hook kwargs on `@mvm.app(...)`: `before_build`,
   `before_start`, `after_start`, `before_stop`.
-- Deployment packaging moved behind mvmd-owned control-plane flows. `mvmctl`
-  keeps the local compile/build/run surface.
+- Packaging moved behind control-plane flows. `mvmctl` keeps the local
+  compile/build/run surface.
 - The Rust-side compile pipeline is now a library (`mvm-sdk::compile`),
-  so any consumer (mvmd, custom CI runners) can call into the same
-  rendering primitives without going through `mvmctl`.
+  so automation can call into the same rendering primitives without going
+  through `mvmctl`.
 
 ## Migration steps
 

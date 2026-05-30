@@ -124,6 +124,89 @@ html {
   margin-block: 1.5rem;
 }
 
+/* Code sample tabs — quiet editor tabs attached to one code frame. */
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) {
+  display: block;
+  overflow: hidden;
+  margin-block: 1.5rem;
+  border: 1px solid var(--color-code-border);
+  border-radius: 0.65rem;
+  background: var(--color-code-canvas);
+  box-shadow: none;
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .tablist-wrapper {
+  margin: 0;
+  padding: 0;
+  overflow-x: auto;
+  border-block-end: 1px solid var(--color-code-border);
+  background: var(--color-code-header);
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) [role='tablist'] {
+  display: flex;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .tab {
+  margin: 0;
+  line-height: 1;
+  border-inline-end: 1px solid color-mix(in srgb, var(--color-code-border) 78%, transparent);
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .tab > [role='tab'] {
+  min-width: 0;
+  padding: 0.55rem 0.95rem;
+  border: 0;
+  border-radius: 0;
+  color: color-mix(in srgb, var(--color-code-text) 58%, transparent);
+  font-family: var(--sl-font-system-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1;
+  text-align: center;
+  text-decoration: none;
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .tab > [role='tab']:hover {
+  color: var(--color-code-text);
+  background: color-mix(in srgb, var(--color-code-canvas) 72%, var(--color-code-header));
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .tab > [role='tab'][aria-selected='true'] {
+  color: var(--color-code-text);
+  background: var(--color-code-canvas);
+  box-shadow: inset 0 -1px 0 var(--color-code-canvas);
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) [role='tabpanel'] {
+  margin: 0;
+  padding: 0;
+  background: var(--color-code-canvas);
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) [role='tabpanel'] > .expressive-code {
+  margin-block: 0;
+}
+
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .expressive-code,
+[data-has-sidebar] main starlight-tabs:has(.expressive-code) .expressive-code .frame {
+  --ec-codeBg: var(--color-code-canvas) !important;
+  --ec-frm-edBg: var(--color-code-canvas) !important;
+  --ec-frm-edActTabBg: var(--color-code-canvas) !important;
+  --ec-frm-edTabBarBg: var(--color-code-header) !important;
+  --ec-frm-edTabBarBrdBtm: var(--color-code-border) !important;
+  --ec-codeFg: var(--color-code-text) !important;
+  --ec-brdCol: var(--color-code-border) !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+
 .expressive-code,
 .expressive-code .frame {
   --ec-codeBg: var(--color-surface) !important;
@@ -251,4 +334,3 @@ h2.text-title {
     border-color: color-mix(in srgb, var(--color-amber) 65%, transparent);
   }
 }
-

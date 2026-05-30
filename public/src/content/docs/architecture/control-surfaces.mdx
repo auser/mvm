@@ -1,0 +1,196 @@
+---
+title: Control surfaces
+description: The supported local ways to control mvm sandboxes, plus the surfaces that are partial or not claimed.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+`mvm` has several local control surfaces. They all drive the same runtime model:
+build or select an artifact, admit a plan, boot a microVM, talk to the guest
+agent where available, and record evidence for security-relevant actions.
+
+This page helps you choose the right surface without assuming that every product
+entry point is shipped everywhere.
+
+## Surface matrix
+
+| Surface | Best for | Current status |
+| --- | --- | --- |
+| `mvmctl` CLI | Local operation, scripting, CI, debugging, build/run lifecycle. | Shipped and broadest surface. |
+| Runtime SDK | Application-owned sandbox lifecycle from Python or TypeScript. | Partial; see lifecycle matrix. |
+| Declaration SDK | Code-first workload declarations compiled into Workload IR. | Shipped for supported literal declarations. |
+| MCP stdio | Local model-tool integration over the Model Context Protocol. | Shipped for local stdio tool calls. |
+| Console | Human debugging in development images. | Shipped where backend/image policy permits it. |
+| Guest RPC | Process, filesystem, readiness, and telemetry operations. | Backend/image dependent. |
+| REST API | HTTP management surface. | Not claimed in these local docs. |
+| Web dashboard | Browser-based management UI. | Not claimed in these local docs. |
+
+The CLI remains the stable automation boundary when an SDK helper does not yet
+cover an operation.
+
+## CLI
+
+Use `mvmctl` for the full local lifecycle:
+
+```sh
+mvmctl build ./agent
+mvmctl up ./agent --name agent-dev
+mvmctl exec agent-dev -- python /work/task.py
+mvmctl logs agent-dev
+mvmctl down agent-dev
+```
+
+Prefer JSON where available:
+
+```sh
+mvmctl ls --json
+mvmctl boot-report agent-dev --json
+mvmctl run --dry-run --json -- python task.py
+```
+
+CLI automation should use argv arrays, explicit timeouts, and receipts for
+security-relevant runs.
+
+## Runtime SDK
+
+Use the runtime SDK when application code should own a sandbox lifecycle:
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+import mvm
+
+with mvm.Sandbox.create("python-3.12", workload_id="tool") as sandbox:
+    sandbox.files.write("/app/main.py", "print('hello')")
+    sandbox.commands.start(["python", "/app/main.py"])
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { Sandbox } from "mvm-sdk";
+
+using sandbox = Sandbox.create("node-22", { workloadId: "tool" });
+sandbox.files.write("/app/main.js", "console.log('hello')");
+sandbox.commands.start(["node", "/app/main.js"]);
+```
+
+</TabItem>
+</Tabs>
+
+Current SDKs expose create, command start, file write, record mode, live mode,
+and cleanup helpers. Higher-level command results, file read/list/remove, logs,
+ports, snapshots, cold mode, detach, and destroy remain parity targets.
+
+Use [Lifecycle matrix](/sdk/lifecycle-matrix/) before depending on a method in a
+language SDK.
+
+## Declaration SDK
+
+Use declarations when the workload should be reviewed and compiled before it
+runs:
+
+<Tabs syncKey="declaration-language">
+<TabItem label="Python">
+
+```python
+import mvm
+
+@mvm.app(
+    name="worker",
+    source=mvm.local_path("."),
+    image=mvm.nix_packages(["python312"]),
+    network=mvm.network(mode="deny"),
+)
+def run() -> str:
+    return "ok"
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import * as mvm from "mvm-sdk";
+
+export const run = mvm.app({
+  name: "worker",
+  source: mvm.localPath("."),
+  image: mvm.nixPackages(["nodejs_22"]),
+  network: mvm.network({ mode: "deny" }),
+})((): string => "ok");
+```
+
+</TabItem>
+</Tabs>
+
+The declaration workflow is the safer authoring path for deployable workloads
+because supported declarations are extracted without importing the module.
+
+## MCP stdio
+
+Use the local MCP surface when a model client needs a tool server that routes
+execution into mvm instead of the host process. The server speaks stdio and is
+intended for local tool integration.
+
+Relevant limits are controlled by:
+
+| Variable | Purpose |
+| --- | --- |
+| `MVM_MCP_SESSION_IDLE` | Idle timeout for a tool session. |
+| `MVM_MCP_SESSION_MAX` | Maximum lifetime for a tool session. |
+| `MVM_MCP_MAX_INFLIGHT` | Maximum concurrent tool calls. |
+| `MVM_MCP_MEM_CEILING_MIB` | Per-call memory ceiling before dispatch. |
+
+MCP is not a general remote management API. Keep it local, bounded, and tied to
+policy profiles.
+
+## Console
+
+Use console access for human debugging:
+
+```sh
+mvmctl console agent-dev
+mvmctl console agent-dev --command "uname -a"
+```
+
+Console access is broad authority inside the guest. Development images can
+enable it; sealed production-style images should refuse it and rely on declared
+entrypoints, logs, guest RPC, and audit records instead.
+
+## Guest RPC
+
+Guest RPC is the underlying controlled path for operations such as process
+start, filesystem access, readiness probes, console PTY traffic, and telemetry
+where the backend and image permit them.
+
+Use the high-level CLI or SDK surface unless you are debugging a protocol-level
+issue. Protocol frames and guest payloads are not a substitute for receipts or
+audit-chain evidence.
+
+## Not claimed here
+
+These local docs do not claim a shipped HTTP management API or browser
+dashboard. Scripts should use `mvmctl` JSON output or the current SDK surfaces
+instead of assuming a long-running local server.
+
+If an integration needs language-neutral automation today, prefer subprocess
+calls to `mvmctl` with JSON output and explicit state directories.
+
+## Security checklist
+
+- Choose the narrowest surface that fits the task.
+- Use static declarations for reviewable deployable workloads.
+- Use runtime SDK live mode only for trusted SDK scripts.
+- Keep console access out of production-style paths.
+- Keep MCP local and bounded by concurrency, memory, and session limits.
+- Treat stdout, stderr, logs, console bytes, and screenshots as sensitive.
+- Store receipts or audit identifiers with higher-level automation traces.
+
+## Related pages
+
+- [Programmatic use](/reference/programmatic-use/)
+- [Lifecycle matrix](/sdk/lifecycle-matrix/)
+- [Runtime modes](/sdk/runtime-modes/)
+- [Audit and receipts](/guides/audit-and-receipts/)

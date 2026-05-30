@@ -60,8 +60,8 @@ Snapshot may be corrupted after a Firecracker version change.
 
 **Fix**: Delete the snapshot and cold boot:
 ```bash
-mvmctl template build <template> --force
-mvmctl up --manifest <template> --name <name>
+mvmctl build <project-dir> --force
+mvmctl up <project-dir> --name <name>
 ```
 
 ## Build Issues
@@ -125,18 +125,20 @@ error: hash mismatch in fixed-output derivation
 **Fix**: Update the hash to the value shown after `got:` in the error message, or use `--update-hash`:
 
 ```bash
-mvmctl template build my-service --update-hash
+mvmctl build ./my-service --update-hash
 ```
 
-### Template not found
+### Manifest not found
 
 ```
-error: Template 'foo' not found
+error: no mvm.toml found
 ```
 
-**Fix**: Check available templates:
+**Fix**: run from a project directory with `mvm.toml`, pass an explicit path,
+or inspect built manifest slots:
+
 ```bash
-mvmctl template list
+mvmctl manifest ls
 ```
 
 ### Timeout / Connection errors

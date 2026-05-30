@@ -1,0 +1,84 @@
+---
+title: Agent sandbox
+description: Run generated or third-party agent code in a microVM with explicit build, network, file, and snapshot boundaries.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Use this pattern when an agent needs a real Linux environment but the code it runs should not share the host process, host filesystem, or host network by default.
+
+## Build the sandbox image
+
+Prefer a pinned Nix flake target:
+
+```sh
+cargo run -- build --flake .
+```
+
+The command runs on the host, while Linux Nix evaluation and image assembly happen inside the builder VM. The runtime guest later boots the built artifact; build time and boot time are separate phases.
+
+If your team already has an OCI image, use the OCI path as compatibility input and pin the resolved digest in production policy. See [Nix and OCI](/guides/nix-and-oci/).
+
+## Run locally
+
+```sh
+cargo run -- up agent-sandbox --flake .
+cargo run -- exec agent-sandbox -- python /work/agent.py
+```
+
+Local mode talks to `mvm` on the same host. The microVM is the execution boundary.
+
+## Planned runtime SDK shape
+
+> **Status:** Planned lifecycle API. The CLI path above is the current concrete path.
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+from mvm import Sandbox, NetworkPolicy
+
+sandbox = Sandbox.create(
+    image="nix:./flake#agent",
+    network=NetworkPolicy.deny_by_default(),
+)
+
+try:
+    result = sandbox.exec(["python", "/work/agent.py"], timeout_seconds=60)
+    print(result.stdout)
+finally:
+    sandbox.stop()
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { NetworkPolicy, Sandbox } from "@mvm/sdk";
+
+const sandbox = await Sandbox.create({
+  image: "nix:./flake#agent",
+  network: NetworkPolicy.denyByDefault(),
+});
+
+try {
+  const result = await sandbox.exec(["python", "/work/agent.py"], {
+    timeoutSeconds: 60,
+  });
+  console.log(result.stdout);
+} finally {
+  await sandbox.stop();
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Security checklist
+
+- Start with deny-by-default network policy; allow only the endpoints the agent needs.
+- Pass secrets as references, not plaintext env values or broad files.
+- Avoid mounting the host project read-write unless you are in an explicit dev profile.
+- Treat logs as sensitive because generated code can print data.
+- Use [cold mode](/working/cold-mode/) when you want recoverable state instead of keeping the VM running.
+- Link audit output to the run when promoting the workflow beyond local development.

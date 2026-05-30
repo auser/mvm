@@ -1,43 +1,49 @@
 ---
 title: Transparent rebuilds
-description: Install packages from the console and have your session resume seamlessly on the new microVM
+description: Rebuild a development image while preserving intentional workspace state.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+> **Status:** Planned product workflow. The current safe workflow is explicit:
+> edit the flake or manifest, run `mvmctl build`, restart or replace the VM,
+> and keep persistent data in declared workspace state.
 
-Flagship UX page. Document the user-visible flow of "install a
-package and stay in your shell":
+Transparent rebuilds are the target developer experience for package changes:
+the user asks for a new dependency, `mvm` rebuilds the rootfs through the
+builder VM, the running development session is replaced, and the intended
+workspace state remains available.
 
-1. User runs `mvmctl install python:3.12` (or the in-VM equivalent
-   that calls back to the host).
-2. The console pauses with a progress indicator ("rebuilding
-   rootfs…"). Tmux scrollback is preserved; cwd, env, and pending
-   RPCs are checkpointed.
-3. The warm builder microVM regenerates the rootfs (≤ 30 s with
-   cached substituters; ≤ 5 s if everything is cached).
-4. Rolling swap: pause → swap rootfs → resume. The persistent
-   `/workspace` overlay stays mounted, so user files survive.
-5. The console reattaches automatically. The user sees the new
-   prompt with the package available. To them, it feels like a
-   local install — no awareness of a VM swap.
+## Current explicit workflow
 
-Honest caveats: live processes inside the VM do restart on swap
-(CRIU-based in-flight checkpointing is post-Phase-10). Tmux
-sessions reattach intact (their state is in the overlay).
+```sh
+$EDITOR flake.nix
+mvmctl build ./my-app
+mvmctl down devbox
+mvmctl up ./my-app --name devbox
+mvmctl console devbox
+```
 
-Show `--explain` (diff of base layers) and `mvmctl rebuild
---dry-run` (preview what would change) as inspection tools.
+This keeps rebuild semantics obvious. The rootfs comes from the Nix flake; the
+runtime guest boots the built artifact; persistent files must live in declared
+workspace state rather than accidental image mutation.
 
-Cross-references:
-- console/attach
-- working/persistence
-- working/snapshots
-- plan 60 §"Transparent install / rebuild" (Phase 7a)
-- plan 60 §"Snapshots — first-class feature"
-- plan 60 §"Long-running sessions"
-- ADR-013 (libkrun/libkrun pivot — the warm builder design)
--->
+## Planned workflow shape
 
-> This page is a placeholder. Content is being written — see plan 62.
+The transparent version should preserve the same security boundary:
+
+1. Detect the requested package or flake change.
+2. Build the new artifact in the builder VM.
+3. Show the rebuild plan and changed inputs.
+4. Stop or pause the development VM.
+5. Boot the new artifact.
+6. Reattach the console when the guest is ready.
+
+Live in-guest processes should be treated as restarted unless a future
+checkpoint mechanism is explicitly implemented and verified.
+
+## Security requirements
+
+- Rebuilds must go through the builder VM, not ad-hoc in-guest mutation.
+- Changed inputs should be visible before replacement.
+- Persistent state must be deliberate and scoped.
+- Secrets should not be baked into the rebuilt image.
+- Rollback should use an earlier recorded artifact, not an untracked rootfs.

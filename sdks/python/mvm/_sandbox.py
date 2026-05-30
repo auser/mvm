@@ -1,4 +1,4 @@
-"""Sandbox — e2b-style imperative runtime SDK. SDK port Phase 7b +
+"""Sandbox — imperative runtime SDK. SDK port Phase 7b +
 Plan 73 Followup H-live.
 
 The decorator surface (``@mvm.app(...)``) is static; the host

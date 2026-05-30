@@ -1,0 +1,55 @@
+---
+title: Python SDK
+description: Python runtime and decorator SDK status.
+---
+
+The Python SDK currently exposes both runtime and declarative surfaces.
+
+## Runtime
+
+Current:
+
+- `mvm.Sandbox.create(template, ...)`
+- `sandbox.commands.start(argv, env=...)`
+- `sandbox.files.write(path, content)`
+- context-manager cleanup with `with`
+- record mode for `mvmctl compile` and `mvmctl run --mode plan`
+- live mode for `mvmctl run --mode live`
+
+Planned:
+
+- command result capture through `commands.run(...)`;
+- file read/list/remove;
+- logs and event streams;
+- port helpers;
+- snapshot, cold, resume, detach, destroy;
+- additional lifecycle result types once the local runtime transport supports them.
+
+## Decorator
+
+Current:
+
+```python
+import mvm
+
+@mvm.app(
+    name="worker",
+    source=mvm.local_path("."),
+    image=mvm.nix_packages(["python312"]),
+    network=mvm.network(mode="deny"),
+)
+def run() -> str:
+    return "ok"
+```
+
+The static compiler extracts literal decorator declarations without importing the module.
+
+## Security notes
+
+- Runtime scripts execute host-side SDK code.
+- Decorator compile is preferred for deployable workloads.
+- Secret values should be represented as references.
+- Network policy should be explicit in examples and tests.
+
+See [Runtime modes](/sdk/runtime-modes/) before using live mode in automation.
+See [Operations cookbook](/sdk/operations-cookbook/) for current calls, target helpers, and CLI fallbacks.

@@ -3,6 +3,8 @@ title: From Workload IR to MicroVM Image
 description: How mvm lowers an SDK-emitted Workload IR through Nix factories into a bootable microVM rootfs.
 ---
 
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
 This guide explains the full pipeline that turns a workload described in an SDK (Python, Rust) into a bootable microVM rootfs. The pipeline has three layers and a build orchestrator; each layer is a small, addressable boundary you can read, replace, or skip.
 
 ```
@@ -100,9 +102,10 @@ Validation runs in two places: in the SDK before emit, and again on the host whe
 
 ## Layer 2 — Producing the IR from an SDK
 
-The SDKs (Python today, Rust today, TypeScript soon) are all generated from the JSON schema for `Workload`, so they cannot drift from the IR. They share one **subprocess contract** (ADR-0002): the SDK runs the user's declaration code, builds an in-memory IR, and writes it out as canonical JSON. It never runs the user's workload on the host.
+The SDKs are all generated from the JSON schema for `Workload`, so they cannot drift from the IR. They share one **subprocess contract** (ADR-0002): the SDK runs the user's declaration code, builds an in-memory IR, and writes it out as canonical JSON. It never runs the user's workload on the host.
 
-### Python
+<Tabs syncKey="sdk-authoring-language">
+<TabItem label="Python">
 
 ```python
 import mvm
@@ -120,7 +123,30 @@ def greet(name: str) -> str:
 
 `mvmctl emit entry.py` runs the user's module under `MVM_EMITTING=1` and `MVM_IR_OUT=/path/to/workload-ir.json`. The decorators build a `Workload` dataclass tree, `_dsl.emit_json()` calls `json.dumps(..., sort_keys=True, separators=(",", ":"))`, and the canonical bytes land at `MVM_IR_OUT` (or stdout when unset).
 
-### Rust
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import * as mvm from "mvm-sdk";
+
+export const greet = mvm.app({
+  name: "hello",
+  image: mvm.nixPackages(["nodejs_22"]),
+  resources: mvm.resources({ vcpus: 1, memory_mb: 256 }),
+  dependencies: mvm.deps.none(),
+  entrypoint: mvm.entrypointFunction({
+    language: "typescript",
+    module: "app",
+    function: "greet",
+    format: "json",
+  }),
+})((name: string): string => `hello, ${name}`);
+```
+
+`mvmctl emit entry.ts` runs the declaration under the same `MVM_EMITTING=1` and `MVM_IR_OUT=/path/to/workload-ir.json` contract. The TypeScript helpers emit canonical IR through the same schema-owned shape as Python.
+
+</TabItem>
+<TabItem label="Rust">
 
 ```rust
 use mvm_sdk::{workload, image, resources};
@@ -137,6 +163,9 @@ fn main() -> Result<(), mvm_sdk::EmitError> {
 ```
 
 The Rust builders are `#[must_use]` and enforce required fields at compile time. `emit()` honors the same `MVM_IR_OUT` contract.
+
+</TabItem>
+</Tabs>
 
 After emission, you have a `workload-ir.json` file on disk. That's the boundary between "your code" and "mvm's build pipeline."
 
@@ -278,7 +307,10 @@ If you change something the helper validates against (e.g. add a second app), Ni
 
 This section walks one workload end-to-end so you can see every layer's output.
 
-### The Python source
+### The source
+
+<Tabs syncKey="sdk-authoring-language">
+<TabItem label="Python">
 
 `src/app.py`:
 
@@ -287,7 +319,24 @@ def greet(name: str) -> str:
     return f"hello, {name}"
 ```
 
+</TabItem>
+<TabItem label="TypeScript">
+
+`src/app.ts`:
+
+```ts
+export function greet(name: string): string {
+  return `hello, ${name}`;
+}
+```
+
+</TabItem>
+</Tabs>
+
 ### The SDK declaration
+
+<Tabs syncKey="sdk-authoring-language">
+<TabItem label="Python">
 
 `entry.py`:
 
@@ -310,6 +359,33 @@ import mvm
 )
 def _spec(): pass
 ```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+`entry.ts`:
+
+```ts
+import * as mvm from "mvm-sdk";
+
+export const spec = mvm.app({
+  name: "hello",
+  source: mvm.source.local("./src"),
+  image: mvm.nixPackages(["nodejs_22"]),
+  resources: mvm.resources({ vcpus: 1, memory_mb: 256 }),
+  dependencies: mvm.deps.none(),
+  entrypoint: mvm.entrypointFunction({
+    language: "typescript",
+    module: "app",
+    function: "greet",
+    format: "json",
+    primary: true,
+  }),
+})(() => undefined);
+```
+
+</TabItem>
+</Tabs>
 
 ### The emitted IR
 

@@ -1,26 +1,49 @@
 ---
 title: Attach to a microVM
-description: Open an interactive shell to a running microVM and reattach across sessions
+description: Open an interactive shell to a running microVM.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+Start a development microVM, then attach:
 
-Document `mvmctl console <name>` end-to-end:
-- accessible vs sealed images (the gate that decides if a console
-  is even available — sealed production images refuse)
-- one-shot exec (`--command "uname -a"`) vs interactive shell
-- detach/reattach across host disconnects (long-running tmux-backed
-  sessions; survive `mvmctl down`/`up`, host suspend/resume)
-- scrollback semantics, signals, terminal size negotiation
+```sh
+mvmctl up ./my-app --name devbox
+mvmctl console devbox
+```
 
-Cross-references:
-- console/index
-- console/transparent-rebuild
-- crates/mvm-guest/src/console.rs
-- plan 60 §"Long-running sessions"
-- plan 60 W6.2 (the accessible/sealed gate implementation)
--->
+The console uses the project's guest-control path rather than requiring SSH
+inside the guest. That keeps the base image smaller and avoids introducing a
+second always-on remote access service.
 
-> This page is a placeholder. Content is being written — see plan 62.
+## One-shot command
+
+```sh
+mvmctl console devbox --command "id && uname -a"
+```
+
+Use this for terminal-shaped checks. For normal automation, prefer:
+
+```sh
+mvmctl exec devbox -- id
+mvmctl proc start devbox -- python /work/task.py
+```
+
+## Attach behavior
+
+Console behavior depends on the active backend and image mode:
+
+- Development images may expose PTY-backed shell access.
+- Sealed images should refuse interactive console access.
+- Terminal resize, signal forwarding, and scrollback are backend-specific.
+- Console sessions end when the VM stops.
+
+When a backend cannot provide a console, use `mvmctl logs`, `mvmctl exec`, and
+guest readiness probes to debug the workload.
+
+## Security checklist
+
+- Do not treat console access as a production management API.
+- Avoid pasting secrets into an interactive shell.
+- Prefer short-lived dev sandboxes for debugging third-party code.
+- Stop or cold-pause the VM when the debugging session is over.
+- Capture relevant state with explicit files or logs instead of relying on
+  terminal scrollback.

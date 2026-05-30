@@ -214,7 +214,7 @@ Host (macOS Apple Silicon / native Linux KVM)
 
 ## Build Pipeline
 
-`mvmctl build` and `mvmctl template build` are host commands that stage a build job for the builder VM. The builder VM invokes `nix build` inside Linux, producing:
+`mvmctl build` is a host command that discovers a manifest-backed project and stages a build job for the builder VM. The builder VM invokes `nix build` inside Linux, producing:
 
 - **vmlinux** -- Firecracker-compatible kernel
 - **rootfs.ext4** or **rootfs.squashfs** -- guest root filesystem

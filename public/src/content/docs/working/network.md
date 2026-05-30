@@ -1,19 +1,61 @@
 ---
 title: Network & exposing ports
-description: Internet access, port forwarding, exposing services
+description: Control egress and expose guest services intentionally.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+Networking is part of the sandbox contract. Name what the guest can reach, name what ports are exposed, and keep service exposure separate from outbound egress.
 
-User-facing networking workflow: how to expose a port from the
-guest, how egress is controlled, when to use TAP vs vsock. Split
-from `guides/networking.md` (architectural detail stays there).
+## Egress policy
 
-Cross-references:
-- guides/networking.md
-- crates/mvm-runtime/src/vm/network.rs
--->
+Use a preset when it matches the workload:
 
-> This page is a placeholder. Content is being written — see plan 62.
+```sh
+mvmctl up --flake . --network-preset none
+mvmctl up --flake . --network-preset registries
+mvmctl up --flake . --network-preset dev
+```
+
+Use explicit allow rules for narrow agent workloads:
+
+```sh
+mvmctl up --flake . \
+  --network-allow api.example.com:443 \
+  --network-allow github.com:443
+```
+
+For security-sensitive examples, start from no egress and add only required destinations.
+For grant review, SDK declarations, and agent-tool policy, see [Network egress policy](/guides/network-egress-policy/).
+
+## Port forwarding
+
+Expose a guest service to the host:
+
+```sh
+mvmctl up --flake . --name api-dev -p 8080:8080
+mvmctl forward api-dev -p 3000:3000
+```
+
+Use readiness and logs while developing services:
+
+```sh
+mvmctl wait api-dev --for all
+mvmctl boot-report api-dev
+mvmctl logs api-dev -f
+```
+
+## Host control channel
+
+Host control does not require SSH. Guest communication uses the mvm control plane and guest protocol where supported. For debugging, prefer:
+
+```sh
+mvmctl console api-dev
+mvmctl logs api-dev
+mvmctl exec api-dev -- sh -lc 'id && pwd'
+```
+
+## Security notes
+
+- Do not expose ports unless the workflow requires it.
+- Keep inbound port forwarding and outbound egress policy separate.
+- Treat browser automation and agent workflows as high-risk network users.
+- Prefer explicit allowlists over broad presets for production-like runs.

@@ -1,0 +1,183 @@
+---
+title: Network egress policy
+description: Apply deny-first outbound network rules for agents, services, package installs, and browser automation.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Network access is a sandbox capability. Treat it like filesystem writes or
+secret grants: start closed, add the smallest destination set that makes the
+workload useful, and record why the grant exists.
+
+This page focuses on outbound egress. For backend network layout and port
+forwarding mechanics, see [Networking](/guides/networking/).
+
+## Policy levels
+
+| Level | Use when | Example |
+| --- | --- | --- |
+| No egress | Generated code, code interpreters, offline analysis. | `--network-preset none` |
+| Package registries | Build or install steps need language registries. | `--network-preset registries` |
+| Local development | A developer needs common dev services. | `--network-preset dev` |
+| Explicit allowlist | Production-like agent or service path. | `--network-allow api.example.com:443` |
+| Unrestricted | Local debugging only. | Avoid for untrusted workloads. |
+
+For security-sensitive examples, use no egress or explicit allowlists. Broad
+presets are convenience tools, not production policy.
+
+## CLI patterns
+
+Start closed:
+
+```sh
+mvmctl up --flake . --name agent-sandbox --network-preset none
+```
+
+Allow only package registries for install-heavy workflows:
+
+```sh
+mvmctl up --flake . --name build-sandbox --network-preset registries
+```
+
+Allow named destinations:
+
+```sh
+mvmctl up --flake . --name agent-sandbox \
+  --network-preset none \
+  --network-allow api.openai.com:443 \
+  --network-allow github.com:443
+```
+
+Keep inbound ports separate from outbound egress:
+
+```sh
+mvmctl up --flake . --name api-dev \
+  --network-preset none \
+  -p 127.0.0.1:8080:8080
+```
+
+Opening a host port does not mean the guest should have outbound internet
+access.
+
+## SDK declaration pattern
+
+Static declarations should make network posture reviewable:
+
+<Tabs syncKey="network-declaration-language">
+<TabItem label="Python">
+
+```python
+network=mvm.network(mode="none")
+```
+
+For a reviewed outbound grant:
+
+```python
+network=mvm.network(
+    mode="bridge",
+    egress=mvm.egress([
+        mvm.host_port("api.openai.com", 443),
+    ]),
+    dns=mvm.dns_system(),
+)
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+network: mvm.network({ mode: "none" })
+```
+
+For a reviewed outbound grant:
+
+```ts
+network: mvm.network({
+  mode: "bridge",
+  egress: mvm.egress([
+    mvm.hostPort("api.openai.com", 443),
+  ]),
+  dns: mvm.dnsSystem(),
+})
+```
+
+</TabItem>
+</Tabs>
+
+Use [Declaration cookbook](/sdk/declaration-cookbook/) for the full decorator
+shape.
+
+## Agent tool policy
+
+Do not let a model choose arbitrary network destinations. The application
+should map a capability to a fixed grant:
+
+```json
+{
+  "tool": "web_fetch",
+  "network": {
+    "mode": "bridge",
+    "allow": [
+      {
+        "host": "api.openai.com",
+        "port": 443
+      }
+    ]
+  }
+}
+```
+
+Validation rules:
+
+- reject wildcard hosts, CIDRs, and user-provided raw proxy URLs unless the
+  policy explicitly supports them;
+- allow only expected ports for each tool capability;
+- keep DNS policy explicit when the workload depends on names;
+- store the grant decision with the audit/run identifier;
+- return policy denial distinctly from transport or guest command failure.
+
+## Browser and desktop automation
+
+Browser and desktop automation should be treated as high-risk network users.
+They may carry cookies, sessions, downloads, and rendered user data.
+
+Use a dedicated profile:
+
+- no broad host mounts;
+- short TTL;
+- explicit egress allowlist;
+- isolated persistent workspace if state must survive;
+- no credential-bearing browser profile unless the task requires it;
+- cold state or snapshots retained only with a clear retention rule.
+
+## Backend enforcement notes
+
+The enforcement mechanism is backend-specific:
+
+- Linux Firecracker paths can enforce bridge traffic with host firewall rules.
+- macOS backends enforce through their host-side network layer.
+- Some local debugging backends may have weaker isolation tiers.
+
+Docs and examples should describe the product policy first, then name backend
+limits where the mechanism matters. Do not turn a backend convenience path into
+a product security claim without tests and claim-ledger evidence.
+
+## Review checklist
+
+Before allowing egress:
+
+- name the exact host and port;
+- confirm why the workload needs it;
+- confirm whether DNS is needed;
+- confirm whether the destination can receive secrets or user data;
+- confirm logs and receipts will not expose payload data;
+- confirm cleanup or retention behavior for any downloaded files.
+
+## Related pages
+
+- [Networking](/guides/networking/)
+- [Network & exposing ports](/working/network/)
+- [Policy profiles](/guides/policy-profiles/)
+- [Agent tool contract](/guides/agent-tool-contract/)
+- [SDK security model](/sdk/security-model/)
+- [Audit and receipts](/guides/audit-and-receipts/)

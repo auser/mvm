@@ -1,0 +1,83 @@
+---
+title: LLM tool integration
+description: Use mvm as the execution backend for an LLM tool while keeping egress, secrets, and logs explicit.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+An LLM tool should treat the sandbox as an untrusted execution target. The model proposes code or commands; `mvm` runs them in a microVM with policy.
+For the production tool boundary, request schema, response schema, and retention rules, see [Agent tool contract](/guides/agent-tool-contract/).
+
+## Tool loop shape
+
+```text
+LLM
+  -> tool call: run code
+  -> app validates request
+  -> mvm sandbox exec
+  -> app redacts output
+  -> LLM receives result
+```
+
+## Planned runtime SDK shape
+
+> **Status:** Planned lifecycle API.
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+def run_code_tool(code: str) -> dict:
+    sandbox = Sandbox.create(
+        image="nix:./flake#python-tool",
+        network=NetworkPolicy.deny_by_default(),
+    )
+    try:
+        sandbox.files.write("/work/main.py", code.encode())
+        result = sandbox.exec(["python", "/work/main.py"], timeout_seconds=10)
+        return {
+            "exit_code": result.exit_code,
+            "stdout": redact(result.stdout),
+            "stderr": redact(result.stderr),
+        }
+    finally:
+        sandbox.stop()
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+async function runCodeTool(code: string): Promise<Record<string, unknown>> {
+  const sandbox = await Sandbox.create({
+    image: "nix:./flake#node-tool",
+    network: NetworkPolicy.denyByDefault(),
+  });
+
+  try {
+    await sandbox.files.write("/work/main.js", code);
+    const result = await sandbox.exec(["node", "/work/main.js"], {
+      timeoutSeconds: 10,
+    });
+    return {
+      exit_code: result.exitCode,
+      stdout: redact(result.stdout),
+      stderr: redact(result.stderr),
+    };
+  } finally {
+    await sandbox.stop();
+  }
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Secure defaults
+
+- Validate the tool request before it reaches `mvm`.
+- Set a timeout.
+- Keep network disabled unless the tool needs a named endpoint.
+- Use secret references only when the tool has a policy reason to access a credential.
+- Redact output before returning it to the model.
+- Store the audit/run identifier with the LLM trace.

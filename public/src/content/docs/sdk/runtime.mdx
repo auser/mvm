@@ -1,0 +1,166 @@
+---
+title: Runtime SDK
+description: Current and planned lifecycle APIs for creating, executing, inspecting, snapshotting, and stopping mvm sandboxes from application code.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+The runtime SDK is the application-facing sandbox API. It is the surface you use when your product needs to create a microVM, run generated code, exchange files, inspect output, and clean up.
+
+> **Status:** Partially implemented. `sdks/python` and `sdks/typescript` already expose `Sandbox.create(...)`, command start, file write, record mode, live mode, and cleanup helpers. The remaining lifecycle methods below are the parity target; do not treat every method name on this page as a shipped package API.
+
+For the execution-mode split between record, plan, live, and static declaration
+flows, see [Runtime modes](/sdk/runtime-modes/).
+For the host/guest trust boundary, see [SDK security model](/sdk/security-model/).
+
+## Current SDK surface
+
+The current local imperative runtime path has two transports:
+
+- Record mode runs a `Sandbox.create(...)` script on the host and records operations into Workload IR for build or admission checks.
+- Live mode runs the script with `MVM_SDK_MODE=live`; the SDK shells through the invoking `mvmctl` binary to boot a real microVM and apply command/file operations.
+
+<Tabs syncKey="runtime-sdk-current-surface">
+<TabItem label="Python">
+
+```python
+import mvm
+
+with mvm.Sandbox.create("python-3.12", workload_id="agent-tool") as sandbox:
+    sandbox.files.write("/app/main.py", "print('hello from mvm')")
+    sandbox.commands.start(["python", "/app/main.py"])
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { Sandbox } from "mvm-sdk";
+
+using sandbox = Sandbox.create("node-22", { workloadId: "agent-tool" });
+sandbox.files.write("/app/main.js", "console.log('hello from mvm')");
+sandbox.commands.start(["node", "/app/main.js"]);
+```
+
+</TabItem>
+<TabItem label="CLI">
+
+```sh
+mvmctl compile ./agent.py --out /tmp/agent-ir
+mvmctl run --mode plan ./agent.py
+mvmctl run --mode live ./agent.py
+```
+
+</TabItem>
+</Tabs>
+
+Use the static decorator path when you need host-side compile without executing user modules.
+
+## Target shape
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+from mvm import Sandbox, NetworkPolicy, SecretRef
+
+sandbox = Sandbox.create(
+    image="nix:./flake#agent-runtime",
+    network=NetworkPolicy.deny_by_default().allow_https("api.openai.com"),
+    secrets={"OPENAI_API_KEY": SecretRef("openai-api-key")},
+    cpu=2,
+    memory_mb=2048,
+)
+
+try:
+    result = sandbox.commands.run(["python", "main.py"], timeout_seconds=30)
+    print(result.stdout)
+    snapshot = sandbox.snapshot(name="after-first-run")
+finally:
+    sandbox.stop()
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+import { NetworkPolicy, Sandbox, SecretRef } from "@mvm/sdk";
+
+const sandbox = await Sandbox.create({
+  image: "nix:./flake#agent-runtime",
+  network: NetworkPolicy.denyByDefault().allowHttps("api.openai.com"),
+  secrets: { OPENAI_API_KEY: SecretRef.from("openai-api-key") },
+  cpu: 2,
+  memoryMb: 2048,
+});
+
+try {
+  const result = await sandbox.commands.run(["node", "main.js"], {
+    timeoutSeconds: 30,
+  });
+  console.log(result.stdout);
+  const snapshot = await sandbox.snapshot({ name: "after-first-run" });
+} finally {
+  await sandbox.stop();
+}
+```
+
+</TabItem>
+</Tabs>
+
+The same core operations should exist across Python, TypeScript, and Rust:
+
+| Operation | Purpose | Security notes |
+| --- | --- | --- |
+| `create` | Start or allocate a sandbox. | Must bind policy, image digest/source, and owner lease. |
+| `commands.run` | Run a command or entrypoint and return captured output. | Args and output are logged carefully; secrets are redacted. |
+| `files.read/write/list/remove` | Exchange files with the guest. | Must prevent path traversal and clarify host mount boundaries. |
+| `logs` | Stream guest and supervisor events. | Logs must not expose secret material. |
+| `snapshot` / `fork` | Capture and branch sandbox state. | Snapshot contents and retention policy must be explicit. |
+| `stop` | Stop the sandbox and release leases. | Non-detached sandboxes should clean up on parent death. |
+| `destroy` | Delete sandbox state. | Deletion guarantees depend on backend and storage layer. |
+| `detach` | Keep a sandbox alive after the client exits. | Requires explicit ownership and cleanup semantics. |
+
+## Cold mode and snapshots
+
+The runtime SDK should expose cold mode as a first-class lifecycle state, not as an implementation detail. `mvm` already has backend-specific snapshot primitives:
+
+- Firecracker `mvmctl pause` / `mvmctl resume` writes and verifies sealed instance snapshots.
+- Vz `mvmctl snapshot save` / `mvmctl snapshot restore` stores machine-state files and records hashes in the audit chain.
+- Pool instances have Sleeping/Running restore paths for base and delta snapshots.
+
+The SDK contract should hide backend mechanics but not hide security semantics. A cold sandbox still has sensitive state on disk. Restore should surface whether the snapshot matched the recorded audit hash or seal, and retention policy must be explicit.
+
+## Local mode
+
+Local mode talks to `mvm` on the same host and owns the child lifecycle directly. If the runtime SDK needs a primitive that `mvm` does not have, the primitive belongs in `mvm` first.
+
+## Secure-by-default contract
+
+Runtime SDK examples should follow these rules:
+
+- Prefer Nix flake targets for reproducible workloads.
+- Treat the builder VM as the secure build boundary for Linux image construction.
+- Use digest-pinned OCI refs when showing OCI compatibility.
+- Use secret references; do not place real credentials in guest env or files by default.
+- Make network allowlists explicit.
+- Treat snapshots as sensitive state.
+- Surface audit identifiers in return values so users can connect SDK actions to the audit chain.
+- Surface cold-mode state explicitly: running, stopped, paused/sleeping, restoring, or destroyed.
+
+## Verification needed before this page becomes shipped API docs
+
+- Shared fixture suite for Rust, Python, and TypeScript.
+- Live-mode tests for result capture, streaming, file reads, and snapshot/cold-mode operations.
+- Parent-process cleanup tests.
+- Secret redaction tests for errors, logs, and panic paths.
+- File API tests for traversal, symlink escape, large files, and concurrent writes.
+- Local `mvm` behavior tests for the full lifecycle contract.
+
+## Related pages
+
+- [Runtime modes](/sdk/runtime-modes/)
+- [SDK security model](/sdk/security-model/)
+- [Sandbox types](/sdk/sandbox-types/)
+- [Lifecycle matrix](/sdk/lifecycle-matrix/)
+- [Errors and metrics](/sdk/errors-metrics/)

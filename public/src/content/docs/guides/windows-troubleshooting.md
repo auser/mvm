@@ -5,7 +5,7 @@ description: "Windows-specific notes for mvm. Windows is not a supported local m
 
 This page is the Windows-specific FAQ and research note. For current Windows guidance see [Install on Windows](/install/windows); for WSL2 caveats see [the WSL2 notes](/guides/windows-wsl2). General mvm troubleshooting lives in [the main troubleshooting page](/guides/troubleshooting).
 
-Windows is not a supported local microVM host today. WSL2 nested KVM and a Hyper-V managed Linux builder are future backend work.
+Windows is not a supported local microVM host today. WSL2 nested KVM and a Hyper-V managed Linux builder are future backend work tracked in [mvm#428](https://github.com/tinylabscom/mvm/issues/428).
 
 ## Setup
 

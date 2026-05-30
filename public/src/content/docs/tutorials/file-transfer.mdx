@@ -1,0 +1,55 @@
+---
+title: File transfer
+description: Move files in and out of a microVM without turning the whole host filesystem into the sandbox interface.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+File transfer should be explicit. A narrow copy operation is easier to audit and reason about than a broad writable host mount.
+
+## Copy into the guest
+
+```sh
+cargo run -- cp ./input.json filebox:/work/input.json
+cargo run -- exec filebox -- python /work/process.py /work/input.json
+```
+
+## Copy out of the guest
+
+```sh
+cargo run -- cp filebox:/work/output.json ./output.json
+```
+
+Use host mounts only when the workflow is intentionally a development workflow and the mounted path is narrow.
+
+## Planned runtime SDK shape
+
+> **Status:** Planned lifecycle API.
+
+<Tabs syncKey="runtime-language">
+<TabItem label="Python">
+
+```python
+sandbox.files.write("/work/input.json", input_bytes)
+result = sandbox.exec(["python", "/work/process.py"])
+output = sandbox.files.read("/work/output.json")
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts
+await sandbox.files.write("/work/input.json", inputBytes);
+const result = await sandbox.exec(["node", "/work/process.js"]);
+const output = await sandbox.files.read("/work/output.json");
+```
+
+</TabItem>
+</Tabs>
+
+## Security checklist
+
+- Validate guest paths; reject traversal such as `../`.
+- Treat symlinks carefully when reading from the guest.
+- Avoid mounting `$HOME`, credential directories, SSH agents, or cloud config paths.
+- Treat snapshots as containing any files that existed in the guest at snapshot time.

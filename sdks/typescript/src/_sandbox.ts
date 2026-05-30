@@ -1,5 +1,5 @@
 /**
- * Sandbox — e2b-style imperative runtime SDK. SDK port Phase 7c +
+ * Sandbox — imperative runtime SDK. SDK port Phase 7c +
  * Plan 73 Followup H-live.
  *
  * TypeScript mirror of `sdks/python/mvm/_sandbox.py`. The

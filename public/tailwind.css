@@ -46,6 +46,10 @@
   --color-gray-1: #c9d1d9;
   --color-gray-2: #b1bac4;
   --color-gray-4: #6e7681;
+  --color-code-canvas: #161b22;
+  --color-code-header: #21262d;
+  --color-code-border: #30363d;
+  --color-code-text: #e6edf3;
 }
 
 @theme inline {
@@ -97,6 +101,10 @@
     --color-gray-1: #1f2328;
     --color-gray-2: #424a53;
     --color-gray-4: #6e7681;
+    --color-code-canvas: #161b22;
+    --color-code-header: #21262d;
+    --color-code-border: #30363d;
+    --color-code-text: #e6edf3;
   }
 
   /* Auto mode + OS prefers light → use the light palette. The
@@ -122,6 +130,10 @@
       --color-gray-1: #1f2328;
       --color-gray-2: #424a53;
       --color-gray-4: #6e7681;
+      --color-code-canvas: #161b22;
+      --color-code-header: #21262d;
+      --color-code-border: #30363d;
+      --color-code-text: #e6edf3;
     }
   }
 }

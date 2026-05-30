@@ -107,7 +107,7 @@ The planner outputs a structured plan (preset, features, http port, entrypoint, 
 
 ```bash
 mvmctl build                                 # discover manifest, build
-mvmctl build --snapshot                       # also create a Firecracker snapshot for instant warm-start
+mvmctl build --snapshot                       # also create a Firecracker snapshot where supported
 mvmctl build --force                          # rebuild even if the cache hits
 mvmctl build --update-hash                    # recompute Nix FOD hash (after package version bump)
 mvmctl build --vcpus 4 --mem 2G               # CLI overrides; persisted to the slot record

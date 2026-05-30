@@ -1,21 +1,39 @@
 ---
 title: Working in the MicroVM
-description: Overview of in-VM operations
+description: Local sandbox management with mvmctl.
 ---
 
-<!--
-TODO: This page is a placeholder created in plan 62 for sidebar
-parity. Intended content brief:
+`mvmctl` is the local sandbox management surface. It builds images, boots microVMs, runs commands, transfers files, forwards ports, captures logs, and moves sandboxes through pause, cold, resume, stop, and destroy-style workflows.
 
-Landing page for the new section. One-paragraph intro + cards/links
-to the 5 pages below.
+## Common lifecycle
 
-Cross-references:
-- working/commands
-- working/filesystem
-- working/network
-- working/persistence
-- working/snapshots
--->
+```sh
+mvmctl build ./my-app
+mvmctl up ./my-app --name agent-sandbox
+mvmctl exec agent-sandbox -- python /work/task.py
+mvmctl logs agent-sandbox -f
+mvmctl down agent-sandbox
+```
 
-> This page is a placeholder. Content is being written — see plan 62.
+## Management tasks
+
+| Task | Start here |
+| --- | --- |
+| Understand sandbox states and transitions | [Lifecycle states](/working/lifecycle-states/) |
+| Run commands and processes | [Run commands & processes](/working/commands/) |
+| Move files across the host/guest boundary | [Filesystem operations](/working/filesystem/) |
+| Expose services or constrain egress | [Network & exposing ports](/working/network/) |
+| Keep state across runs | [Persistence, pause & resume](/working/persistence/) |
+| Save and recover machine state | [Cold mode](/working/cold-mode/) and [Snapshots](/working/snapshots/) |
+
+## Security posture
+
+- Build inputs are materialized before runtime launch.
+- Runtime guests boot through explicit backend selection and local admission.
+- Guest operations go through the control plane rather than broad host access.
+- Logs, file transfer, and snapshots can carry sensitive data and should be handled as such.
+- Network access should be explicit for agent and browser workloads.
+
+## Local first
+
+The local workflow should be complete on its own: build, launch, inspect, debug, pause, recover, and remove state from the host you control. Hosted or fleet layers can build on the same semantics later, but the local management commands are the baseline.
