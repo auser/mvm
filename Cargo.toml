@@ -68,6 +68,14 @@ members = [
     # cgroup + seccomp + binary hardening land in W1b.2.
     "crates/mvm-host-signer",
     "crates/mvm-audit-signer",
+    # Plan 113 / ADR-064 §Decision 5 — A2 confinement helper wrapping
+    # seccompiler 0.5 + landlock 0.4. Called by the per-VM
+    # `mvm-firecracker-bridge` sidecar (Task 12) just after startup so
+    # the kernel-LSM ruleset + seccomp filter are installed before the
+    # packet loop touches untrusted bytes. Linux-only at runtime; the
+    # crate compiles as inert stubs on macOS / Windows so workspace
+    # builds stay green for non-Linux contributors.
+    "crates/mvm-jailer-lite",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
@@ -182,8 +190,18 @@ libc = "0.2"
 
 # Seccomp BPF compilation (W2.4 — per-service syscall filtering inside
 # guests, applied via the `mvm-seccomp-apply` shim before execve into
-# the service binary).
+# the service binary). Plan 113 / ADR-064 also uses this for the
+# `mvm-jailer-lite` A2 confinement helper that wraps the Firecracker
+# bridge sidecar.
 seccompiler = "0.5"
+
+# Landlock (Linux kernel LSM) ruleset binding. Plan 113 / ADR-064 —
+# `mvm-jailer-lite` uses this to constrain the per-VM Firecracker
+# bridge to a small read/write-path set before entering the packet
+# loop. Linux-only at runtime; the `mvm-jailer-lite` Cargo.toml gates
+# the dep behind `cfg(target_os = "linux")` so workspace builds on
+# macOS / Windows contributor hosts stay green.
+landlock = "0.4"
 
 # File watching (dev-watch feature only)
 notify = "7"
@@ -287,6 +305,10 @@ mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-feature
 # mvm-builder-init spawns this as a subprocess before the
 # installer + tears it down after.
 mvm-egress-proxy = { path = "crates/mvm-egress-proxy", version = "0.14.0" }
+
+# Plan 113 / ADR-064 §Decision 5 — A2 confinement helper (seccompiler +
+# landlock). Consumed by the per-VM `mvm-firecracker-bridge` sidecar.
+mvm-jailer-lite = { path = "crates/mvm-jailer-lite", version = "0.14.0" }
 
 # Dev dependencies
 assert_cmd = "2"
