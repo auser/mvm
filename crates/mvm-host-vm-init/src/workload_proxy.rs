@@ -212,6 +212,16 @@ mod tests {
     }
 
     #[test]
+    fn handshake_byte_layout_matches_host_encoder() {
+        // The host side (`mvm_guest::builder_agent::
+        // encode_workload_forward_handshake`) pins the *same* literal
+        // bytes for this input. Keeping both pinned to the identical
+        // layout is how the two no-shared-dep encoders stay in sync.
+        let bytes = encode_handshake("ab", 5);
+        assert_eq!(bytes, vec![0, 0, 0, 4, b'a', b'b', b' ', b'5']);
+    }
+
+    #[test]
     fn handshake_round_trips_through_encode_and_read() {
         let bytes = encode_handshake("00000000-0000-0000-0000-000000000001", 5252);
         let mut cursor = io::Cursor::new(bytes);
