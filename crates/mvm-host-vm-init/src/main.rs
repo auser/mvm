@@ -101,6 +101,13 @@ mod proxy;
 /// signal-based stop/status helpers are Linux-only.
 #[allow(dead_code)]
 mod workload;
+/// Plan 107 A3 — in-host-VM vsock forwarder (the nesting hop). The
+/// cross-platform CONNECT+splice core is unit-tested on every host;
+/// the AF_VSOCK listener wiring (A3.b) is Linux-only. `unix`-gated
+/// because it uses `UnixStream` (the crate is inert on Windows).
+#[cfg(unix)]
+#[allow(dead_code)]
+mod workload_proxy;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
