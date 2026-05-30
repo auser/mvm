@@ -50,9 +50,13 @@ pub struct ConfinementSpec {
 }
 
 impl ConfinementSpec {
-    /// Canonical spec for `mvm-firecracker-bridge`. `SECCOMP.md` and
-    /// `LANDLOCK.md` in the crate root document the rationale + review
-    /// process for syscall additions.
+    /// Canonical spec for the unified `mvm-bridge` sidecar's passt
+    /// arm (consumed by the Firecracker backend today; reusable by any
+    /// future Linux backend fronting a virtio-net socketpair with
+    /// passt). The method name `firecracker_bridge` reflects the
+    /// historical passt-on-Firecracker family rather than the binary
+    /// name. `SECCOMP.md` and `LANDLOCK.md` in the crate root document
+    /// the rationale + review process for syscall additions.
     ///
     /// The syscall allowlist is sourced from the canonical
     /// `seccomp::BRIDGE_SYSCALLS` table on Linux, so a contributor can
@@ -89,11 +93,11 @@ impl ConfinementSpec {
 /// installation is not transactional). The caller MUST hard-exit the
 /// process on any error — there is no `disengage` API in either
 /// kernel LSM, and a half-confined process running attacker-influenced
-/// code is strictly worse than a confined one. The
-/// `mvm-firecracker-bridge` sidecar honours this contract by returning
-/// the error up to `main`, which logs and exits nonzero; the
-/// supervisor's `BridgeRestartPolicy::HardFail` (ADR-064 §Decision 6)
-/// is the cleanup mechanism that turns the exit into a VM teardown.
+/// code is strictly worse than a confined one. The `mvm-bridge`
+/// sidecar's passt arm honours this contract by returning the error
+/// up to `main`, which logs and exits nonzero; the supervisor's
+/// `BridgeRestartPolicy::HardFail` (ADR-064 §Decision 6) is the
+/// cleanup mechanism that turns the exit into a VM teardown.
 #[cfg(target_os = "linux")]
 pub fn confine_self(spec: &ConfinementSpec) -> Result<(), JailerError> {
     crate::landlock::apply(spec)?;

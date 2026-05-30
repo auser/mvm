@@ -1,9 +1,10 @@
 //! ADR-064 — Landlock filesystem ruleset (ABI v2, Linux 5.19+).
 //!
 //! ABI v2 is the floor because it's the first to expose the
-//! file-execute permission split, which the `mvm-firecracker-bridge`
-//! sidecar relies on to read its passt binary (exec) without granting
-//! exec on the audit-log directory. Earlier ABIs collapse the two.
+//! file-execute permission split, which the `mvm-bridge` sidecar's
+//! passt arm relies on to read its passt binary (exec) without
+//! granting exec on the audit-log directory. Earlier ABIs collapse
+//! the two.
 
 use crate::{ConfinementSpec, JailerError};
 use landlock::{

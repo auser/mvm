@@ -1,5 +1,7 @@
 # Plan 113 — NetworkProvider Observer fan-out + Firecracker substrate (ADR-064 impl, Path X)
 
+> **Post-execution refactor (2026-05-29):** Tasks 10 and 12's separate binaries `mvm-vz-drainer` + `mvm-firecracker-bridge` were unified into a single `mvm-bridge` crate with a `BridgeConfigJson { endpoints: { Passt | VzIngest } }` discriminator. The task-body text below references the original names for historical accuracy; the shipped binary is `mvm-bridge` (`crates/mvm-bridge/`). Spawn sites in `mvm-backend` resolve a single `MVM_BRIDGE_PATH` env var; PID files are named `mvm-bridge.pid` on both backends.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **No placeholders allowed in plans or code** (AGENTS.md §"No Placeholders in Plans or Code") — every code snippet below is real code lifted from the current repo or built from verified existing types.
 
 **Goal:** Add observer fan-out + host-allowlisted trust store on top of the existing `mvm-supervisor::gateway_bridge` substrate (PR #459/#487/#502), close Plan 112's Vz drainer carve-out by shipping `mvm-vz-drainer` as a thin binary that links the existing `mvm-supervisor` with `BridgeEndpoints::VzIngest`, and ship the Firecracker substrate as `mvm-firecracker-bridge` linking `mvm-supervisor` with `BridgeEndpoints::Passt` under `mvm-jailer-lite` seccomp + Landlock confinement.

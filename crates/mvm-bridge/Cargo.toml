@@ -1,0 +1,85 @@
+[package]
+name = "mvm-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Per-VM gateway audit bridge sidecar: variant-dispatched endpoints (passt for Linux/Firecracker, Vz NDJSON ingest for Apple Vz) feeding mvm-supervisor's chain-signed flow-event pipeline (Plan 113, ADR-064)"
+
+# ── What this crate is ─────────────────────────────────────────────
+#
+# Single leaf bin crate that runs alongside every microVM as the per-VM
+# A2 component (ADR-064 §Decision 5). Unifies the original
+# `mvm-firecracker-bridge` (Linux/passt) + `mvm-vz-drainer` (macOS/Vz)
+# binaries — both were structurally the same thing: a thin host of
+# `mvm-supervisor::gateway_bridge::run_bridge_inner` with a different
+# `BridgeEndpoints` variant.
+#
+# Sequence:
+#
+#   1. Read a `BridgeConfigJson` document from stdin (producer is the
+#      `mvm-backend` spawner for the matching backend).
+#   2. Dispatch on `endpoints.kind`:
+#        - `"passt"`  → Linux-only `endpoints::run_passt` arm:
+#          verify the operator-pinned `passt` SHA256 against
+#          `~/.mvm/passt-hashes.toml`, apply
+#          `mvm_jailer_lite::confine_self()` (seccomp + Landlock),
+#          reconstruct the parent-inherited socketpair fds, build
+#          `BridgeEndpoints::Passt`, and call
+#          `mvm_supervisor::gateway_bridge::spawn_bridge_thread`.
+#        - `"vz_ingest"` → `endpoints::run_vz_ingest` arm: bind the
+#          Swift `mvm-vz-supervisor`'s NDJSON `FlowEventWire` socket,
+#          build `BridgeEndpoints::VzIngest`, call
+#          `spawn_bridge_thread`. No confinement; the macOS Swift
+#          side already owns the socket.
+#   3. Park the main thread forever. The spawner watchdog handles
+#      teardown via SIGTERM/SIGKILL.
+#
+# ADR-064 §Decision 8 capability map:
+#   - passt arm reports `payload_tap: true` (the bridge sits directly
+#     on the virtio-net byte stream via the parent-inherited
+#     socketpair fds).
+#   - vz_ingest arm reports `payload_tap: false` (Swift emits
+#     flow-open / flow-close events but does not tap packet bytes).
+#
+# ── Linux-only Passt arm ──────────────────────────────────────────
+#
+# `endpoints::run_passt` is `#[cfg(target_os = "linux")]`; the
+# dispatch in `main` bails on non-Linux with a clear message if the
+# stdin shape names the passt endpoint. The `mvm-jailer-lite` +
+# `libc` dependencies that power confinement are target-gated to
+# Linux so the macOS / Windows builds don't pull them.
+
+[lib]
+name = "mvm_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mvm-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+mvm-plan = { workspace = true }
+mvm-policy = { workspace = true }
+mvm-supervisor = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mvm-jailer-lite = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -17,8 +17,8 @@ const TARGET_ARCH: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "aarch64")]
 const TARGET_ARCH: TargetArch = TargetArch::aarch64;
 
-/// Canonical (name, syscall-number) table for the
-/// `mvm-firecracker-bridge` sidecar. This is the single source of
+/// Canonical (name, syscall-number) table for the unified
+/// `mvm-bridge` sidecar's passt arm. This is the single source of
 /// truth for the bridge's syscall allowlist:
 /// `ConfinementSpec::firecracker_bridge()` derives its
 /// `allowed_syscalls` from the names here, and `syscall_name_to_nr`

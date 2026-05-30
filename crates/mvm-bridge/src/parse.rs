@@ -1,16 +1,23 @@
-//! Parser surface for `mvm-firecracker-bridge` (Plan 113 §Task 12 +
-//! Task 15 / ADR-064).
+//! Parser surface for `mvm-bridge` (Plan 113, ADR-064).
 //!
 //! Extracted from `src/main.rs` so the cargo-fuzz harness under
-//! `crates/mvm-firecracker-bridge/fuzz/` (Plan 113 §Task 15) can call
-//! the same serde deserializers and the same hash-verify helper the
-//! binary uses at startup. The binary's `main()` imports
-//! [`BridgeConfigJson`], [`PasstHashesFile`], and
-//! [`verify_passt_hash`] from this module verbatim — there is no
-//! parser duplication.
+//! `crates/mvm-bridge/fuzz/` (Plan 113 §Task 15) can call the same
+//! serde deserializers and the same hash-verify helper the binary uses
+//! at startup. The binary's `main()` imports [`BridgeConfigJson`],
+//! [`EndpointSpec`], [`PasstHashesFile`], and [`verify_passt_hash`]
+//! from this module verbatim — there is no parser duplication.
 //!
-//! Both deserializer shapes carry `#[serde(deny_unknown_fields)]` so
-//! a malicious or merely sloppy producer can never inject an
+//! [`BridgeConfigJson`] carries an [`EndpointSpec`] discriminator that
+//! tells the binary which backend arm to run:
+//!
+//! * `EndpointSpec::Passt` — Linux/passt path (Firecracker today,
+//!   future Cloud Hypervisor). Carries the operator-pinned `passt`
+//!   binary + hashes + the parent-inherited socketpair fds.
+//! * `EndpointSpec::VzIngest` — Apple Vz NDJSON ingest path. Carries
+//!   the Swift `mvm-vz-supervisor` events socket path.
+//!
+//! All deserializer shapes carry `#[serde(deny_unknown_fields)]` so a
+//! malicious or merely sloppy producer can never inject an
 //! attacker-controlled field that a future schema bump would
 //! interpret. The fuzz target's contract is "no panic on any input,"
 //! mirroring `fuzz_supervisor_config` / `fuzz_guest_request` (ADR-002
@@ -23,8 +30,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// Stdin JSON contract. Producer is Task 13's `FirecrackerBackend`.
-/// All paths are absolute and already-canonicalised by the parent.
+/// Stdin JSON contract. Producer is one of `mvm-backend`'s spawners
+/// (`microvm.rs::spawn_mvm_bridge` for the Firecracker path,
+/// `vz.rs::spawn_mvm_bridge` for the Vz path). All paths are absolute
+/// and already-canonicalised by the parent.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfigJson {
@@ -40,43 +49,13 @@ pub struct BridgeConfigJson {
 
     /// `~/.mvm/audit/gateway-<vm>.sock` — subscriber socket the
     /// bridge binds at startup so `nc -U <path>` consumers see the
-    /// live NDJSON flow-event tail. Same shape as the libkrun /
-    /// Vz drainer paths.
+    /// live NDJSON flow-event tail.
     pub audit_socket: PathBuf,
-
-    /// `~/.mvm/keys/` — directory containing the host signer key.
-    /// Used to scope the Landlock confinement spec; the actual
-    /// secret bytes are read from `signing_key_path` below before
-    /// confinement clamps the bridge to the spec.
-    pub keys_dir: PathBuf,
 
     /// `~/.mvm/keys/host-signer.ed25519` — mode 0600 file owned by
     /// the calling user. The bridge re-reads it on each launch to
     /// seed the `FileAuditSigner`'s `SigningKey`.
     pub signing_key_path: PathBuf,
-
-    /// Path to the operator-installed `passt` binary the bridge
-    /// relays packets to. The bridge verifies its SHA256 against
-    /// `passt_hashes_path` before installing confinement and before
-    /// touching the inherited fds.
-    pub passt_path: PathBuf,
-
-    /// `~/.mvm/passt-hashes.toml` — operator-curated allowlist of
-    /// accepted `passt` binary SHA256 hashes. See
-    /// [`PasstHashesFile`].
-    pub passt_hashes_path: PathBuf,
-
-    /// Raw fd number of the parent half of the passt socketpair.
-    /// Task 13's `pre_exec` `dup2`s the parent socketpair fd into
-    /// this slot and clears `O_CLOEXEC` so the kernel preserves
-    /// the fd across exec. The bridge takes ownership via
-    /// `OwnedFd::from_raw_fd`.
-    pub gateway_fd_raw: i32,
-
-    /// Raw fd number of the supervisor half of the inner virtio-net
-    /// socketpair whose other half is plumbed into Firecracker.
-    /// Same `pre_exec` contract as `gateway_fd_raw`.
-    pub supervisor_fd_raw: i32,
 
     /// Serialised `SignedExecutionPlan` envelope as produced by
     /// `mvm-cli::plan_admission::populate_audit_substrate`. Trust
@@ -90,6 +69,67 @@ pub struct BridgeConfigJson {
     /// to label flow-event audit entries with the bundle digest).
     #[serde(default)]
     pub bundle_json: Option<String>,
+
+    /// Backend-specific endpoint variant. See [`EndpointSpec`].
+    pub endpoints: EndpointSpec,
+}
+
+/// Discriminated union over the backend-specific tail of the bridge
+/// config. Tagged on `kind`:
+///
+/// * `"passt"` — Linux/passt socketpair endpoints (Firecracker today;
+///   Cloud Hypervisor in the future). The `mvm-jailer-lite`
+///   confinement spec + `passt`-hash pin live in this arm.
+/// * `"vz_ingest"` — Apple Vz NDJSON ingest socket. No confinement;
+///   the Swift `mvm-vz-supervisor` owns the socket lifecycle.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EndpointSpec {
+    /// Linux passt-backed leaf. Carried by Firecracker today; reusable
+    /// by any future Linux backend that fronts a virtio-net socketpair
+    /// with passt (e.g. Cloud Hypervisor). Runtime-Linux-only — the
+    /// dispatch in `main()` bails on non-Linux targets.
+    Passt {
+        /// Path to the operator-installed `passt` binary the bridge
+        /// relays packets to. The bridge verifies its SHA256 against
+        /// `passt_hashes_path` before installing confinement and
+        /// before touching the inherited fds.
+        passt_path: PathBuf,
+
+        /// `~/.mvm/passt-hashes.toml` — operator-curated allowlist of
+        /// accepted `passt` binary SHA256 hashes. See
+        /// [`PasstHashesFile`].
+        passt_hashes_path: PathBuf,
+
+        /// `~/.mvm/keys/` — directory containing the host signer
+        /// key. Used to scope the Landlock confinement spec; the
+        /// actual secret bytes are read from
+        /// [`BridgeConfigJson::signing_key_path`] before
+        /// confinement clamps the bridge.
+        keys_dir: PathBuf,
+
+        /// Raw fd number of the parent half of the passt socketpair.
+        /// `mvm-backend`'s `pre_exec` `dup2`s the parent socketpair
+        /// fd into this slot and clears `O_CLOEXEC` so the kernel
+        /// preserves the fd across exec. The bridge takes ownership
+        /// via `OwnedFd::from_raw_fd`.
+        gateway_fd_raw: i32,
+
+        /// Raw fd number of the supervisor half of the inner
+        /// virtio-net socketpair whose other half is plumbed into
+        /// the hypervisor. Same `pre_exec` contract as
+        /// `gateway_fd_raw`.
+        supervisor_fd_raw: i32,
+    },
+    /// macOS Vz NDJSON ingest leaf. Carries only the path the Swift
+    /// `mvm-vz-supervisor` writes its NDJSON `FlowEventWire` stream
+    /// to. The bridge binds this socket (mode 0700) and reads from
+    /// each accepted connection.
+    VzIngest {
+        /// Path the Swift `mvm-vz-supervisor` writes its NDJSON
+        /// `FlowEventWire` stream to.
+        events_socket_path: PathBuf,
+    },
 }
 
 /// On-disk format of `~/.mvm/passt-hashes.toml`. Operator-managed —
@@ -344,5 +384,112 @@ mod tests {
             h,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    // ─── Discriminator round-trip ───────────────────────────────────
+
+    /// Sanity that the `kind` discriminator round-trips for the
+    /// passt arm — every per-arm field is required, unknown fields
+    /// reject.
+    #[test]
+    fn endpoint_spec_passt_round_trip() {
+        let json = serde_json::json!({
+            "kind": "passt",
+            "passt_path": "/usr/bin/passt",
+            "passt_hashes_path": "/home/me/.mvm/passt-hashes.toml",
+            "keys_dir": "/home/me/.mvm/keys",
+            "gateway_fd_raw": 7,
+            "supervisor_fd_raw": 8,
+        });
+        let parsed: EndpointSpec = serde_json::from_value(json).expect("valid passt variant");
+        match parsed {
+            EndpointSpec::Passt {
+                passt_path,
+                gateway_fd_raw,
+                supervisor_fd_raw,
+                ..
+            } => {
+                assert_eq!(passt_path.to_str(), Some("/usr/bin/passt"));
+                assert_eq!(gateway_fd_raw, 7);
+                assert_eq!(supervisor_fd_raw, 8);
+            }
+            EndpointSpec::VzIngest { .. } => panic!("expected passt arm"),
+        }
+    }
+
+    #[test]
+    fn endpoint_spec_vz_ingest_round_trip() {
+        let json = serde_json::json!({
+            "kind": "vz_ingest",
+            "events_socket_path": "/home/me/.mvm/vms/foo/vz-events.sock",
+        });
+        let parsed: EndpointSpec = serde_json::from_value(json).expect("valid vz_ingest variant");
+        match parsed {
+            EndpointSpec::VzIngest { events_socket_path } => {
+                assert_eq!(
+                    events_socket_path.to_str(),
+                    Some("/home/me/.mvm/vms/foo/vz-events.sock"),
+                );
+            }
+            EndpointSpec::Passt { .. } => panic!("expected vz_ingest arm"),
+        }
+    }
+
+    #[test]
+    fn endpoint_spec_unknown_kind_rejects() {
+        let json = serde_json::json!({
+            "kind": "attacker_invented_kind",
+            "events_socket_path": "/x",
+        });
+        let err =
+            serde_json::from_value::<EndpointSpec>(json).expect_err("unknown kind must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attacker_invented_kind") || msg.contains("variant"),
+            "error must name the bad variant: {msg}"
+        );
+    }
+
+    #[test]
+    fn endpoint_spec_unknown_field_rejects() {
+        // deny_unknown_fields on a tagged enum applies per-variant.
+        let json = serde_json::json!({
+            "kind": "vz_ingest",
+            "events_socket_path": "/x",
+            "attacker_injected": "value",
+        });
+        let err = serde_json::from_value::<EndpointSpec>(json)
+            .expect_err("unknown field must reject under deny_unknown_fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attacker_injected") || msg.contains("unknown field"),
+            "error must name the injected field: {msg}"
+        );
+    }
+
+    /// Full envelope round-trip with the passt variant nested.
+    #[test]
+    fn bridge_config_json_with_passt_round_trip() {
+        let json = serde_json::json!({
+            "vm_name": "smoke",
+            "audit_dir": "/home/me/.mvm/audit",
+            "audit_socket": "/home/me/.mvm/audit/gateway-smoke.sock",
+            "signing_key_path": "/home/me/.mvm/keys/host-signer.ed25519",
+            "plan_json": "{}",
+            "endpoints": {
+                "kind": "passt",
+                "passt_path": "/usr/bin/passt",
+                "passt_hashes_path": "/home/me/.mvm/passt-hashes.toml",
+                "keys_dir": "/home/me/.mvm/keys",
+                "gateway_fd_raw": 7,
+                "supervisor_fd_raw": 8,
+            },
+        });
+        let cfg: BridgeConfigJson = serde_json::from_value(json).expect("valid envelope");
+        assert_eq!(cfg.vm_name, "smoke");
+        match cfg.endpoints {
+            EndpointSpec::Passt { gateway_fd_raw, .. } => assert_eq!(gateway_fd_raw, 7),
+            EndpointSpec::VzIngest { .. } => panic!("expected passt"),
+        }
     }
 }

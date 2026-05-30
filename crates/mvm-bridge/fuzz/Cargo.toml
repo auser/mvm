@@ -1,14 +1,14 @@
 [package]
-name = "mvm-firecracker-bridge-fuzz"
+name = "mvm-bridge-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
 
-# Detach from the parent workspace — `crates/mvm-firecracker-bridge/fuzz`
-# is listed under `workspace.exclude` in the repo root Cargo.toml
-# because `libfuzzer-sys` only links cleanly under cargo-fuzz's wrapper
-# (which injects sanitizer + linker flags). An empty `[workspace]`
-# table self-identifies this manifest as standalone so cargo doesn't
+# Detach from the parent workspace — `crates/mvm-bridge/fuzz` is
+# listed under `workspace.exclude` in the repo root Cargo.toml because
+# `libfuzzer-sys` only links cleanly under cargo-fuzz's wrapper (which
+# injects sanitizer + linker flags). An empty `[workspace]` table
+# self-identifies this manifest as standalone so cargo doesn't
 # complain about a hierarchy mismatch when invoked through
 # `cargo fuzz`.
 [workspace]
@@ -22,18 +22,17 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 toml = "0.8"
 
-[dependencies.mvm-firecracker-bridge]
+[dependencies.mvm-bridge]
 path = ".."
 
 # Plan 113 §Task 15 — fuzz the host-side `BridgeConfigJson` JSON
 # parser. The bridge binary reads attacker-influenced bytes on stdin
-# (Task 13's `FirecrackerBackend` writes them, but the bytes traverse
-# a pipe boundary the bridge must defend before installing Landlock +
-# seccomp). Analog of `fuzz_supervisor_config` and `fuzz_guest_request`;
-# harness goal is "never panic on any input." See
-# `crates/mvm-firecracker-bridge/fuzz/fuzz_targets/fuzz_bridge_config_json.rs`
-# for the harness body and ADR-064 §"Trust model" for the trust
-# boundary.
+# (the spawner writes them, but the bytes traverse a pipe boundary the
+# bridge must defend before installing Landlock + seccomp). Analog of
+# `fuzz_supervisor_config` and `fuzz_guest_request`; harness goal is
+# "never panic on any input." See
+# `crates/mvm-bridge/fuzz/fuzz_targets/fuzz_bridge_config_json.rs` for
+# the harness body and ADR-064 §"Trust model" for the trust boundary.
 [[bin]]
 name = "fuzz_bridge_config_json"
 path = "fuzz_targets/fuzz_bridge_config_json.rs"

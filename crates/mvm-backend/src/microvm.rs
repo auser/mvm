@@ -656,23 +656,24 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
     // Apply network policy (iptables egress filtering) if not unrestricted
     network::apply_network_policy(slot, &config.network_policy)?;
 
-    // Plan 113 §Task 13 / ADR-064 — spawn `mvm-firecracker-bridge`
-    // alongside the Firecracker VM. The sidecar runs under
-    // `mvm-jailer-lite` confinement (seccomp + Landlock), verifies the
-    // operator-pinned passt SHA256, inherits both halves of a
-    // socketpair from this process, and runs
-    // `mvm-supervisor::gateway_bridge` with `BridgeEndpoints::Passt`.
+    // Plan 113 §Task 13 / ADR-064 — spawn the unified `mvm-bridge`
+    // sidecar alongside the Firecracker VM under the Passt endpoint
+    // variant. The sidecar runs under `mvm-jailer-lite` confinement
+    // (seccomp + Landlock), verifies the operator-pinned passt
+    // SHA256, inherits both halves of a socketpair from this
+    // process, and runs `mvm-supervisor::gateway_bridge` with
+    // `BridgeEndpoints::Passt`.
     //
     // The guard kills the bridge on early return / panic between
     // spawn and the FC VM's boot completion; after the VM is healthy
     // the guard's child is detached and a watchdog thread takes over
-    // (writes `fc-bridge.pid` and SIGTERMs the FC VM on bridge death
+    // (writes `mvm-bridge.pid` and SIGTERMs the FC VM on bridge death
     // via `fc.pid`, hard-fail policy).
     //
-    // No-op on non-Linux hosts (the bridge is Linux-only — see
-    // `crates/mvm-firecracker-bridge/src/main.rs`).
+    // No-op on non-Linux hosts (the Passt arm is Linux-only — see
+    // `crates/mvm-bridge/src/endpoints.rs::run_passt`).
     #[cfg(target_os = "linux")]
-    let mut bridge_guard = spawn_fc_bridge(&config.slot.name, &abs_dir)?;
+    let mut bridge_guard = spawn_bridge_passt(&config.slot.name, &abs_dir)?;
 
     // Start Firecracker daemon in per-VM directory
     start_vm_firecracker(&abs_dir, &abs_socket)?;
@@ -700,7 +701,7 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
 
     // Plan 113 §Task 13 — VM is healthy. Detach the bridge guard so
     // its child outlives this stack frame; persist the bridge PID to
-    // `<abs_dir>/fc-bridge.pid` and spawn the watchdog thread that
+    // `<abs_dir>/mvm-bridge.pid` and spawn the watchdog thread that
     // SIGTERMs the FC VM if the bridge dies (ADR-064 §Decision 6 —
     // hard-fail bridge crash policy).
     //
@@ -714,7 +715,7 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
     {
         warn!(
             vm = %config.slot.name,
-            "detach/watchdog setup for mvm-firecracker-bridge failed (non-fatal): {e}"
+            "detach/watchdog setup for mvm-bridge failed (non-fatal): {e}"
         );
     }
 
@@ -2131,14 +2132,15 @@ pub fn read_run_info() -> Option<RunInfo> {
 }
 
 // ============================================================================
-// Plan 113 §Task 13 — mvm-firecracker-bridge spawn + watchdog (Linux only)
+// Plan 113 §Task 13 — `mvm-bridge` (passt arm) spawn + watchdog (Linux only)
 //
-// Mirrors Vz's `AttachedDrainerGuard` shape (`crates/mvm-backend/src/vz.rs`
+// Mirrors Vz's `AttachedBridgeGuard` shape (`crates/mvm-backend/src/vz.rs`
 // §Task 11) — Drop kills+waits the child on early return, `detach()`
 // hands ownership to the caller which records the PID in
-// `<state_dir>/fc-bridge.pid` and lets the watchdog thread inherit it.
-// The bridge is Linux-only so every helper is `#[cfg(target_os = "linux")]`;
-// non-Linux builds compile but never call into this path.
+// `<state_dir>/mvm-bridge.pid` and lets the watchdog thread inherit
+// it. The passt arm is Linux-only so every helper is
+// `#[cfg(target_os = "linux")]`; non-Linux builds compile but never
+// call into this path.
 // ============================================================================
 
 /// PID file the bridge watchdog writes inside `<abs_dir>`. Lives next
@@ -2146,12 +2148,12 @@ pub fn read_run_info() -> Option<RunInfo> {
 /// the bridge with the same `<abs_dir>` it already resolves for the
 /// FC VM itself. Plan 113 §Task 13.
 #[cfg(target_os = "linux")]
-const FC_BRIDGE_PID_FILE_NAME: &str = "fc-bridge.pid";
+const BRIDGE_PID_FILE_NAME: &str = "mvm-bridge.pid";
 
-/// RAII guard for a spawned `mvm-firecracker-bridge` child. Mirrors
-/// the Vz `AttachedDrainerGuard` pattern: dropping the guard kills +
-/// waits the child so an early return / panic between bridge spawn
-/// and VM boot completion cleans up the bridge process.
+/// RAII guard for a spawned `mvm-bridge` child. Mirrors the Vz
+/// `AttachedBridgeGuard` pattern: dropping the guard kills + waits the
+/// child so an early return / panic between bridge spawn and VM boot
+/// completion cleans up the bridge process.
 ///
 /// After successful boot, `detach_and_spawn_bridge_watchdog` takes
 /// the `Child` out via `.take()`; the watchdog thread inherits the
@@ -2182,14 +2184,14 @@ impl Drop for AttachedBridgeGuard {
                 warn!(
                     bridge_pid = pid,
                     error = %e,
-                    "AttachedBridgeGuard: kill mvm-firecracker-bridge failed on drop"
+                    "AttachedBridgeGuard: kill mvm-bridge failed on drop"
                 );
             }
             if let Err(e) = c.wait() {
                 warn!(
                     bridge_pid = pid,
                     error = %e,
-                    "AttachedBridgeGuard: wait mvm-firecracker-bridge failed on drop"
+                    "AttachedBridgeGuard: wait mvm-bridge failed on drop"
                 );
             }
         }
@@ -2206,12 +2208,13 @@ fn passt_path_from_env_or_default() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/usr/bin/passt"))
 }
 
-/// Resolve the `mvm-firecracker-bridge` binary path, checking three
+/// Resolve the unified `mvm-bridge` binary path, checking three
 /// sources in order. Pure resolver — exercised directly from tests
-/// without touching `std::env`. Mirrors Task 11's
-/// `resolve_vz_drainer_path_inner` shape.
+/// without touching `std::env`. Mirrors Vz's
+/// `resolve_bridge_path_inner` shape so both backends share the same
+/// override env var (`MVM_BRIDGE_PATH`).
 #[cfg(target_os = "linux")]
-fn resolve_fc_bridge_path_inner(
+fn resolve_bridge_path_inner(
     env_override: Option<&std::path::Path>,
     current_exe: Option<&std::path::Path>,
     manifest_dir: &std::path::Path,
@@ -2221,14 +2224,14 @@ fn resolve_fc_bridge_path_inner(
             return Ok(path.to_path_buf());
         }
         anyhow::bail!(
-            "MVM_FC_BRIDGE_PATH points at {} which is not a file",
+            "MVM_BRIDGE_PATH points at {} which is not a file",
             path.display()
         );
     }
     if let Some(exe) = current_exe
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join("mvm-firecracker-bridge");
+        let candidate = dir.join("mvm-bridge");
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -2240,41 +2243,41 @@ fn resolve_fc_bridge_path_inner(
             let candidate = workspace_root
                 .join("target")
                 .join(variant)
-                .join("mvm-firecracker-bridge");
+                .join("mvm-bridge");
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
     }
     anyhow::bail!(
-        "mvm-firecracker-bridge binary not found. Looked for: $MVM_FC_BRIDGE_PATH, \
-         alongside the current exe, and <workspace>/target/{{release,debug}}/mvm-firecracker-bridge. \
-         Build with `cargo build -p mvm-firecracker-bridge`."
+        "mvm-bridge binary not found. Looked for: $MVM_BRIDGE_PATH, \
+         alongside the current exe, and <workspace>/target/{{release,debug}}/mvm-bridge. \
+         Build with `cargo build -p mvm-bridge`."
     )
 }
 
-/// Production wrapper around `resolve_fc_bridge_path_inner` that
-/// reads `std::env` + `current_exe` + `CARGO_MANIFEST_DIR`. Keep the
-/// test seam in `_inner` so unit tests don't race on env state.
+/// Production wrapper around `resolve_bridge_path_inner` that reads
+/// `std::env` + `current_exe` + `CARGO_MANIFEST_DIR`. Keep the test
+/// seam in `_inner` so unit tests don't race on env state.
 #[cfg(target_os = "linux")]
-fn resolve_fc_bridge_path() -> Result<std::path::PathBuf> {
-    let env_override = std::env::var_os("MVM_FC_BRIDGE_PATH").map(std::path::PathBuf::from);
+fn resolve_bridge_path() -> Result<std::path::PathBuf> {
+    let env_override = std::env::var_os("MVM_BRIDGE_PATH").map(std::path::PathBuf::from);
     let current_exe = std::env::current_exe().ok();
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    resolve_fc_bridge_path_inner(
+    resolve_bridge_path_inner(
         env_override.as_deref(),
         current_exe.as_deref(),
         &manifest_dir,
     )
 }
 
-/// Spawn the `mvm-firecracker-bridge` sibling. Creates a UNIX
-/// socketpair, clears `O_CLOEXEC` on both halves in the child via
-/// `CommandExt::pre_exec` so they survive `execve`, then pipes the
-/// `BridgeConfigJson` document to the child's stdin. Both fds stay
-/// owned by the child; the parent closes its handles via
-/// `libc::close` after spawn so the supervisor process doesn't leak
-/// an fd per VM boot.
+/// Spawn the unified `mvm-bridge` sidecar with `EndpointSpec::Passt`.
+/// Creates a UNIX socketpair, clears `O_CLOEXEC` on both halves in
+/// the child via `CommandExt::pre_exec` so they survive `execve`,
+/// then pipes the `BridgeConfigJson` document to the child's stdin.
+/// Both fds stay owned by the child; the parent closes its handles
+/// via `libc::close` after spawn so the supervisor process doesn't
+/// leak an fd per VM boot.
 ///
 /// Reads `plan.json` (required) + `bundle.json` (optional) from the
 /// per-VM state dir `~/.mvm/vms/<vm_name>/` where the producer
@@ -2290,7 +2293,7 @@ fn resolve_fc_bridge_path() -> Result<std::path::PathBuf> {
 /// `abs_dir` is the FC VM's state dir inside the host's filesystem
 /// (where `fc.pid` lands so the watchdog can find it).
 #[cfg(target_os = "linux")]
-fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> {
+fn spawn_bridge_passt(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::os::unix::process::CommandExt;
@@ -2302,8 +2305,8 @@ fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> 
     //            responsible for putting a freshly-admitted plan
     //            here. A missing file means a non-admitted boot —
     //            legacy path, no bridge.
-    let bridge_bin = resolve_fc_bridge_path()
-        .with_context(|| "locate mvm-firecracker-bridge binary".to_string())?;
+    let bridge_bin =
+        resolve_bridge_path().with_context(|| "locate mvm-bridge binary".to_string())?;
 
     let data_dir = std::path::PathBuf::from(mvm_core::config::mvm_data_dir());
     let state_dir = data_dir.join("vms").join(vm_name);
@@ -2314,7 +2317,7 @@ fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(
                 vm = %vm_name,
-                "no plan.json at {}; skipping mvm-firecracker-bridge (legacy path)",
+                "no plan.json at {}; skipping mvm-bridge (legacy path)",
                 plan_path.display()
             );
             return Ok(AttachedBridgeGuard { child: None });
@@ -2360,18 +2363,24 @@ fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> 
     let gateway_raw = gateway_socket.as_raw_fd();
     let supervisor_raw = supervisor_socket.as_raw_fd();
 
+    // BridgeConfigJson with the Passt variant nested under
+    // `endpoints.kind = "passt"`. See `mvm_bridge::parse` for the
+    // schema.
     let bridge_cfg = serde_json::json!({
         "vm_name": vm_name,
         "audit_dir": audit_dir,
         "audit_socket": audit_socket,
-        "keys_dir": keys_dir,
         "signing_key_path": signing_key_path,
-        "passt_path": passt_path,
-        "passt_hashes_path": passt_hashes_path,
-        "gateway_fd_raw": gateway_raw,
-        "supervisor_fd_raw": supervisor_raw,
         "plan_json": plan_json,
         "bundle_json": bundle_json,
+        "endpoints": {
+            "kind": "passt",
+            "passt_path": passt_path,
+            "passt_hashes_path": passt_hashes_path,
+            "keys_dir": keys_dir,
+            "gateway_fd_raw": gateway_raw,
+            "supervisor_fd_raw": supervisor_raw,
+        },
     });
 
     tracing::info!(
@@ -2379,7 +2388,7 @@ fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> 
         bridge = %bridge_bin.display(),
         gateway_fd = gateway_raw,
         supervisor_fd = supervisor_raw,
-        "spawning mvm-firecracker-bridge with inherited socketpair fds"
+        "spawning mvm-bridge (passt arm) with inherited socketpair fds"
     );
 
     let mut cmd = std::process::Command::new(&bridge_bin);
@@ -2450,7 +2459,7 @@ fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> 
     child
         .stdin
         .take()
-        .ok_or_else(|| anyhow::anyhow!("mvm-firecracker-bridge stdin was not piped"))?
+        .ok_or_else(|| anyhow::anyhow!("mvm-bridge stdin was not piped"))?
         .write_all(bridge_cfg.to_string().as_bytes())
         .map_err(|e| anyhow::anyhow!("pipe BridgeConfigJson to stdin: {e}"))?;
 
@@ -2466,17 +2475,17 @@ fn spawn_fc_bridge(vm_name: &str, abs_dir: &str) -> Result<AttachedBridgeGuard> 
 }
 
 /// Atomically write the bridge PID file at mode 0600. Same shape as
-/// Vz's `write_drainer_pid_file` — tmp + rename so a concurrent
-/// reader (a future `stop_vm` reaper) never sees a partial value.
+/// Vz's `write_bridge_pid_file` — tmp + rename so a concurrent reader
+/// (a future `stop_vm` reaper) never sees a partial value.
 #[cfg(target_os = "linux")]
-fn write_fc_bridge_pid_file(path: &std::path::Path, pid: u32) -> Result<()> {
+fn write_bridge_pid_file(path: &std::path::Path, pid: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("bridge pid path has no parent: {}", path.display()))?;
-    let tmp = parent.join(format!("{FC_BRIDGE_PID_FILE_NAME}.tmp"));
+    let tmp = parent.join(format!("{BRIDGE_PID_FILE_NAME}.tmp"));
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -2494,8 +2503,8 @@ fn write_fc_bridge_pid_file(path: &std::path::Path, pid: u32) -> Result<()> {
 }
 
 /// Once the FC VM is healthy, take the bridge `Child` out of its
-/// guard, persist its PID under `<abs_dir>/fc-bridge.pid` (mode 0600),
-/// then spawn the watchdog thread that observes the child via
+/// guard, persist its PID under `<abs_dir>/mvm-bridge.pid` (mode
+/// 0600), then spawn the watchdog thread that observes the child via
 /// `wait()`. On bridge death the watchdog SIGTERMs the FC VM via
 /// `<abs_dir>/fc.pid` (ADR-064 §Decision 6 — hard-fail bridge crash
 /// policy).
@@ -2511,8 +2520,8 @@ fn detach_and_spawn_bridge_watchdog(
         return Ok(());
     };
     let pid = child.id();
-    let pid_path = std::path::PathBuf::from(abs_dir).join(FC_BRIDGE_PID_FILE_NAME);
-    write_fc_bridge_pid_file(&pid_path, pid)?;
+    let pid_path = std::path::PathBuf::from(abs_dir).join(BRIDGE_PID_FILE_NAME);
+    write_bridge_pid_file(&pid_path, pid)?;
 
     let fc_pid_path = format!("{abs_dir}/fc.pid");
     let vm = vm_name.to_string();
@@ -2522,7 +2531,7 @@ fn detach_and_spawn_bridge_watchdog(
             vm = %vm,
             bridge_pid = pid,
             ?exit,
-            "mvm-firecracker-bridge exited; SIGTERM'ing Firecracker VM (hard-fail policy)"
+            "mvm-bridge exited; SIGTERM'ing Firecracker VM (hard-fail policy)"
         );
         match std::fs::read_to_string(&fc_pid_path) {
             Ok(pid_str) => match pid_str.trim().parse::<libc::pid_t>() {
@@ -3075,27 +3084,27 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────
-    // Plan 113 §Task 13 — mvm-firecracker-bridge spawn helpers
+    // Plan 113 §Task 13 — mvm-bridge (passt arm) spawn helpers
     // ───────────────────────────────────────────────────────────────
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn resolve_fc_bridge_path_inner_honors_env_var() {
+    fn resolve_bridge_path_inner_honors_env_var() {
         // Pure resolver — exercised without touching process env. The
         // override must point at a real file or the call errors.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let manifest_dir = std::path::PathBuf::from("/nonexistent/manifest");
-        let resolved = resolve_fc_bridge_path_inner(Some(tmp.path()), None, &manifest_dir)
+        let resolved = resolve_bridge_path_inner(Some(tmp.path()), None, &manifest_dir)
             .expect("env override resolves");
         assert_eq!(resolved, tmp.path());
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn resolve_fc_bridge_path_inner_env_pointing_at_missing_file_errors() {
+    fn resolve_bridge_path_inner_env_pointing_at_missing_file_errors() {
         let manifest_dir = std::path::PathBuf::from("/nonexistent/manifest");
-        let bogus = std::path::Path::new("/definitely/not/there/mvm-firecracker-bridge");
-        let err = resolve_fc_bridge_path_inner(Some(bogus), None, &manifest_dir)
+        let bogus = std::path::Path::new("/definitely/not/there/mvm-bridge");
+        let err = resolve_bridge_path_inner(Some(bogus), None, &manifest_dir)
             .expect_err("missing file must error");
         assert!(
             err.to_string().contains("not a file"),
@@ -3105,31 +3114,31 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn resolve_fc_bridge_path_inner_missing_env_falls_back_to_adjacent() {
+    fn resolve_bridge_path_inner_missing_env_falls_back_to_adjacent() {
         // No env override, but a sibling binary exists next to the
         // current exe → resolver returns it.
         let tmp_dir = tempfile::tempdir().unwrap();
         let exe = tmp_dir.path().join("mvmctl");
         std::fs::write(&exe, b"#!fake").unwrap();
-        let bridge = tmp_dir.path().join("mvm-firecracker-bridge");
+        let bridge = tmp_dir.path().join("mvm-bridge");
         std::fs::write(&bridge, b"#!fake").unwrap();
         let manifest_dir = std::path::PathBuf::from("/nonexistent/manifest");
         let resolved =
-            resolve_fc_bridge_path_inner(None, Some(&exe), &manifest_dir).expect("adjacent hit");
+            resolve_bridge_path_inner(None, Some(&exe), &manifest_dir).expect("adjacent hit");
         assert_eq!(resolved, bridge);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn resolve_fc_bridge_path_inner_errors_when_nothing_found() {
+    fn resolve_bridge_path_inner_errors_when_nothing_found() {
         // All three sources miss → actionable error naming the binary
         // + the override env var so operators know how to fix it.
         let manifest_dir = std::path::PathBuf::from("/nonexistent/manifest");
-        let err = resolve_fc_bridge_path_inner(None, None, &manifest_dir)
+        let err = resolve_bridge_path_inner(None, None, &manifest_dir)
             .expect_err("no candidate must error");
         let msg = err.to_string();
         assert!(
-            msg.contains("mvm-firecracker-bridge") && msg.contains("MVM_FC_BRIDGE_PATH"),
+            msg.contains("mvm-bridge") && msg.contains("MVM_BRIDGE_PATH"),
             "error names the binary + override env var: {msg}"
         );
     }
@@ -3215,11 +3224,11 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn write_fc_bridge_pid_file_creates_mode_0600() {
+    fn write_bridge_pid_file_creates_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fc-bridge.pid");
-        write_fc_bridge_pid_file(&path, 12345).expect("write");
+        let path = dir.path().join("mvm-bridge.pid");
+        write_bridge_pid_file(&path, 12345).expect("write");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,

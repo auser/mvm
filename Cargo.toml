@@ -69,28 +69,31 @@ members = [
     "crates/mvm-host-signer",
     "crates/mvm-audit-signer",
     # Plan 113 / ADR-064 §Decision 5 — A2 confinement helper wrapping
-    # seccompiler 0.5 + landlock 0.4. Called by the per-VM
-    # `mvm-firecracker-bridge` sidecar (Task 12) just after startup so
-    # the kernel-LSM ruleset + seccomp filter are installed before the
-    # packet loop touches untrusted bytes. Linux-only at runtime; the
-    # crate compiles as inert stubs on macOS / Windows so workspace
-    # builds stay green for non-Linux contributors.
+    # seccompiler 0.5 + landlock 0.4. Called by the per-VM `mvm-bridge`
+    # sidecar's passt arm just after startup so the kernel-LSM ruleset
+    # + seccomp filter are installed before the packet loop touches
+    # untrusted bytes. Linux-only at runtime; the crate compiles as
+    # inert stubs on macOS / Windows so workspace builds stay green
+    # for non-Linux contributors.
     "crates/mvm-jailer-lite",
-    # Plan 113 §Task 10 / ADR-064 — per-VM Vz drainer binary. Closes
-    # Plan 112's "Vz carve-out" by binding the Swift `mvm-vz-supervisor`'s
-    # `events_ingest_socket_path` and threading the NDJSON `FlowEventWire`
-    # stream through `mvm-supervisor`'s chain-signing audit pipeline.
-    # Parallel role to `mvm-libkrun-supervisor` for the Vz backend.
-    "crates/mvm-vz-drainer",
-    # Plan 113 §Task 12 / ADR-064 — per-VM Firecracker bridge sidecar.
-    # Linux-only at runtime; the file-level `cfg(target_os = "linux")`
-    # gate in `src/main.rs` reduces non-Linux compilation to a stub
-    # `main()` that prints a guard message and exits nonzero. Verifies
-    # the operator-curated `passt` binary hash, installs the
-    # `mvm-jailer-lite` (seccomp + Landlock) ruleset, then hands the
-    # parent-inherited socketpair fds to the
-    # `mvm-supervisor::gateway_bridge::BridgeEndpoints::Passt` path.
-    "crates/mvm-firecracker-bridge",
+    # Plan 113 / ADR-064 — per-VM gateway audit bridge sidecar binary.
+    # Single leaf crate that dispatches on a stdin discriminator:
+    #   * `EndpointSpec::Passt` (Linux-only) — Firecracker/passt path.
+    #     Verifies the operator-curated `passt` binary hash, installs
+    #     the `mvm-jailer-lite` (seccomp + Landlock) ruleset, then
+    #     hands the parent-inherited socketpair fds to the
+    #     `mvm-supervisor::gateway_bridge::BridgeEndpoints::Passt`
+    #     path. The file-level `cfg(target_os = "linux")` gate in
+    #     `src/endpoints.rs::run_passt` reduces non-Linux compilation
+    #     to a stub that bails when the variant fires.
+    #   * `EndpointSpec::VzIngest` — Apple Vz path. Binds the Swift
+    #     `mvm-vz-supervisor`'s `events_ingest_socket_path` and
+    #     threads the NDJSON `FlowEventWire` stream through
+    #     `mvm-supervisor`'s chain-signing audit pipeline.
+    # Unifies the two prior backend-specific binaries
+    # (`mvm-firecracker-bridge` + `mvm-vz-drainer`) into one shipped
+    # artifact; future backends ship as new `EndpointSpec` variants.
+    "crates/mvm-bridge",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
@@ -120,7 +123,7 @@ exclude = [
     # CI gate at `.github/workflows/security.yml::fuzz` runs both
     # targets on release-tag pushes + nightly cron + manual
     # dispatch only (not on every PR — the lane is heavy).
-    "crates/mvm-firecracker-bridge/fuzz",
+    "crates/mvm-bridge/fuzz",
 ]
 resolver = "3"
 
@@ -329,20 +332,18 @@ mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-feature
 mvm-egress-proxy = { path = "crates/mvm-egress-proxy", version = "0.14.0" }
 
 # Plan 113 / ADR-064 §Decision 5 — A2 confinement helper (seccompiler +
-# landlock). Consumed by the per-VM `mvm-firecracker-bridge` sidecar.
+# landlock). Consumed by the per-VM `mvm-bridge` sidecar's passt arm.
 mvm-jailer-lite = { path = "crates/mvm-jailer-lite", version = "0.14.0" }
 
-# Plan 113 §Task 10 / ADR-064 — per-VM Vz drainer binary crate. Leaf
-# entry consumed by `mvm-backend::vz::start()` (Task 11) via fork+exec;
-# no other workspace member links it as a library.
-mvm-vz-drainer = { path = "crates/mvm-vz-drainer", version = "0.14.0" }
-
-# Plan 113 §Task 12 / ADR-064 — per-VM Firecracker bridge sidecar binary
-# crate. Leaf entry resolved by Task 13's `FirecrackerBackend` at runtime
-# (fork+exec, never linked as a library). Linux-only at runtime; the
-# crate's `src/main.rs` cfg-gates the body so `cargo check --workspace`
-# stays green on macOS / Windows contributor hosts.
-mvm-firecracker-bridge = { path = "crates/mvm-firecracker-bridge", version = "0.14.0" }
+# Plan 113 / ADR-064 — unified per-VM gateway audit bridge sidecar
+# binary crate. Leaf entry resolved by `mvm-backend`'s per-backend
+# spawner at runtime (fork+exec, never linked as a library).
+# Dispatches on an `EndpointSpec` discriminator: Linux-only Passt
+# (Firecracker / future Cloud Hypervisor) + VzIngest (Apple Vz). The
+# Linux-only arm `cfg(target_os = "linux")` gate keeps
+# `cargo check --workspace` green on macOS / Windows contributor
+# hosts.
+mvm-bridge = { path = "crates/mvm-bridge", version = "0.14.0" }
 
 # Dev dependencies
 assert_cmd = "2"

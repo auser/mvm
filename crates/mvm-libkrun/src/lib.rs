@@ -1222,13 +1222,13 @@ fn install_shutdown_handler(_krun: &sys::Context) -> Result<(), Error> {
 /// "unknown variant" error.
 ///
 /// Scope: this reservation is `mvm-libkrun::SupervisorConfig`-only.
-/// The `mvm-firecracker-bridge` and `mvm-vz-drainer` sidecar binaries
-/// don't need an equivalent field because their crash policy is
-/// enforced by the parent `mvm-backend` process via the watchdog
-/// thread — the bridge dies, the parent observes the exit, the
-/// parent tears down the VM. libkrun is different because the bridge
-/// runs in-process; the supervisor itself is the only thing in a
-/// position to enforce a policy on bridge panics.
+/// The unified `mvm-bridge` sidecar binary doesn't need an equivalent
+/// field because its crash policy is enforced by the parent
+/// `mvm-backend` process via the watchdog thread — the bridge dies,
+/// the parent observes the exit, the parent tears down the VM.
+/// libkrun is different because the bridge runs in-process; the
+/// supervisor itself is the only thing in a position to enforce a
+/// policy on bridge panics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BridgeRestartPolicy {

@@ -1,13 +1,13 @@
 // Plan 113 §Task 15 / ADR-064 — fuzz the operator-curated
 // `~/.mvm/passt-hashes.toml` parser.
 //
-// `verify_passt_hash` (`crates/mvm-firecracker-bridge/src/parse.rs`)
-// reads this file BEFORE installing `mvm-jailer-lite` confinement so
-// the bridge can emit a clean remediation hint on a missing or
-// malformed allowlist (Cardoso minimum-viable-policy — the operator-
-// pinned allowlist is the supply-chain gate). A panic in the TOML
-// parser surfaces as a hard process death before the FlowEvent
-// pipeline is up.
+// `verify_passt_hash` (`crates/mvm-bridge/src/parse.rs`) reads this
+// file BEFORE installing `mvm-jailer-lite` confinement so the bridge
+// can emit a clean remediation hint on a missing or malformed
+// allowlist (Cardoso minimum-viable-policy — the operator-pinned
+// allowlist is the supply-chain gate). A panic in the TOML parser
+// surfaces as a hard process death before the FlowEvent pipeline is
+// up.
 //
 // The operator-managed format is a single-key TOML doc:
 //
@@ -22,7 +22,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mvm_firecracker_bridge::parse::PasstHashesFile;
+use mvm_bridge::parse::PasstHashesFile;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {

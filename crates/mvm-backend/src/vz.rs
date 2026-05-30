@@ -75,49 +75,50 @@ impl Drop for AttachedGvproxyGuard {
     }
 }
 
-/// Plan 113 §Task 11 — tear-down guard for the per-VM `mvm-vz-drainer`
+/// Plan 113 / ADR-064 — tear-down guard for the per-VM `mvm-bridge`
 /// sidecar that bridges Swift's NDJSON `FlowEventWire` socket into the
-/// chain-signed audit pipeline (ADR-064 §Decision 8). Mirrors
-/// `AttachedGvproxyGuard`'s shape: kills + reaps the child on `Drop` so
-/// the drainer dies on early return / panic from `VzBackend::start`
-/// between drainer spawn and the Vz supervisor's PID-file write.
+/// chain-signed audit pipeline (ADR-064 §Decision 8) under the
+/// VzIngest endpoint variant. Mirrors `AttachedGvproxyGuard`'s shape:
+/// kills + reaps the child on `Drop` so the bridge dies on early
+/// return / panic from `VzBackend::start` between bridge spawn and the
+/// Vz supervisor's PID-file write.
 ///
 /// Once the Vz supervisor has confirmed boot (its PID file appears),
-/// the parent calls [`AttachedDrainerGuard::detach`] which takes the
-/// `Child` out of the guard. From that point the drainer is detached
-/// (its PID file under `~/.mvm/vms/<name>/vz-drainer.pid` is the
+/// the parent calls [`AttachedBridgeGuard::detach`] which takes the
+/// `Child` out of the guard. From that point the bridge is detached
+/// (its PID file under `~/.mvm/vms/<name>/mvm-bridge.pid` is the
 /// reaper handle used by [`VzBackend::stop`]).
-struct AttachedDrainerGuard {
+struct AttachedBridgeGuard {
     child: Option<std::process::Child>,
 }
 
-impl AttachedDrainerGuard {
-    /// Hand off ownership of the spawned drainer to the OS — used after
-    /// the Vz supervisor has confirmed boot so the drainer outlives
-    /// `start()`'s stack frame. Returns the `Child` so the caller can
-    /// read its PID into the on-disk reaper file before the handle is
-    /// dropped without `kill()` firing.
+impl AttachedBridgeGuard {
+    /// Hand off ownership of the spawned bridge to the OS — used
+    /// after the Vz supervisor has confirmed boot so the bridge
+    /// outlives `start()`'s stack frame. Returns the `Child` so the
+    /// caller can read its PID into the on-disk reaper file before
+    /// the handle is dropped without `kill()` firing.
     fn detach(&mut self) -> Option<std::process::Child> {
         self.child.take()
     }
 }
 
-impl Drop for AttachedDrainerGuard {
+impl Drop for AttachedBridgeGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
             let pid = c.id();
             if let Err(e) = c.kill() {
                 tracing::warn!(
-                    drainer_pid = pid,
+                    bridge_pid = pid,
                     error = %e,
-                    "AttachedDrainerGuard: kill mvm-vz-drainer failed on drop"
+                    "AttachedBridgeGuard: kill mvm-bridge failed on drop"
                 );
             }
             if let Err(e) = c.wait() {
                 tracing::warn!(
-                    drainer_pid = pid,
+                    bridge_pid = pid,
                     error = %e,
-                    "AttachedDrainerGuard: wait mvm-vz-drainer failed on drop"
+                    "AttachedBridgeGuard: wait mvm-bridge failed on drop"
                 );
             }
         }
@@ -129,10 +130,12 @@ impl Drop for AttachedDrainerGuard {
 /// the same `~/.mvm/vms/<name>/` tree if a host happens to use both.
 const PID_FILE_NAME: &str = "vz.pid";
 
-/// Plan 113 §Task 11 — PID file the `mvm-vz-drainer` sibling writes
+/// Plan 113 / ADR-064 — PID file the `mvm-bridge` sibling writes
 /// after a successful boot. Lives next to `vz.pid` so `VzBackend::stop`
-/// can reap the drainer the same way it reaps the supervisor.
-const DRAINER_PID_FILE_NAME: &str = "vz-drainer.pid";
+/// can reap the bridge the same way it reaps the supervisor. Matches
+/// the Firecracker backend's `mvm-bridge.pid` naming under
+/// `crates/mvm-backend/src/microvm.rs`.
+const BRIDGE_PID_FILE_NAME: &str = "mvm-bridge.pid";
 
 /// Persisted `SupervisorConfig` JSON. Written by `start` so
 /// `snapshot_restore` can replay the same shape with
@@ -222,16 +225,18 @@ impl VmBackend for VzBackend {
         // / vm_name) — see Plan 112 Phase 3c.
         let cfg = build_supervisor_config(config, kernel, &state_dir, &gvproxy_info)?;
 
-        // Plan 113 §Task 11 / ADR-064 — spawn the `mvm-vz-drainer`
-        // sibling between gvproxy and the Vz VM boot. Closes Plan 112's
-        // Vz carve-out: the drainer binds `events_ingest_socket_path`,
-        // reads Swift's NDJSON `FlowEventWire` stream, and chain-signs
-        // entries into `~/.mvm/audit/<tenant>.jsonl` via
-        // `mvm-supervisor::gateway_bridge`. The guard kills the drainer
-        // on early return / panic between here and the supervisor's PID
-        // file appearing; after a clean boot the guard is `detach()`ed
-        // and the drainer is reaped by `stop()` via its own PID file.
-        let mut drainer_guard = spawn_vz_drainer(config)?;
+        // Plan 113 §Task 11 / ADR-064 — spawn the unified `mvm-bridge`
+        // sibling under the VzIngest endpoint variant between gvproxy
+        // and the Vz VM boot. Closes Plan 112's Vz carve-out: the
+        // bridge binds `events_ingest_socket_path`, reads Swift's
+        // NDJSON `FlowEventWire` stream, and chain-signs entries into
+        // `~/.mvm/audit/<tenant>.jsonl` via
+        // `mvm-supervisor::gateway_bridge`. The guard kills the bridge
+        // on early return / panic between here and the supervisor's
+        // PID file appearing; after a clean boot the guard is
+        // `detach()`ed and the bridge is reaped by `stop()` via its
+        // own PID file.
+        let mut bridge_guard = spawn_bridge_vz_ingest(config)?;
         let pid_file = state_dir.join(PID_FILE_NAME);
         // Stale-PID-file cleanup from a previous crashed supervisor so
         // the wait-loop below detects the *new* one unambiguously.
@@ -319,15 +324,15 @@ impl VmBackend for VzBackend {
         }
 
         // Plan 113 §Task 11 — Vz supervisor booted cleanly. Detach the
-        // drainer so it survives `start()`'s stack frame; record its
+        // bridge so it survives `start()`'s stack frame; record its
         // PID for `stop()` to reap. A failure here is non-fatal: the
-        // VM is already running. We log + leave the drainer attached;
+        // VM is already running. We log + leave the bridge attached;
         // the next `stop()` walks both PID files anyway.
-        if let Err(e) = detach_and_persist_drainer(&state_dir, &mut drainer_guard) {
+        if let Err(e) = detach_and_persist_bridge(&state_dir, &mut bridge_guard) {
             tracing::warn!(
                 vm = %config.name,
                 error = %e,
-                "detach/persist mvm-vz-drainer PID failed (non-fatal); guard remains attached"
+                "detach/persist mvm-bridge PID failed (non-fatal); guard remains attached"
             );
         }
 
@@ -398,11 +403,11 @@ impl VmBackend for VzBackend {
             );
         }
 
-        // Plan 113 §Task 11 — reap the `mvm-vz-drainer` sibling that
-        // `start()` spawned and detached. Same SIGTERM → poll → SIGKILL
-        // ladder as the supervisor; best-effort because some VMs have
-        // no drainer (legacy callers without `plan_json`).
-        reap_drainer(&vm_state_dir(&id.0));
+        // Plan 113 §Task 11 — reap the `mvm-bridge` sibling that
+        // `start()` spawned and detached. Same SIGTERM → poll →
+        // SIGKILL ladder as the supervisor; best-effort because some
+        // VMs have no bridge (legacy callers without `plan_json`).
+        reap_bridge(&vm_state_dir(&id.0));
 
         ui::success(&format!("Vz VM '{}' stopped.", id.0));
         Ok(())
@@ -1099,34 +1104,35 @@ fn workspace_root_from_manifest_dir() -> Option<PathBuf> {
     manifest_dir.parent()?.parent().map(Path::to_path_buf)
 }
 
-/// Plan 113 §Task 11 — spawn the `mvm-vz-drainer` sibling. Returns an
-/// [`AttachedDrainerGuard`] still holding the `Child`; the caller
-/// either lets the guard fall out of scope on early-return to kill the
-/// drainer, or calls [`AttachedDrainerGuard::detach`] after the Vz
-/// supervisor confirms boot.
+/// Plan 113 / ADR-064 — spawn the unified `mvm-bridge` sibling with
+/// `EndpointSpec::VzIngest`. Returns an [`AttachedBridgeGuard`] still
+/// holding the `Child`; the caller either lets the guard fall out of
+/// scope on early-return to kill the bridge, or calls
+/// [`AttachedBridgeGuard::detach`] after the Vz supervisor confirms
+/// boot.
 ///
 /// Gate: when `config.plan_json` is `None`, the legacy path (no
 /// admission, no audit substrate) is taken and an empty guard is
 /// returned. When `plan_json` is `Some` but `tenant_id` is `None`,
 /// that's a wire-level inconsistency (Plan 112 Phase 3c invariant —
 /// substrate paths can't be computed without a tenant), so we log a
-/// warning and skip the drainer rather than launch it with partial
+/// warning and skip the bridge rather than launch it with partial
 /// information.
-fn spawn_vz_drainer(config: &VmStartConfig) -> Result<AttachedDrainerGuard> {
+fn spawn_bridge_vz_ingest(config: &VmStartConfig) -> Result<AttachedBridgeGuard> {
     let Some(plan_json) = config.plan_json.as_deref() else {
         tracing::debug!(
             vm = %config.name,
-            "no plan_json on VmStartConfig; skipping mvm-vz-drainer (legacy path)"
+            "no plan_json on VmStartConfig; skipping mvm-bridge (legacy path)"
         );
-        return Ok(AttachedDrainerGuard { child: None });
+        return Ok(AttachedBridgeGuard { child: None });
     };
     if config.tenant_id.is_none() {
         tracing::warn!(
             vm = %config.name,
-            "plan_json set without tenant_id; skipping mvm-vz-drainer (wire-level inconsistency — \
+            "plan_json set without tenant_id; skipping mvm-bridge (wire-level inconsistency — \
              Plan 112 Phase 3c requires both for substrate path derivation)"
         );
-        return Ok(AttachedDrainerGuard { child: None });
+        return Ok(AttachedBridgeGuard { child: None });
     }
 
     let data_dir = PathBuf::from(mvm_core::config::mvm_data_dir());
@@ -1135,74 +1141,79 @@ fn spawn_vz_drainer(config: &VmStartConfig) -> Result<AttachedDrainerGuard> {
     let signing_key_path = data_dir.join("keys").join("host-signer.ed25519");
     let events_socket = events_ingest_socket_path(&config.name);
 
-    let drainer_cfg = serde_json::json!({
+    // BridgeConfigJson with the VzIngest variant nested under
+    // `endpoints.kind = "vz_ingest"`. See `mvm_bridge::parse` for the
+    // schema.
+    let bridge_cfg = serde_json::json!({
         "vm_name": config.name,
         "audit_dir": audit_dir,
         "audit_socket": audit_socket,
         "signing_key_path": signing_key_path,
-        "events_socket_path": events_socket,
         "plan_json": plan_json,
         "bundle_json": config.bundle_json,
+        "endpoints": {
+            "kind": "vz_ingest",
+            "events_socket_path": events_socket,
+        },
     });
 
-    let drainer_bin =
-        resolve_vz_drainer_path().map_err(|e| anyhow!("locate mvm-vz-drainer binary: {e}"))?;
+    let bridge_bin = resolve_bridge_path().map_err(|e| anyhow!("locate mvm-bridge binary: {e}"))?;
 
     ui::info(&format!(
-        "Spawning mvm-vz-drainer for Vz VM '{}' via {}...",
+        "Spawning mvm-bridge (vz_ingest arm) for Vz VM '{}' via {}...",
         config.name,
-        drainer_bin.display(),
+        bridge_bin.display(),
     ));
 
-    let mut child = Command::new(&drainer_bin)
+    let mut child = Command::new(&bridge_bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| anyhow!("spawn {}: {e}", drainer_bin.display()))?;
+        .map_err(|e| anyhow!("spawn {}: {e}", bridge_bin.display()))?;
     child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("mvm-vz-drainer stdin was not piped"))?
-        .write_all(drainer_cfg.to_string().as_bytes())
-        .map_err(|e| anyhow!("pipe DrainerConfig to mvm-vz-drainer stdin: {e}"))?;
+        .ok_or_else(|| anyhow!("mvm-bridge stdin was not piped"))?
+        .write_all(bridge_cfg.to_string().as_bytes())
+        .map_err(|e| anyhow!("pipe BridgeConfigJson to mvm-bridge stdin: {e}"))?;
 
     // Closing stdin (the take above already drops the writer once the
-    // block ends) signals end-of-input to the drainer's `read_to_string`
+    // block ends) signals end-of-input to the bridge's `read_to_string`
     // loop.
-    Ok(AttachedDrainerGuard { child: Some(child) })
+    Ok(AttachedBridgeGuard { child: Some(child) })
 }
 
-/// Plan 113 §Task 11 — once the Vz supervisor's PID file appears, take
-/// the drainer `Child` out of its guard, persist its PID under
-/// `<state_dir>/vz-drainer.pid` (mode 0600), then drop the handle so
-/// the OS keeps the process alive. From that point [`reap_drainer`] is
+/// Plan 113 / ADR-064 — once the Vz supervisor's PID file appears,
+/// take the bridge `Child` out of its guard, persist its PID under
+/// `<state_dir>/mvm-bridge.pid` (mode 0600), then drop the handle so
+/// the OS keeps the process alive. From that point [`reap_bridge`] is
 /// the reaper. No-op when the guard is empty (legacy path).
-fn detach_and_persist_drainer(state_dir: &Path, guard: &mut AttachedDrainerGuard) -> Result<()> {
+fn detach_and_persist_bridge(state_dir: &Path, guard: &mut AttachedBridgeGuard) -> Result<()> {
     let Some(child) = guard.detach() else {
         return Ok(());
     };
     let pid = child.id();
-    let pid_path = state_dir.join(DRAINER_PID_FILE_NAME);
-    write_drainer_pid_file(&pid_path, pid)?;
+    let pid_path = state_dir.join(BRIDGE_PID_FILE_NAME);
+    write_bridge_pid_file(&pid_path, pid)?;
     // Drop the `Child` handle without `wait`; the kernel does not kill
-    // a process when its `Child` handle drops, so the drainer survives.
+    // a process when its `Child` handle drops, so the bridge survives.
     drop(child);
     Ok(())
 }
 
-/// Atomically write the drainer PID file at mode 0600, mirroring the
+/// Atomically write the bridge PID file at mode 0600, mirroring the
 /// shape used by `persist_supervisor_config` so concurrent observers
 /// never see a half-written value.
-fn write_drainer_pid_file(path: &Path, pid: u32) -> Result<()> {
+fn write_bridge_pid_file(path: &Path, pid: u32) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
 
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("drainer pid path has no parent: {}", path.display()))?;
-    let tmp = parent.join(format!("{DRAINER_PID_FILE_NAME}.tmp"));
+        .ok_or_else(|| anyhow!("bridge pid path has no parent: {}", path.display()))?;
+    let tmp = parent.join(format!("{BRIDGE_PID_FILE_NAME}.tmp"));
     {
         let mut f = OpenOptions::new()
             .create(true)
@@ -1211,7 +1222,7 @@ fn write_drainer_pid_file(path: &Path, pid: u32) -> Result<()> {
             .mode(0o600)
             .open(&tmp)
             .map_err(|e| anyhow!("open {} for write: {e}", tmp.display()))?;
-        writeln!(f, "{pid}").map_err(|e| anyhow!("write drainer pid: {e}"))?;
+        writeln!(f, "{pid}").map_err(|e| anyhow!("write bridge pid: {e}"))?;
         f.sync_all().ok();
     }
     std::fs::rename(&tmp, path)
@@ -1219,13 +1230,13 @@ fn write_drainer_pid_file(path: &Path, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Plan 113 §Task 11 — reap the `mvm-vz-drainer` sibling spawned by
+/// Plan 113 / ADR-064 — reap the `mvm-bridge` sibling spawned by
 /// `start()`. Best-effort: a missing PID file means the VM either had
-/// no drainer (legacy callers without `plan_json`) or the drainer
+/// no bridge (legacy callers without `plan_json`) or the bridge
 /// already exited; in either case `stop()` proceeds. SIGTERM → poll →
 /// SIGKILL ladder matches the supervisor's path.
-fn reap_drainer(state_dir: &Path) {
-    let pid_path = state_dir.join(DRAINER_PID_FILE_NAME);
+fn reap_bridge(state_dir: &Path) {
+    let pid_path = state_dir.join(BRIDGE_PID_FILE_NAME);
     let pid = match read_pid(&pid_path) {
         Some(p) => p,
         None => return,
@@ -1244,32 +1255,34 @@ fn reap_drainer(state_dir: &Path) {
     }
     if pid_alive(pid) {
         tracing::warn!(
-            drainer_pid = pid,
-            "mvm-vz-drainer did not exit after SIGTERM within {STOP_TIMEOUT:?}; sending SIGKILL"
+            bridge_pid = pid,
+            "mvm-bridge did not exit after SIGTERM within {STOP_TIMEOUT:?}; sending SIGKILL"
         );
         send_signal(pid, libc::SIGKILL);
     }
     let _ = std::fs::remove_file(&pid_path);
 }
 
-/// Plan 113 §Task 11 — resolve the `mvm-vz-drainer` binary path,
+/// Plan 113 / ADR-064 — resolve the unified `mvm-bridge` binary path,
 /// checking three sources in order, mirroring `resolve_supervisor_path`:
 ///
-/// 1. `MVM_VZ_DRAINER_PATH` — explicit override for tests +
-///    `cargo run` workflows.
-/// 2. A binary named `mvm-vz-drainer` adjacent to the current
+/// 1. `MVM_BRIDGE_PATH` — explicit override for tests +
+///    `cargo run` workflows. Shared with the Firecracker backend's
+///    spawn site under `crates/mvm-backend/src/microvm.rs` since
+///    there's now one bridge binary.
+/// 2. A binary named `mvm-bridge` adjacent to the current
 ///    executable — the layout produced by `cargo install` / Homebrew
 ///    bottles that ship `mvmctl` alongside the sidecars.
 /// 3. The source-checkout build output under
-///    `<workspace-root>/target/{release,debug}/mvm-vz-drainer`
+///    `<workspace-root>/target/{release,debug}/mvm-bridge`
 ///    (CLAUDE.md "Source-checkout builds never depend on mvm-published
 ///    artifacts"); this matters during local dev when `mvmctl` is
 ///    `cargo run` from the workspace root.
-fn resolve_vz_drainer_path() -> Result<PathBuf> {
-    let env_override = std::env::var_os("MVM_VZ_DRAINER_PATH").map(PathBuf::from);
+fn resolve_bridge_path() -> Result<PathBuf> {
+    let env_override = std::env::var_os("MVM_BRIDGE_PATH").map(PathBuf::from);
     let current_exe = std::env::current_exe().ok();
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    resolve_vz_drainer_path_inner(
+    resolve_bridge_path_inner(
         env_override.as_deref(),
         current_exe.as_deref(),
         &manifest_dir,
@@ -1279,7 +1292,7 @@ fn resolve_vz_drainer_path() -> Result<PathBuf> {
 /// Pure resolver — exercised directly from tests without touching
 /// `std::env`. Mirrors the Task 7 refactor pattern (`scrape_file_path_for`)
 /// so unit tests don't race on process-wide env state.
-fn resolve_vz_drainer_path_inner(
+fn resolve_bridge_path_inner(
     env_override: Option<&Path>,
     current_exe: Option<&Path>,
     manifest_dir: &Path,
@@ -1289,14 +1302,14 @@ fn resolve_vz_drainer_path_inner(
             return Ok(path.to_path_buf());
         }
         bail!(
-            "MVM_VZ_DRAINER_PATH points at {} which is not a file",
+            "MVM_BRIDGE_PATH points at {} which is not a file",
             path.display()
         );
     }
     if let Some(exe) = current_exe
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join("mvm-vz-drainer");
+        let candidate = dir.join("mvm-bridge");
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -1308,16 +1321,16 @@ fn resolve_vz_drainer_path_inner(
             let candidate = workspace_root
                 .join("target")
                 .join(variant)
-                .join("mvm-vz-drainer");
+                .join("mvm-bridge");
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
     }
     bail!(
-        "mvm-vz-drainer binary not found. Looked for: $MVM_VZ_DRAINER_PATH, \
-         alongside the current exe, and <workspace>/target/{{release,debug}}/mvm-vz-drainer. \
-         Build with `cargo build -p mvm-vz-drainer`."
+        "mvm-bridge binary not found. Looked for: $MVM_BRIDGE_PATH, \
+         alongside the current exe, and <workspace>/target/{{release,debug}}/mvm-bridge. \
+         Build with `cargo build -p mvm-bridge`."
     )
 }
 
@@ -1605,22 +1618,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vz_drainer_path_inner_prefers_env_override() {
+    fn resolve_bridge_path_inner_prefers_env_override() {
         // Pure resolver — exercised without touching process env. The
         // override must point at a real file or the call errors with a
         // "not a file" message.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let manifest_dir = PathBuf::from("/nonexistent/manifest");
-        let resolved = resolve_vz_drainer_path_inner(Some(tmp.path()), None, &manifest_dir)
+        let resolved = resolve_bridge_path_inner(Some(tmp.path()), None, &manifest_dir)
             .expect("env override resolves");
         assert_eq!(resolved, tmp.path());
     }
 
     #[test]
-    fn resolve_vz_drainer_path_inner_env_pointing_at_missing_file_errors() {
+    fn resolve_bridge_path_inner_env_pointing_at_missing_file_errors() {
         let manifest_dir = PathBuf::from("/nonexistent/manifest");
-        let bogus = Path::new("/definitely/not/there/mvm-vz-drainer");
-        let err = resolve_vz_drainer_path_inner(Some(bogus), None, &manifest_dir)
+        let bogus = Path::new("/definitely/not/there/mvm-bridge");
+        let err = resolve_bridge_path_inner(Some(bogus), None, &manifest_dir)
             .expect_err("missing file must error");
         assert!(
             err.to_string().contains("not a file"),
@@ -1629,35 +1642,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vz_drainer_path_inner_falls_back_to_adjacent() {
+    fn resolve_bridge_path_inner_falls_back_to_adjacent() {
         // When the env override is absent but a sibling binary exists
         // next to the current exe, the resolver returns it.
         let tmp_dir = tempfile::tempdir().unwrap();
         let exe = tmp_dir.path().join("mvmctl");
         std::fs::write(&exe, b"#!fake").unwrap();
-        let drainer = tmp_dir.path().join("mvm-vz-drainer");
-        std::fs::write(&drainer, b"#!fake").unwrap();
+        let bridge = tmp_dir.path().join("mvm-bridge");
+        std::fs::write(&bridge, b"#!fake").unwrap();
         let manifest_dir = PathBuf::from("/nonexistent/manifest");
         let resolved =
-            resolve_vz_drainer_path_inner(None, Some(&exe), &manifest_dir).expect("adjacent hit");
-        assert_eq!(resolved, drainer);
+            resolve_bridge_path_inner(None, Some(&exe), &manifest_dir).expect("adjacent hit");
+        assert_eq!(resolved, bridge);
     }
 
     #[test]
-    fn resolve_vz_drainer_path_inner_errors_when_nothing_found() {
+    fn resolve_bridge_path_inner_errors_when_nothing_found() {
         // All three sources miss → actionable error.
         let manifest_dir = PathBuf::from("/nonexistent/manifest");
-        let err = resolve_vz_drainer_path_inner(None, None, &manifest_dir)
+        let err = resolve_bridge_path_inner(None, None, &manifest_dir)
             .expect_err("no candidate must error");
         let msg = err.to_string();
         assert!(
-            msg.contains("mvm-vz-drainer") && msg.contains("MVM_VZ_DRAINER_PATH"),
+            msg.contains("mvm-bridge") && msg.contains("MVM_BRIDGE_PATH"),
             "error names the binary + override env var: {msg}"
         );
     }
 
     #[test]
-    fn attached_drainer_guard_kills_child_on_drop() {
+    fn attached_bridge_guard_kills_child_on_drop() {
         // Spawn a long-lived `sleep` and wrap it; dropping the guard
         // must kill the process. We poll `try_wait` briefly after drop
         // to assert the child reaped.
@@ -1670,7 +1683,7 @@ mod tests {
             .expect("spawn sleep");
         let pid = child.id() as libc::pid_t;
         {
-            let _guard = AttachedDrainerGuard { child: Some(child) };
+            let _guard = AttachedBridgeGuard { child: Some(child) };
             assert!(pid_alive(pid), "sleep should be alive while guard owns it");
         }
         // After drop: poll up to 1s for the process to disappear.
@@ -1685,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_drainer_guard_detach_leaves_child_running() {
+    fn attached_bridge_guard_detach_leaves_child_running() {
         // `detach` takes the Child out so dropping the guard does NOT
         // kill the process. The test reaps the detached child manually
         // to avoid leaking it past the test boundary.
@@ -1697,7 +1710,7 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id() as libc::pid_t;
-        let mut guard = AttachedDrainerGuard { child: Some(child) };
+        let mut guard = AttachedBridgeGuard { child: Some(child) };
         let detached = guard.detach().expect("detach yields the child");
         // Guard is now empty; dropping it must NOT kill the child.
         drop(guard);
@@ -1709,10 +1722,10 @@ mod tests {
     }
 
     #[test]
-    fn attached_drainer_guard_empty_drop_is_noop() {
+    fn attached_bridge_guard_empty_drop_is_noop() {
         // The legacy / opt-out path returns an empty guard. Dropping
         // it must not panic and must not attempt any process ops.
-        let guard = AttachedDrainerGuard { child: None };
+        let guard = AttachedBridgeGuard { child: None };
         drop(guard);
     }
 

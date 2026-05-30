@@ -3337,6 +3337,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-bridge"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "libc",
+ "mvm-jailer-lite",
+ "mvm-plan",
+ "mvm-policy",
+ "mvm-supervisor",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mvm-broker"
 version = "0.14.0"
 dependencies = [
@@ -3480,25 +3500,6 @@ version = "0.14.0"
 dependencies = [
  "libc",
  "tempfile",
-]
-
-[[package]]
-name = "mvm-firecracker-bridge"
-version = "0.14.0"
-dependencies = [
- "anyhow",
- "ed25519-dalek",
- "mvm-jailer-lite",
- "mvm-plan",
- "mvm-policy",
- "mvm-supervisor",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3801,21 +3802,6 @@ version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "mvm-vz-drainer"
-version = "0.14.0"
-dependencies = [
- "anyhow",
- "ed25519-dalek",
- "mvm-plan",
- "mvm-policy",
- "mvm-supervisor",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

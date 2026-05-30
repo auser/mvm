@@ -1,5 +1,7 @@
 # ADR 064 - NetworkProvider trait — composable network audit substrate
 
+> **Post-execution refactor (2026-05-29):** Plan 113 originally shipped two separate sidecar binaries (`mvm-firecracker-bridge` + `mvm-vz-drainer`). Both were structurally the same host of `mvm-supervisor::gateway_bridge::run_bridge_inner` with a different `BridgeEndpoints` variant; they were unified into a single `mvm-bridge` crate with a `BridgeConfigJson { endpoints: { Passt | VzIngest } }` discriminator. Future backends ship as new `EndpointSpec` variants — no new binary. The ADR body below references the original names for historical accuracy; the shipped binary is `mvm-bridge` (`crates/mvm-bridge/`).
+
 **Status**: Proposed
 **Date**: 2026-05-29
 **Cross-refs**: ADR-002 (security posture, claim 1 / claim 5 / claim 10), ADR-041 (signed/audited ExecutionPlan, claim 8), ADR-055 (passt/gvproxy cross-platform backends), ADR-058 (claim 10 leg 2 / "bytes leaving the trust boundary"), ADR-059 (host services broker — vsock-only scope boundary), Plan 102 (gateway audit substrate impl), Plan 112 (W6.A Phase 3c producer activation, merged 2026-05-29).
