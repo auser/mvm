@@ -362,6 +362,11 @@ pub fn run_benchmark<P: LaunchProbe>(probe: &mut P, runs: u32, warmup: u32) -> R
 struct LibkrunProbe {
     os: String,
     arch: String,
+    // Per-iteration counter so each boot gets a unique VM name and the
+    // teardown of run N never races the cold start of run N+1. Only
+    // read on the `libkrun-live` path.
+    #[allow(dead_code)]
+    iter: u32,
 }
 
 impl LibkrunProbe {
@@ -369,25 +374,36 @@ impl LibkrunProbe {
         Ok(Self {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            iter: 0,
         })
     }
 }
 
 impl LaunchProbe for LibkrunProbe {
     fn measure_once(&mut self) -> Result<IterationTiming> {
-        // The measurement substrate (stats, schema, regression gate,
-        // orchestration) is implemented and unit-tested above. The
-        // only remaining piece is booting a real libkrun guest through
-        // `admit_plan_for_boot` and reading the host wall-clock spans +
-        // the guest `BootTimingReport`. Wiring that needs a working
-        // libkrun backend and is tracked in
-        // `specs/plans/93-fast-secure-dev-path-followups.md`.
-        bail!(
-            "bench microvm-launch: the live libkrun probe is not yet wired. The \
-             measurement substrate is complete; the remaining step is booting a \
-             guest through the signed-plan admission path and reading its boot \
-             timing. Tracked as a Plan 93 Phase 2 Lever 0 follow-up."
-        )
+        // Under `libkrun-live`, boot a real guest through the claim-8
+        // admission path and convert the captured marks to spans.
+        // Without the feature, fail honestly rather than fake a number —
+        // a stock binary cannot boot a libkrun guest.
+        #[cfg(feature = "libkrun-live")]
+        {
+            // Unique name per iteration so teardown of run N never races
+            // the cold start of run N+1.
+            self.iter += 1;
+            let name = format!("mvm-bench-{}", self.iter);
+            let marks = crate::commands::ops::bench_probe::boot_measure_once(&name)?;
+            Ok(marks.to_timing())
+        }
+        #[cfg(not(feature = "libkrun-live"))]
+        {
+            bail!(
+                "bench microvm-launch: this binary was built without the \
+                 `libkrun-live` feature, so it cannot boot a real guest. \
+                 Rebuild with `cargo build -p mvm-cli --features libkrun-live` \
+                 on a host where libkrun boots (the slp/krun Homebrew trio \
+                 installed). The measurement substrate is otherwise complete."
+            )
+        }
     }
 
     fn host_descriptor(&self) -> HostDescriptor {
