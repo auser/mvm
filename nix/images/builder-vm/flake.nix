@@ -157,9 +157,11 @@
       # lands.
       #
       # Plan 73 Followup B.2.x closed the egress side: the
-      # builder VM now runs `mvm-egress-proxy` (built via
-      # `mvmEgressProxyFor system`, installed at
-      # `/sbin/mvm-egress-proxy` via `extraFiles` below).
+      # builder VM runs `mvm-egress-proxy`, embedded in mvmctl
+      # at its own build time (Plan 115 / ADR-064) and baked
+      # into the rootfs via `hostBinExtraFiles` (read from
+      # `MVM_HOST_BIN_DIR` under `--impure`) at the install
+      # path declared in `nix/lib/mvm-host-binaries.nix`.
       # `mvm-host-vm-init::install::run_install` spawns it
       # before the installer + injects `HTTPS_PROXY` /
       # `HTTP_PROXY` on `uv` / `pnpm`'s env. The proxy refuses
