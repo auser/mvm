@@ -407,13 +407,24 @@ impl LaunchProbe for LibkrunProbe {
     }
 
     fn host_descriptor(&self) -> HostDescriptor {
+        // Hash the canonical kernel so the regression gate refuses to
+        // compare across a kernel swap (a faster/slower kernel must
+        // invalidate the baseline, not silently mis-compare). Resolved
+        // from the same default-microvm image the probe boots.
+        let kernel_sha256 = super::bench_probe::resolve_probe_image()
+            .ok()
+            .and_then(|img| {
+                mvm_security::image_verify::sha256_file(std::path::Path::new(&img.kernel)).ok()
+            });
         HostDescriptor {
             os: self.os.clone(),
             arch: self.arch.clone(),
             hypervisor: "libkrun".to_string(),
             libkrun_version: None,
-            kernel_sha256: None,
-            cmdline: None,
+            kernel_sha256,
+            // The runtime libkrun cmdline (Apple Silicon HVF / virtio
+            // console), matching the backend's supervisor config.
+            cmdline: Some("console=hvc0 root=/dev/vda rw init=/init".to_string()),
         }
     }
 }
@@ -707,5 +718,31 @@ mod tests {
             );
         }
         assert!(it.total_ready_ms >= it.start_to_pid_ms);
+    }
+
+    /// The libkrun probe must stamp the kernel sha into the
+    /// `HostDescriptor` so a kernel swap invalidates the baseline (a
+    /// `None` kernel sha would let a different kernel mis-compare as a
+    /// regression-free run). Needs the cached image present, not a
+    /// boot — gated under `libkrun-live` because it touches
+    /// `~/.cache/mvm`.
+    #[cfg(feature = "libkrun-live")]
+    #[test]
+    fn host_descriptor_is_populated() {
+        let probe = LibkrunProbe::new(&MicrovmLaunchArgs {
+            runs: 1,
+            warmup: 0,
+            hypervisor: "libkrun".to_string(),
+            out: None,
+            json: false,
+            baseline: None,
+            max_regression_pct: 10.0,
+        })
+        .unwrap();
+        let h = probe.host_descriptor();
+        assert!(
+            h.kernel_sha256.is_some(),
+            "kernel sha must be set so a kernel swap invalidates the baseline"
+        );
     }
 }
