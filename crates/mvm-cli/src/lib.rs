@@ -2,11 +2,11 @@
 // Depends on mvm-core, mvm, mvm-build
 
 pub mod bootstrap;
-pub mod host_binaries;
 pub mod commands;
 pub mod config_watcher;
 pub mod doctor;
 pub mod exec;
+pub mod host_binaries;
 pub mod http;
 pub mod logging;
 pub mod metrics_server;

@@ -9,6 +9,9 @@ pub struct HostBinary {
     /// Absolute path inside the builder/dev VM rootfs.
     pub install_path: &'static str,
     /// Unix mode (e.g. 0o755) applied via the flake's extraFiles.
+    /// Mirror note: `nix/lib/mvm-host-binaries.nix` stores this as
+    /// a decimal string (`"0755"`); the `check-mvm-host-binaries-sync`
+    /// xtask (Task 3) parses + compares numerically.
     pub mode: u32,
 }
 

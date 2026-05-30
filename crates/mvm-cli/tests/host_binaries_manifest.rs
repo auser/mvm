@@ -5,17 +5,24 @@ fn manifest_lists_mvm_builder_init_and_egress_proxy() {
     let names: Vec<&str> = HOST_BINARIES.iter().map(|b| b.name).collect();
     assert!(names.contains(&"mvm-builder-init"));
     assert!(names.contains(&"mvm-egress-proxy"));
-    assert_eq!(HOST_BINARIES.len(), 2,
-        "expected exactly two host binaries in this ADR's scope");
+    assert_eq!(
+        HOST_BINARIES.len(),
+        2,
+        "expected exactly two host binaries in this ADR's scope"
+    );
 }
 
 #[test]
 fn manifest_install_paths_match_adr_064() {
-    let by_name = |n: &str| -> &HostBinary {
-        HOST_BINARIES.iter().find(|b| b.name == n).unwrap()
-    };
-    assert_eq!(by_name("mvm-builder-init").install_path, "/sbin/mvm-builder-init");
+    let by_name = |n: &str| -> &HostBinary { HOST_BINARIES.iter().find(|b| b.name == n).unwrap() };
+    assert_eq!(
+        by_name("mvm-builder-init").install_path,
+        "/sbin/mvm-builder-init"
+    );
     assert_eq!(by_name("mvm-builder-init").mode, 0o755);
-    assert_eq!(by_name("mvm-egress-proxy").install_path, "/sbin/mvm-egress-proxy");
+    assert_eq!(
+        by_name("mvm-egress-proxy").install_path,
+        "/sbin/mvm-egress-proxy"
+    );
     assert_eq!(by_name("mvm-egress-proxy").mode, 0o755);
 }
