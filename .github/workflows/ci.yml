@@ -313,6 +313,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcap-ng-dev lld
 
+      - name: Install passt
+        # Both property tests construct
+        # ConfinementSpec::firecracker_bridge(audit_dir, keys_dir,
+        # "/usr/bin/passt") and confine_self() calls landlock::apply,
+        # which calls PathFd::new on every readable_path — including
+        # /usr/bin/passt. Task 8 P1.4 made that fail-closed
+        # (JailerError::PathNotFound), which is the correct security
+        # posture but means the runner must actually ship passt.
+        # Ubuntu 22.04 universe installs the binary at /usr/bin/passt
+        # (Debian convention); the post-install probe fails loudly
+        # with a clear message if a future package lands it elsewhere.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y passt
+          test -x /usr/bin/passt || { echo "passt not at /usr/bin/passt"; ls -la /usr/bin/passt* 2>/dev/null; exit 1; }
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
