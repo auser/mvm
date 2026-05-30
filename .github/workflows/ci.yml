@@ -289,14 +289,17 @@ jobs:
   # `#![cfg(target_os = "linux")]` and `#[ignore = "..."]` so a
   # plain `cargo test -p mvm-jailer-lite` is a no-op on Linux + a
   # zero-binary on macOS / Windows. This lane drives them explicitly
-  # with `-- --ignored` on Ubuntu 22.04 (kernel ≥ 5.19, the minimum
-  # for Landlock ABI v2 best-effort installation; see
+  # with `-- --ignored` on Ubuntu 24.04 (kernel 6.x, which strictly
+  # satisfies Landlock ABI v2 best-effort installation — see
   # `crates/mvm-jailer-lite/src/landlock.rs::install_landlock`).
+  # Ubuntu 22.04 ships kernel 5.15 (borderline for ABI v2) and lacks
+  # passt in its default apt repos (passt landed in main archives only
+  # in 24.04 / noble), so this lane targets 24.04 outright.
   #
   # Runtime: a few seconds. PR-time, every push.
   jailer-lite-property:
     name: jailer-lite property tests (seccomp + Landlock) (Plan 113 §Task 9)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 
@@ -321,9 +324,11 @@ jobs:
         # /usr/bin/passt. Task 8 P1.4 made that fail-closed
         # (JailerError::PathNotFound), which is the correct security
         # posture but means the runner must actually ship passt.
-        # Ubuntu 22.04 universe installs the binary at /usr/bin/passt
-        # (Debian convention); the post-install probe fails loudly
-        # with a clear message if a future package lands it elsewhere.
+        # Ubuntu 24.04 ships passt in main and installs the binary at
+        # /usr/bin/passt (Debian convention); the post-install probe
+        # fails loudly with a clear message if a future package lands
+        # it elsewhere. Ubuntu 22.04 was tried first but its default
+        # apt repos don't carry passt (only backports / source).
         run: |
           sudo apt-get update
           sudo apt-get install -y passt
