@@ -121,7 +121,15 @@ impl WorkloadVmm for FirecrackerVmm {
 
     fn command(&self, config_path: &Path) -> Command {
         let mut cmd = Command::new(FIRECRACKER_BIN);
-        cmd.arg("--config-file").arg(config_path);
+        // `--no-api`: boot the microVM straight from the config file
+        // and run without the HTTP API server. Without it, Firecracker
+        // tries to bind its API socket at a default (privileged) path
+        // and dies with EACCES before booting the guest. We never use
+        // the API — lifecycle is the config-file boot + SIGTERM
+        // (`stop_workload`), not API calls. A4 can add `--api-sock`
+        // (mutually exclusive with `--no-api`) if it needs live
+        // control.
+        cmd.arg("--no-api").arg("--config-file").arg(config_path);
         cmd
     }
 }
@@ -349,7 +357,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, vec!["--config-file", "/some/config.json"]);
+        assert_eq!(args, vec!["--no-api", "--config-file", "/some/config.json"]);
         assert_eq!(FirecrackerVmm.name(), "firecracker");
     }
 
