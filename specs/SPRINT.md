@@ -2191,10 +2191,10 @@ Plan 100 W1 — implementation tracker (Plan 105). First slice: env-gated `MVM_L
 - [ ] **W6 dispatch flip** — brainstorm in [Plan 106](plans/106-plan-100-w6-dispatch-flip.md) (decision locked 2026-05-27 on Approach A: shared libkrun host VM, Firecracker per workload). Executable phases A1–A6 tracked in [Plan 107](plans/107-plan-100-w6-approach-a.md).
   - [x] **A1a** — protocol type rename (`BuilderRequest`/`Response` → `HostVmRequest`/`Response`) + `LibkrunPersistentBuilderVm` → `LibkrunPersistentHostVm` + new workload stub variants + 9 hermetic tests. Shipped in PR #503.
   - [x] **A1b** — crate rename (`mvm-builder-init` → `mvm-host-vm-init`) + Stage 0 byte-scan migration (`/sbin/mvm-host-vm-init` + 15 sites in `apple_container.rs`) + Nix flake updates + guest-side workload arms with `unimplemented!()` stubs until A2.2. Shipped in PR #506. Cached pre-rename rootfs images fail-closed on first `mvmctl dev up` after merge.
-  - [ ] **A2** — Firecracker-in-guest launch path.
-    - [x] **A2.1 + A2.2 + A2.3** — bake `firecracker` into the builder-vm rootfs at `/usr/bin/firecracker`; `WorkloadStart` arm spawns a workload microVM via a `WorkloadVmm` trait (no VMM lock-in — `FirecrackerVmm` is the only Firecracker-aware type, spawns `firecracker --config-file`); per-workload state dir at `/var/lib/mvm/workloads/<id>/` with collision-detect + `Drop` cleanup; `WorkloadFailed` fail-closed response. Hermetic tests only (no live KVM).
-    - [ ] **A2.4** — live nested-KVM CI smoke.
-    - [ ] **A2.5** — `nix/images/builder-vm/` reproducibility double-build.
+  - [x] **A2** — Firecracker-in-guest launch path.
+    - [x] **A2.1 + A2.2 + A2.3** — bake `firecracker` into the builder-vm rootfs at `/usr/bin/firecracker`; `WorkloadStart` arm spawns a workload microVM via a `WorkloadVmm` trait (no VMM lock-in — `FirecrackerVmm` is the only Firecracker-aware type, spawns `firecracker --config-file`); per-workload state dir at `/var/lib/mvm/workloads/<id>/` with collision-detect + `Drop` cleanup; `WorkloadFailed` fail-closed response. Hermetic tests only (no live KVM). Shipped in PR #507.
+    - [x] **A2.4** — live spawn smoke (`workload-spawn-smoke-linux` lane): boots a real Firecracker workload via `start_workload` on a stock GHA runner at **L1** `/dev/kvm` (the runner stands in for the host VM; no nested KVM needed). The original "nested-KVM" framing was over-claimed — true L2 nesting (Firecracker inside a libkrun guest, the no-`ptrace` uplift) is **deferred to A4.5**'s live-KVM smoke.
+    - [x] **A2.5** — `builder-vm-image-reproducibility` lane double-builds `nix/images/builder-vm/` and asserts byte-identical outputs (guards A2.1's firecracker closure). Release/nightly/dispatch only.
   - [ ] **A3 / A4 / A5 / A6** — vsock proxy nesting hop / `mvmctl up` wires the path / retire direct-Firecracker / docs + claim rewording. Each its own PR per Plan 107.
 - [ ] **W4 / W5 / W7 / W8** — gated on Plan 107 A4 landing.
 
