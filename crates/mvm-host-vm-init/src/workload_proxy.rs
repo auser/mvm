@@ -42,10 +42,20 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fixed AF_VSOCK port the forwarder listens on inside the host VM,
 /// registered at host-VM launch alongside the dispatch port (21471).
 pub const WORKLOAD_FORWARD_PORT: u32 = 21472;
+
+/// Plan 107 A3.4 — max concurrent forwarded vsock streams. A bounded
+/// cap so a misbehaving outer host can't exhaust the host VM's
+/// threads / fds by opening unbounded hop connections; the listener
+/// fails closed (drops the new connection) at the cap. When Plan 102
+/// W6.A.5's bridge guardrails land, the forwarder can defer to those;
+/// until then this is the bound.
+pub const MAX_CONCURRENT_FORWARDS: usize = 64;
 
 /// Upper bound on the inbound handshake body. A handshake is just
 /// `"<uuid> <port>"`, so this is generous; anything larger is junk.
@@ -53,6 +63,66 @@ const MAX_HANDSHAKE_BYTES: usize = 256;
 
 /// Upper bound on a single CONNECT response line from Firecracker.
 const MAX_CONNECT_LINE_BYTES: usize = 64;
+
+/// Plan 107 A3.4 — bounds concurrent forwarded streams. The listener
+/// calls [`ConnectionLimiter::try_acquire`] per accepted connection:
+/// it returns a [`ConnectionPermit`] (which decrements the live count
+/// on drop, i.e. when the handler thread ends) or `None` at capacity,
+/// so the listener can fail closed instead of spawning unboundedly.
+#[derive(Clone)]
+pub struct ConnectionLimiter {
+    active: Arc<AtomicUsize>,
+    max: usize,
+}
+
+/// Live-slot reservation; releases the slot when dropped.
+pub struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionLimiter {
+    pub fn new(max: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    /// Atomically reserve a slot if below the cap. Returns the permit
+    /// or `None` when already at `max` in-flight connections.
+    pub fn try_acquire(&self) -> Option<ConnectionPermit> {
+        let mut cur = self.active.load(Ordering::Acquire);
+        loop {
+            if cur >= self.max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionPermit {
+                        active: Arc::clone(&self.active),
+                    });
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Current number of live forwarded streams.
+    pub fn active_count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Parse the inbound multiplex handshake: a u32-BE length prefix
 /// followed by a UTF-8 body `"<workload_id> <port>"`. Returns the
@@ -346,5 +416,110 @@ mod tests {
         let _ = client.shutdown(Shutdown::Write);
         let res = fwd.join().unwrap();
         assert!(res.is_err(), "path-traversal workload_id must fail closed");
+    }
+
+    // ── A3.4 guardrail: bounded concurrency ──────────────────────
+
+    #[test]
+    fn connection_limiter_caps_concurrency_and_releases_on_drop() {
+        let limiter = ConnectionLimiter::new(2);
+        let p1 = limiter.try_acquire().expect("1st slot");
+        let p2 = limiter.try_acquire().expect("2nd slot");
+        assert_eq!(limiter.active_count(), 2);
+        // At cap → fail closed.
+        assert!(
+            limiter.try_acquire().is_none(),
+            "must refuse beyond the cap"
+        );
+        // Dropping a permit frees exactly one slot.
+        drop(p1);
+        assert_eq!(limiter.active_count(), 1);
+        let _p3 = limiter.try_acquire().expect("slot freed by drop");
+        assert_eq!(limiter.active_count(), 2);
+        assert!(limiter.try_acquire().is_none(), "at cap again");
+        drop(p2);
+    }
+
+    #[test]
+    fn connection_limiter_is_thread_safe() {
+        use std::sync::Arc as StdArc;
+        let limiter = StdArc::new(ConnectionLimiter::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let l = StdArc::clone(&limiter);
+            handles.push(std::thread::spawn(move || {
+                // Acquire-and-release churn; the count must never
+                // exceed the cap from any thread's view.
+                if let Some(p) = l.try_acquire() {
+                    assert!(l.active_count() <= 8);
+                    drop(p);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(limiter.active_count(), 0, "all permits released");
+    }
+
+    // ── A3.5 framing/tamper/oversize ─────────────────────────────
+
+    #[test]
+    fn read_handshake_rejects_oversized_length_prefix() {
+        // A huge length prefix must be rejected before any allocation
+        // of the body (oversized-payload drop).
+        let mut buf = u32::MAX.to_be_bytes().to_vec();
+        buf.extend_from_slice(b"junk");
+        let err = read_handshake(&mut io::Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_handshake_rejects_non_utf8_body() {
+        // Tampered (non-UTF-8) handshake body → rejected.
+        let body = [0xff, 0xfe, b' ', b'5'];
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        assert!(read_handshake(&mut io::Cursor::new(buf)).is_err());
+    }
+
+    #[test]
+    fn handle_forward_conn_is_bit_equivalent_for_binary_payload() {
+        // A3.3 parity: bytes through the hop are identical to direct —
+        // including NULs and bytes that look like frame boundaries.
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let id = "00000000-0000-0000-0000-0000000000ff";
+        std::fs::create_dir_all(base.join(id)).unwrap();
+        let uds = base.join(id).join("v.sock");
+        let listener = UnixListener::bind(&uds).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _connect_line = read_line_unbuffered(&mut conn, 64).unwrap();
+            conn.write_all(b"OK 1024\n").unwrap();
+            conn.flush().unwrap();
+            // Echo everything (the workload side).
+            let mut buf = Vec::new();
+            conn.read_to_end(&mut buf).unwrap();
+            conn.write_all(&buf).unwrap();
+        });
+
+        let payload: Vec<u8> = (0u16..=511).map(|b| (b % 256) as u8).collect();
+        let (mut client, inbound) = UnixStream::pair().unwrap();
+        let base_owned = base.to_path_buf();
+        let fwd = std::thread::spawn(move || handle_forward_conn(inbound, &base_owned));
+
+        write_handshake(&mut client, id, 5252);
+        client.write_all(&payload).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).unwrap();
+
+        assert_eq!(echoed, payload, "hop must preserve bytes exactly");
+        fwd.join().unwrap().expect("forward conn ok");
+        server.join().unwrap();
     }
 }

@@ -900,12 +900,28 @@ mod linux {
             "mvm-host-vm-init: forward listener ready on AF_VSOCK port {}",
             crate::workload_proxy::WORKLOAD_FORWARD_PORT
         );
+        // Plan 107 A3.4 — bound concurrent forwarded streams.
+        let limiter = crate::workload_proxy::ConnectionLimiter::new(
+            crate::workload_proxy::MAX_CONCURRENT_FORWARDS,
+        );
         loop {
             let Some(conn_fd) = accept_one(listen_fd) else {
                 eprintln!("mvm-host-vm-init: forward listener: accept failed (retrying)");
                 continue;
             };
+            // Fail closed at the cap rather than spawning unboundedly.
+            let Some(permit) = limiter.try_acquire() else {
+                eprintln!(
+                    "mvm-host-vm-init: forward listener: at {} concurrent streams, dropping connection",
+                    crate::workload_proxy::MAX_CONCURRENT_FORWARDS
+                );
+                unsafe { close(conn_fd) };
+                continue;
+            };
             std::thread::spawn(move || {
+                // Hold the permit for the connection's lifetime; it
+                // releases the slot when this thread ends.
+                let _permit = permit;
                 // The accepted fd is an AF_VSOCK SOCK_STREAM socket;
                 // UnixStream only touches its read/write/clone, so
                 // wrapping it is sound (address family is irrelevant).
