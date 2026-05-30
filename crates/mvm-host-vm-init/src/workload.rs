@@ -450,4 +450,132 @@ mod tests {
         let err = start_workload(&FakeVmm, &cfg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
+
+    /// Plan 107 A2.4 — live nested-KVM smoke (runner-direct variant).
+    ///
+    /// Boots a **real** Firecracker workload microVM through the
+    /// production [`start_workload`] + [`FirecrackerVmm`] path and
+    /// asserts the kernel actually executed, then tears it down via
+    /// [`stop_workload`]. This validates the A2.2/A2.3 spawn path
+    /// end-to-end against a live VMM.
+    ///
+    /// **Scope:** the runner (or a container) stands in for the host
+    /// VM, so Firecracker uses the runner's `/dev/kvm` directly (L1)
+    /// — no nested KVM required, which is why it runs on a stock GHA
+    /// `ubuntu-latest`. The genuine libkrun-host-VM *nesting* (L2,
+    /// the no-`ptrace` trust uplift) is out of scope here and is
+    /// validated by Plan 107 A4.5's live-KVM smoke on a nested-KVM
+    /// runner.
+    ///
+    /// Inert unless `MVM_FC_BOOT_SMOKE=1` is set (so the normal
+    /// `cargo test --workspace` lane skips it). The A2.4 CI lane
+    /// installs `firecracker` at [`FIRECRACKER_BIN`], grants
+    /// `/dev/kvm`, builds a workload kernel + rootfs, points
+    /// `MVM_FC_SMOKE_KERNEL` / `MVM_FC_SMOKE_ROOTFS` at them, and
+    /// sets the gate.
+    ///
+    /// Boot detection mirrors `mvm-backend`'s `ch-bootcheck`: poll
+    /// the guest serial (Firecracker routes `ttyS0` to its stdout,
+    /// which `start_workload` redirects to `fc.stdout.log`) for a
+    /// kernel-boot marker. Reaching the kernel (even to a later
+    /// rootfs/init failure) proves the VMM spawn path is viable; we
+    /// don't require userspace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_firecracker_boot_smoke() {
+        use std::time::{Duration, Instant};
+
+        if std::env::var("MVM_FC_BOOT_SMOKE").is_err() {
+            eprintln!(
+                "live_firecracker_boot_smoke: skipped (set MVM_FC_BOOT_SMOKE=1 + \
+                 MVM_FC_SMOKE_KERNEL=<vmlinux> MVM_FC_SMOKE_ROOTFS=<rootfs.ext4> to run)"
+            );
+            return;
+        }
+
+        let kernel = std::env::var("MVM_FC_SMOKE_KERNEL")
+            .expect("MVM_FC_SMOKE_KERNEL must point at a workload vmlinux");
+        let rootfs = std::env::var("MVM_FC_SMOKE_ROOTFS")
+            .expect("MVM_FC_SMOKE_ROOTFS must point at a workload rootfs.ext4");
+        assert!(
+            Path::new(&kernel).is_file(),
+            "kernel artifact missing: {kernel}"
+        );
+        assert!(
+            Path::new(&rootfs).is_file(),
+            "rootfs artifact missing: {rootfs}"
+        );
+        assert!(
+            Path::new(FIRECRACKER_BIN).exists(),
+            "firecracker not installed at {FIRECRACKER_BIN}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let workload_id = "live-smoke";
+        let cfg = WorkloadSpawnConfig {
+            workload_id: workload_id.to_string(),
+            kernel_path: kernel,
+            rootfs_path: rootfs,
+            vsock_socket_dir: base.to_string_lossy().into_owned(),
+            vcpus: 1,
+            memory_mib: 256,
+            // Mount the rootfs read-write so the kernel can at least
+            // attempt to mount root; `panic=1` (in the base cmdline)
+            // makes a no-init panic exit fast rather than hang.
+            kernel_cmdline_extras: "root=/dev/vda rw loglevel=7".to_string(),
+        };
+
+        let pid =
+            start_workload(&FirecrackerVmm, &cfg).expect("start_workload should spawn firecracker");
+        eprintln!("[a2.4-smoke] spawned firecracker pid={pid}");
+
+        let stdout_log = base.join(workload_id).join("fc.stdout.log");
+        let stderr_log = base.join(workload_id).join("fc.stderr.log");
+
+        // Poll the guest serial for a kernel-boot marker, ~30s budget.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut booted = false;
+        while Instant::now() < deadline {
+            let serial = fs::read_to_string(&stdout_log).unwrap_or_default();
+            if serial.contains("Linux version")
+                || serial.contains("Booting Linux")
+                || serial.contains("Kernel panic")
+                || serial.contains("Run /init as init process")
+                || serial.contains("Run /sbin/init as init process")
+            {
+                booted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        let serial_tail = {
+            let s = fs::read_to_string(&stdout_log).unwrap_or_default();
+            let fc_err = fs::read_to_string(&stderr_log).unwrap_or_default();
+            eprintln!("──── fc.stderr ────\n{}\n──── end ────", fc_err.trim_end());
+            let tail = if s.len() > 2048 {
+                &s[s.len() - 2048..]
+            } else {
+                &s
+            };
+            tail.to_string()
+        };
+        eprintln!("──── guest serial tail ────\n{serial_tail}\n──── end ────");
+
+        // Tear down before asserting so a failure doesn't leak the VM.
+        let stop = stop_workload(base, workload_id);
+        assert!(
+            !base.join(workload_id).exists(),
+            "stop_workload must remove the state dir"
+        );
+        stop.expect("stop_workload should succeed");
+
+        assert!(
+            booted,
+            "no kernel-boot marker on guest serial within 30s — \
+             firecracker rejected the config or never started the guest \
+             (see fc.stderr above)"
+        );
+    }
 }
