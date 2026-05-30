@@ -2399,12 +2399,12 @@ Phase 1 host cross-compile targets **`<arch>-unknown-linux-musl` static**, not g
 - [x] **PR-1 — bench harness** `mvmctl bench microvm-launch` (Phase 2 Lever 0; everything measurable hangs off it; libkrun-only in v1; must drive real plan admission). Measurement substrate landed + unit-tested; live libkrun probe is a tracked stub.
 - [x] **PR-2 — `LocalAuditKind::VendorBlobFetched`** (Phase 3; additive observability foundation).
 - [x] **PR-3 — `cache info` / `doctor` enrichment + Stage 0 progress** (Phase 3 observability). Deferred: doctor next-run HIT/MISS fingerprint + docs (Item 5).
-- [ ] ~~**PR-4 — dev-shell split** `dev-minimal`/`dev-compile`~~ **SUPERSEDED by [ADR-064](adrs/064-single-builder-dev-image.md)** (landed on `main` 2026-05-29): single `builder-vm` flake with `default`/`dev` attrs, not a dev-image split.
+- [ ] ~~**PR-4 — dev-shell split** `dev-minimal`/`dev-compile`~~ **SUPERSEDED by [ADR-064](adrs/065-single-builder-dev-image.md)** (landed on `main` 2026-05-29): single `builder-vm` flake with `default`/`dev` attrs, not a dev-image split.
 - [ ] ~~**PR-5 — musl cross target**~~ **SUPERSEDED by ADR-064**: glibc via `cargo zigbuild`, not static musl.
 - [ ] ~~**PR-6 — `mvmctl dev compile` + per-VM binbridge bind-mount**~~ **SUPERSEDED by ADR-064**: Linux binaries embedded into `mvmctl` at its build time (`build.rs` + `include_bytes!`), extracted to `~/.cache/mvm/host-bins/` — no runtime bind-mount.
 - [ ] ~~**PR-7 — two-runner reproducibility CI lane**~~ folds into ADR-064's build-time cross-compile.
 - [ ] ~~**PR-8 — `/nix` warm-reuse contract**~~ re-scoped under ADR-064's single-flake model.
-- [ ] **Phase 1 re-plan** — implement [ADR-064](adrs/064-single-builder-dev-image.md) as the new Phase 1, coordinated with the `specs/prompts/93-phase-1-2-3-fast-secure-dev.md` track (do not race it).
+- [ ] **Phase 1 re-plan** — implement [ADR-064](adrs/065-single-builder-dev-image.md) as the new Phase 1, coordinated with the `specs/prompts/93-phase-1-2-3-fast-secure-dev.md` track (do not race it).
 - [~] **PR-9 — adaptive readiness poll** (Phase 2 Lever 2). Landed: `adaptive_backoff` + `wait_for_guest_agent` rewired (20ms→500ms cap; cuts up to ~480ms dead time per readiness detection; timing-only, connect→negotiate ordering untouched). Deferred (tracked): the `connect_and_authenticate` combiner and the guest `socket/bind/listen`-first reorder — both touch the sealed-prod Ed25519 auth path / agent main and need a live VM to validate.
 - [ ] **PR-10 — warm pool of supervisors** `--warm-pool-size N` default 0 (Phase 2 Lever 3; guests unbooted until admission; control UDS reuses `deny_unknown_fields` parser + new fuzz target).
 

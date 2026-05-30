@@ -84,6 +84,32 @@
         in
         if envPath != "" then /. + envPath else ../../..;
 
+      # ADR-065 / Plan 115: host binaries are embedded in mvmctl and
+      # extracted by `host_binaries::ensure_extracted()` before invoking
+      # `nix build path:... --impure`. The dir is passed in via env var;
+      # no rustPlatform.buildRustPackage calls are permitted in this flake.
+      hostBinDir =
+        let envPath = builtins.getEnv "MVM_HOST_BIN_DIR";
+        in if envPath != ""
+           then /. + envPath
+           else throw ''
+             MVM_HOST_BIN_DIR is not set. Plan 115 / ADR-065 contract:
+             mvmctl populates this dir via host_binaries::ensure_extracted()
+             before invoking `nix build path:... --impure`. To run nix
+             build by hand: extract the embedded binaries from your
+             mvmctl with `mvmctl inspect host-bins --extract-to <DIR>`
+             and pass MVM_HOST_BIN_DIR=<DIR> --impure.
+           '';
+
+      hostBinaries = import (workspaceRoot + "/nix/lib/mvm-host-binaries.nix");
+
+      hostBinExtraFiles = nixpkgs.lib.mapAttrs' (name: spec:
+        nixpkgs.lib.nameValuePair spec.install_path {
+          source = hostBinDir + "/${name}";
+          mode = spec.mode;
+        }
+      ) hostBinaries;
+
       # Filter list lives at nix/lib/workspace-filter.nix so the three
       # flakes that ingest the host workspace (this one, builder/,
       # runtime-overlay/) stay aligned with .gitignore in one place.
@@ -131,9 +157,11 @@
       # lands.
       #
       # Plan 73 Followup B.2.x closed the egress side: the
-      # builder VM now runs `mvm-egress-proxy` (built via
-      # `mvmEgressProxyFor system`, installed at
-      # `/sbin/mvm-egress-proxy` via `extraFiles` below).
+      # builder VM runs `mvm-egress-proxy`, embedded in mvmctl
+      # at its own build time (Plan 115 / ADR-065) and baked
+      # into the rootfs via `hostBinExtraFiles` (read from
+      # `MVM_HOST_BIN_DIR` under `--impure`) at the install
+      # path declared in `nix/lib/mvm-host-binaries.nix`.
       # `mvm-host-vm-init::install::run_install` spawns it
       # before the installer + injects `HTTPS_PROXY` /
       # `HTTP_PROXY` on `uv` / `pnpm`'s env. The proxy refuses
@@ -146,7 +174,7 @@
         bashInteractive
         coreutils
         # `pkgsStatic.busybox` for the lightweight utilities that
-        # mvm-host-vm-init spawns by absolute path — chiefly
+        # mvm-builder-init spawns by absolute path — chiefly
         # `/sbin/udhcpc` (busybox applet) for DHCP on the builder
         # VM's eth0. Without busybox in `packages`, mkGuest's
         # symlink loop (nix/lib/mk-guest.nix:770-788) skips it
@@ -202,61 +230,6 @@
         # python3Packages.pip-audit
       ];
 
-      # Build `mvm-host-vm-init` (Plan 72 W3) for the target system.
-      # `rustPlatform.buildRustPackage` consumes the workspace's
-      # `Cargo.lock` so the dependency closure matches the rest of
-      # the workspace — same `nix` crate version we cargo-check on
-      # macOS, same nothing-else.
-      #
-      # `doCheck = false` because the unit tests under
-      # `mvm-host-vm-init::linux::tests` already run in the
-      # workspace's `cargo test` CI lane; running them again here
-      # would double-pay the closure compute for no extra signal.
-      mvmBuilderInitFor = system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "mvm-host-vm-init";
-          version = "0.14.0";
-          src = workspace;
-          cargoLock = {
-            lockFile = workspace + "/Cargo.lock";
-          };
-          buildAndTestSubdir = "crates/mvm-host-vm-init";
-          doCheck = false;
-          meta = {
-            description = "PID-1 for the libkrun builder VM (Plan 72 W3)";
-            mainProgram = "mvm-host-vm-init";
-          };
-        };
-
-      # Build `mvm-egress-proxy` (Plan 73 Followup B.2.x) for the
-      # target system. Same `rustPlatform.buildRustPackage` shape
-      # as `mvm-host-vm-init` — the workspace's `Cargo.lock`
-      # drives the closure so we don't fork dep versions across
-      # the two builder-VM binaries. Tests run in CI's
-      # `cargo test --workspace` lane; `doCheck = false` here for
-      # the same reason.
-      mvmEgressProxyFor = system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "mvm-egress-proxy";
-          version = "0.14.0";
-          src = workspace;
-          cargoLock = {
-            lockFile = workspace + "/Cargo.lock";
-          };
-          buildAndTestSubdir = "crates/mvm-egress-proxy";
-          doCheck = false;
-          meta = {
-            description = "Builder-VM egress allowlist proxy (Plan 73 Followup B.2.x, ADR-047)";
-            mainProgram = "mvm-egress-proxy";
-          };
-        };
-
       # Canonical kernel cmdline for the builder VM. `LibkrunBuilderVm`
       # (Plan 72 W4) reads this from the cmdline.txt output and
       # passes it to `mvm_libkrun::KrunContext.kernel_cmdline`.
@@ -266,8 +239,20 @@
       # - `ro` — root is read-only; writes go to the persistent
       #   /nix-store virtio-blk at /dev/vdb (Plan 72 W4 wires it).
       # - `rootfstype=ext4` — skip filesystem auto-detection.
-      # - `init=/sbin/mvm-host-vm-init` — Plan 72 W3 binary as PID 1.
-      builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-host-vm-init";
+      # - `init=/sbin/mvm-builder-init` — Plan 72 W3 / Plan 107 A1b
+      #   binary as PID 1. Cargo package is `mvm-host-vm-init`; the
+      #   install path is `/sbin/mvm-builder-init` (T2 manifest).
+      builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
+
+      # Extra packages for the interactive (dev) builder VM image.
+      # Added on top of `builderPackages` when `interactive = true`.
+      # Provides a useful shell environment for contributors debugging
+      # inside the builder VM via `mvmctl dev shell`.
+      devPackages = pkgs: with pkgs; [
+        cargo
+        rustc
+        nano
+      ];
 
       # Rootfs builder. The custom kernel under `./kernel` is built
       # `CONFIG_MODULES=n` (everything in-tree is `=y`), so the
@@ -275,18 +260,22 @@
       # kernel arg goes unused — same rootfs whether we're producing
       # the full builder-VM image or the Stage 0 seed.
       # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
+      #
+      # ADR-065 / Plan 115: host binaries (mvm-builder-init,
+      # mvm-egress-proxy) are no longer built from source here.
+      # They come in from `hostBinExtraFiles` (keyed by install_path)
+      # and are read from MVM_HOST_BIN_DIR at eval time.
       mkBuilderVmRootfs =
-        system:
+        { system, interactive ? false }:
         let
           pkgs = import nixpkgs { inherit system; };
-          builderInit = mvmBuilderInitFor system;
-          egressProxy = mvmEgressProxyFor system;
+          extraPkgs = if interactive then devPackages pkgs else [ ];
         in
         (libFor { inherit system; }).mkGuest {
           name = "mvm-builder-vm";
           # Skip the addon-dns bake. The builder VM's PID 1 is
-          # `mvm-host-vm-init` (set via `extraFiles` + the
-          # `init=/sbin/mvm-host-vm-init` kernel cmdline), so
+          # `mvm-builder-init` (set via `extraFiles` + the
+          # `init=/sbin/mvm-builder-init` kernel cmdline), so
           # mkGuest's initScript-side addon-dns activation block
           # never runs and the binary would just sit unused at
           # /usr/local/bin/mvm-addon-dns. The win is in Stage 0:
@@ -295,54 +284,61 @@
           # the tmpfs-bound build into OOM territory.
           bakeAddonDns = false;
           # mkGuest requires an entrypoint declaration. At runtime
-          # the kernel cmdline sets `init=/sbin/mvm-host-vm-init`,
+          # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
           # so mkGuest's entrypoint is vestigial — but we still
           # need to declare one to satisfy the type contract.
           entrypoint.shell = "/bin/sh";
-          packages = builderPackages pkgs;
-          extraFiles = {
-            "/sbin/mvm-host-vm-init" =
-              "${builderInit}/bin/mvm-host-vm-init";
-            # Plan 73 Followup B.2.x — egress allowlist proxy.
-            # `mvm-host-vm-init::install::run_install` spawns
-            # this from PATH (kernel default PATH includes
-            # `/sbin`) before invoking `uv` / `pnpm`. The
-            # binary embeds the ADR-047 four-hostname list at
-            # compile time; no env-var override path on the
-            # production build.
-            "/sbin/mvm-egress-proxy" =
-              "${egressProxy}/bin/mvm-egress-proxy";
-            # Plan 107 A2.1 — pin the exact path the guest's
-            # `FirecrackerVmm` spawns (`/usr/bin/firecracker`).
-            # `firecracker` is also in `packages` above (for the
-            # full closure + the /sbin + /usr/local/bin symlinks
-            # mkGuest adds); this entry guarantees the canonical
-            # /usr/bin path regardless of mkGuest's symlink targets.
+          packages = (builderPackages pkgs) ++ extraPkgs;
+          # ADR-065 / Plan 115: host binaries
+          # (mvm-host-vm-init, mvm-egress-proxy) come from
+          # MVM_HOST_BIN_DIR via hostBinExtraFiles — embedded
+          # in mvmctl, no rustPlatform.buildRustPackage calls
+          # in this flake.
+          # Plan 107 A2.1: /usr/bin/firecracker is pinned for
+          # the guest's FirecrackerVmm spawn. firecracker is
+          # also in `packages` above (for the full closure +
+          # the /sbin + /usr/local/bin symlinks mkGuest adds);
+          # this entry guarantees the canonical /usr/bin path
+          # regardless of mkGuest's symlink targets.
+          extraFiles = hostBinExtraFiles // {
             "/usr/bin/firecracker" =
               "${pkgs.firecracker}/bin/firecracker";
           };
         };
 
-      mkBuilderVmImage = system:
+      # ADR-065 / Plan 115: two attrs.
+      #   default — headless builder VM (production use, mvmctl build/up).
+      #   dev     — interactive builder VM (cargo + rustc + nano + bashInteractive).
+      #             Used by `mvmctl dev shell` for contributor debugging.
+      #
+      # Both take host binaries from MVM_HOST_BIN_DIR (set by mvmctl before
+      # invoking `nix build ... --impure`). No rustPlatform.buildRustPackage
+      # calls remain in this flake.
+      mkBuilderVmImage =
+        { system, interactive ? false }:
         let
           pkgs = import nixpkgs { inherit system; };
-          builderInit = mvmBuilderInitFor system;
-          egressProxy = mvmEgressProxyFor system;
           # Slim custom kernel — see `./kernel/default.nix`.
           # `pkgs.linuxManualConfig` over `make tinyconfig` + a
           # narrow `enables` list. `CONFIG_MODULES=n` so the kernel
-          # has only what `mvm-host-vm-init` actually uses built-in
+          # has only what `mvm-builder-init` actually uses built-in
           # — no driver modules tree to ship.
           # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
           kernelPkg = import ./kernel { inherit pkgs; };
-          rootfs = mkBuilderVmRootfs system;
+          rootfs = mkBuilderVmRootfs { inherit system interactive; };
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64 then "Image" else "bzImage";
+          imageName = if interactive
+                      then "mvm-builder-vm-dev-${system}"
+                      else "mvm-builder-vm-image-${system}";
+          manifestName = if interactive
+                         then "mvm-builder-vm-dev"
+                         else "mvm-builder-vm";
         in
-        pkgs.runCommand "mvm-builder-vm-image-${system}"
+        pkgs.runCommand imageName
           {
             passthru = {
-              inherit rootfs builderInit egressProxy;
+              inherit rootfs;
               kernel = kernelPkg;
               cmdline = builderCmdline;
             };
@@ -394,7 +390,7 @@
             rootfs_size=$(stat -c%s $out/rootfs.ext4)
             cat > $out/manifest.json <<MANIFEST
             {
-              "name": "mvm-builder-vm",
+              "name": "${manifestName}",
               "system": "${system}",
               "vmlinux":      { "sha256": "$kernel_sha", "size": $kernel_size },
               "rootfs_ext4":  { "sha256": "$rootfs_sha", "size": $rootfs_size },
@@ -408,8 +404,8 @@
           pkgs = import nixpkgs { inherit system; };
           # Stage 0 boots under a different kernel than what nixpkgs
           # ships, so omit the kernel + module tree to avoid
-          # misleading modprobe with a foreign kver.
-          rootfs = mkBuilderVmRootfs system;
+          # misleading modprobe with a foreign kver. Always headless.
+          rootfs = mkBuilderVmRootfs { inherit system; interactive = false; };
         in
         pkgs.runCommand "mvm-builder-vm-stage0-rootfs-${system}" { } ''
           mkdir -p $out
@@ -457,7 +453,12 @@
     in
     {
       packages = forAllSystems (system: {
-        default = mkBuilderVmImage system;
+        # Headless builder VM — production use path (mvmctl build / mvmctl up).
+        # Contains only the build tooling; no interactive shell extras.
+        default = mkBuilderVmImage { inherit system; interactive = false; };
+        # Interactive builder VM — contributor dev path (mvmctl dev shell).
+        # Adds cargo, rustc, nano on top of the headless package set.
+        dev = mkBuilderVmImage { inherit system; interactive = true; };
         stage0-rootfs = mkBuilderVmStage0Rootfs system;
         kernel-configfile = mkKernelConfigfile system;
       });

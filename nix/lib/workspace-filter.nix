@@ -2,8 +2,11 @@
 # the Nix store when building images. Used by:
 #
 #   nix/images/builder-vm/flake.nix
-#   nix/images/builder/flake.nix
 #   nix/images/runtime-overlay/flake.nix
+#
+# Note: nix/images/builder/flake.nix was deleted in Plan 115 / ADR-065.
+# The builder-vm flake now produces both the headless (default) and
+# interactive (dev) attrs — no separate builder/ flake is needed.
 #
 # Maintenance: the excluded basenames here must stay aligned with the
 # root .gitignore. The two serve different purposes — .gitignore

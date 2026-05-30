@@ -555,10 +555,17 @@ fn dev_build_with_builder_vm<B: crate::builder_vm::BuilderVm>(
     let staging = unique_dev_staging_dir();
     std::fs::create_dir_all(&staging).with_context(|| format!("creating staging dir {staging}"))?;
 
+    // Plan 115 / ADR-065: dev_build_with_builder_vm is called for
+    // user-flake builds (mvmctl build / dev up against the user's flake).
+    // User flakes do not embed host-vm binaries, so /mvm-bins is unused
+    // here. A temp dir satisfies validate_mounts' directory-exists check.
+    let host_bins_tmp =
+        tempfile::TempDir::new().with_context(|| "creating temp host_bin_dir for dev build")?;
     let mounts = BuilderMounts {
         flake_src,
         host_nix_store: None,
         artifact_out: std::path::PathBuf::from(&staging),
+        host_bin_dir: host_bins_tmp.path().to_path_buf(),
     };
 
     let artifacts = builder

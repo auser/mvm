@@ -199,6 +199,11 @@ trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDS
 # flakes that reference the workspace root don't depend on
 # relative-path resolution against the store-copied flake dir.
 export MVM_WORKSPACE_PATH=/work
+# Plan 115 / ADR-065: host-vm binaries extracted from the mvmctl
+# embedded payload and mounted read-only at /mvm-bins. The builder-vm
+# flake reads this to install the correct cross-compiled binaries into
+# the rootfs without a separate nix build.
+export MVM_HOST_BIN_DIR=/mvm-bins
 
 echo "mvm-builder-vm: filesystem space before nix build:" >&2
 df -h /nix /tmp >&2 || true
