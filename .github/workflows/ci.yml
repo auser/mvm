@@ -973,6 +973,129 @@ jobs:
           MVM_CH_BOOTCHECK_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
         run: cargo run --example ch-bootcheck -p mvm-backend
 
+  # ── Workload spawn smoke (Plan 107 A2.4, runner-direct variant) ───
+  # Drives the real A2.2/A2.3 spawn path: the in-guest
+  # `mvm_host_vm_init::workload::start_workload` + `FirecrackerVmm`
+  # boot a *live* Firecracker workload microVM and the test asserts
+  # the kernel actually executed (then tears it down).
+  #
+  # Scope: the runner stands in for the host VM, so Firecracker uses
+  # the runner's /dev/kvm directly (L1) — no nested KVM needed, which
+  # is why this runs on a stock ubuntu-latest (same L1 path the
+  # `ch-linux` lane above proves). The genuine libkrun-host-VM
+  # *nesting* (L2, the no-ptrace trust uplift) is Plan 107 A4.5's
+  # live-KVM smoke on a nested-KVM runner — not this lane.
+  workload-spawn-smoke-linux:
+    name: Workload spawn smoke (Plan 107 A2.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect workload-spawn-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            spawn:
+              - 'crates/mvm-host-vm-init/**'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install firecracker
+        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
+        # Pin to a known release — auto-tracking `latest` is how this
+        # lane would surprise-break on an unrelated Firecracker cut.
+        # Installed at /usr/bin/firecracker to match
+        # `mvm_host_vm_init::workload::FIRECRACKER_BIN` (the exact path
+        # A2.1 bakes into the builder-vm rootfs).
+        env:
+          FC_VERSION: v1.10.1
+        run: |
+          set -euo pipefail
+          curl -fL -o firecracker.tgz \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
+          tar -xzf firecracker.tgz
+          sudo install -m 0755 "release-${FC_VERSION}-x86_64/firecracker-${FC_VERSION}-x86_64" /usr/bin/firecracker
+          /usr/bin/firecracker --version
+
+      - name: Grant /dev/kvm access for the job
+        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
+        # ubuntu-latest's /dev/kvm is root:kvm 0660 and the runner user
+        # isn't in the kvm group, so firecracker would get EACCES.
+        # `sudo chmod 666` is the canonical GHA fix; the runner is
+        # ephemeral so the looser mode is confined to this job.
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm missing on this runner — firecracker can't run." >&2
+            exit 1
+          fi
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+
+      - name: Cache cargo
+        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-spawn-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-spawn-
+
+      - name: Fetch Firecracker CI kernel + build rootfs
+        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
+        # The mvm Firecracker path uses the upstream Firecracker-CI
+        # kernel (`crates/mvm-backend/src/firecracker.rs` downloads
+        # `firecracker-ci/<ver>/x86_64/vmlinux-5.10.*` from S3), NOT the
+        # Nix `vmlinux` outputs — on x86_64 those are bzImage (for
+        # libkrun/cloud-hypervisor/Vz, which accept bzImage), and
+        # Firecracker's loader requires an *uncompressed ELF* vmlinux
+        # (it rejects bzImage with "Invalid Elf magic number"). So the
+        # smoke boots the same ELF kernel production Firecracker uses.
+        # The rootfs only needs to be a valid block device the kernel
+        # attempts to mount — a small empty ext4 is enough for the
+        # VMM-viability gate (the kernel prints "Linux version" to
+        # ttyS0 before it ever touches root).
+        env:
+          FC_CI_VER: v1.10
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          # Resolve the latest vmlinux-5.10.NNN key from the S3 index
+          # (same listing the production path uses), then download it.
+          KEY=$(curl -fsSL "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/${FC_CI_VER}/x86_64/vmlinux-5.10&list-type=2" \
+            | grep -oE "firecracker-ci/${FC_CI_VER}/x86_64/vmlinux-5\.10\.[0-9]+" \
+            | sort -V | tail -1)
+          if [ -z "$KEY" ]; then
+            echo "::error::could not resolve a Firecracker-CI vmlinux-5.10 key from S3" >&2
+            exit 1
+          fi
+          echo "Firecracker CI kernel: $KEY"
+          curl -fL -o ci-artifacts/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/${KEY}"
+          # Minimal valid ext4 root drive (64 MiB, empty).
+          truncate -s 64M ci-artifacts/rootfs.ext4
+          mkfs.ext4 -F -q ci-artifacts/rootfs.ext4
+          chmod 0644 ci-artifacts/vmlinux ci-artifacts/rootfs.ext4
+          file ci-artifacts/vmlinux
+          ls -la ci-artifacts/
+
+      - name: Run workload spawn smoke
+        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
+        # MVM_FC_BOOT_SMOKE gates the otherwise-inert
+        # `workload::tests::live_firecracker_boot_smoke` test; the env
+        # vars point it at the freshly built workload artifacts. The
+        # test boots a real Firecracker workload via start_workload and
+        # asserts a kernel-boot marker on the guest serial.
+        env:
+          MVM_FC_BOOT_SMOKE: "1"
+          MVM_FC_SMOKE_KERNEL: ${{ github.workspace }}/ci-artifacts/vmlinux
+          MVM_FC_SMOKE_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
+        run: cargo test -p mvm-host-vm-init live_firecracker_boot_smoke -- --nocapture
+
   # ── Plan 85 finalization: named, path-gated OCI gates ─────────────
   #
   # Plan 85's acceptance criteria call out six named CI lanes (plus

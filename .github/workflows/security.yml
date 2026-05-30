@@ -543,3 +543,67 @@ jobs:
           fi
           echo "ok: builder image reproduces byte-identically across two clean builds"
           cat /tmp/hash-a.txt
+
+  # ── Lane 9: Builder-VM image reproducibility (Plan 107 A2.5) ───────
+  # Build the `nix/images/builder-vm` image twice and assert the four
+  # committed outputs are byte-identical. Plan 25 W5.3 pattern, applied
+  # to the symmetric host VM rootfs. Plan 107 A2.1 baked `firecracker`
+  # into this rootfs; a non-reproducible firecracker closure (embedded
+  # build timestamps, host paths) would surface here rather than as a
+  # silent rootfs-hash drift across contributor machines. Heavy (the
+  # builder-vm kernel + rootfs double build), so PR-skipped like Lane 8
+  # — runs on release-tag pushes, the nightly schedule, and
+  # workflow_dispatch. The `builder-vm-image-linux` CI lane prints the
+  # single-build hash on every PR for diff-grade visibility.
+  builder-vm-image-reproducibility:
+    name: Builder-VM image reproducibility (Plan 107 A2.5)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build A
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
+            --no-link --print-out-paths > /tmp/bvm-path-a.txt
+          out=$(head -1 /tmp/bvm-path-a.txt)
+          # Hash the four outputs the flake commits to under stable
+          # relative names so the store-path component (input-hash, not
+          # output) doesn't pollute the comparison.
+          ( cd "$out" && sha256sum vmlinux rootfs.ext4 cmdline.txt manifest.json ) > /tmp/bvm-hash-a.txt
+          cat /tmp/bvm-hash-a.txt
+
+      - name: Build B (force rebuild)
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
+            --rebuild --no-link --print-out-paths > /tmp/bvm-path-b.txt
+          out=$(head -1 /tmp/bvm-path-b.txt)
+          ( cd "$out" && sha256sum vmlinux rootfs.ext4 cmdline.txt manifest.json ) > /tmp/bvm-hash-b.txt
+          cat /tmp/bvm-hash-b.txt
+
+      - name: Compare hashes
+        run: |
+          set -euo pipefail
+          if ! diff -q /tmp/bvm-hash-a.txt /tmp/bvm-hash-b.txt > /dev/null; then
+            echo "::error::Builder-VM image is non-deterministic — two clean builds produced different artifacts" >&2
+            echo "Plan 107 A2.5 requires the builder-vm rootfs (now carrying firecracker, A2.1) to reproduce" >&2
+            echo "byte-for-byte so contributors and CI agree on the same rootfs hash. Investigate before merging" >&2
+            echo "— non-determinism can mask supply-chain injection (ADR-002 §W5.3)." >&2
+            echo >&2
+            echo "Build A:" >&2
+            cat /tmp/bvm-hash-a.txt >&2
+            echo >&2
+            echo "Build B:" >&2
+            cat /tmp/bvm-hash-b.txt >&2
+            echo >&2
+            echo "Diff:" >&2
+            diff -u /tmp/bvm-hash-a.txt /tmp/bvm-hash-b.txt >&2 || true
+            exit 1
+          fi
+          echo "ok: builder-vm image reproduces byte-identically across two clean builds"
+          cat /tmp/bvm-hash-a.txt

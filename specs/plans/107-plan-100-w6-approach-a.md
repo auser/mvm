@@ -165,17 +165,35 @@ itself on dispatch.
       vsock UDS. Collision-detecting create (fail-closed on a
       duplicate id), `Drop` cleanup so a panic mid-spawn doesn't
       leak, explicit cleanup on `WorkloadStop`.
-- [ ] **A2.4** Live smoke on a Linux + nested-KVM CI runner
-      (Ubuntu, nested KVM enabled by default on GHA): send
-      `WorkloadStart` to the host VM, assert Firecracker boots
-      the workload inside, capture vsock CID/port for the workload.
-- [ ] **A2.5** Reproducibility check: `nix/images/builder-vm/`
-      double-build asserts the rootfs hash is stable across two
-      machines. Plan 25 W5.3 pattern.
+- [x] **A2.4** Live smoke (runner-direct variant). The
+      `workload-spawn-smoke-linux` CI lane (`ci.yml`) drives the real
+      A2.2/A2.3 path: `workload::start_workload` + `FirecrackerVmm`
+      boot a *live* Firecracker workload microVM and the env-gated
+      `workload::tests::live_firecracker_boot_smoke` test asserts the
+      kernel executed (boot marker on the guest serial), then tears
+      it down. **Scope clarification (was over-claimed in the
+      original line):** the GHA runner stands in for the host VM, so
+      Firecracker uses the runner's `/dev/kvm` *directly* (L1) — no
+      nested KVM needed (the original "nested KVM enabled by default
+      on GHA" assumption doesn't hold for stock runners; L2 nesting
+      requires a self-hosted / nested-virt runner). This proves the
+      *spawn path* with a real VMM. The genuine libkrun-host-VM
+      *nesting* (L2 — Firecracker inside a libkrun guest, the
+      no-`ptrace` trust uplift) is validated by **A4.5**'s live-KVM
+      smoke, not here.
+- [x] **A2.5** Reproducibility check: `builder-vm-image-reproducibility`
+      lane in `security.yml` double-builds `nix/images/builder-vm/`
+      (`--rebuild`) and asserts the four outputs (vmlinux, rootfs.ext4,
+      cmdline.txt, manifest.json) are byte-identical. Plan 25 W5.3
+      pattern; guards A2.1's firecracker closure against
+      non-determinism. PR-skipped (heavy) — runs on release tags,
+      nightly cron, and `workflow_dispatch`, like the existing
+      builder-image reproducibility lane.
 
-Exit: a CI lane proves `WorkloadStart` produces a booting
-Firecracker workload inside the host VM. No `mvmctl up` plumbing
-yet — the test calls the dispatch API directly.
+Exit: the `workload-spawn-smoke-linux` lane proves `start_workload`
+produces a booting Firecracker workload at L1 on a stock runner. No
+`mvmctl up` plumbing yet — the test calls the spawn path directly.
+The full host-VM-nested boot is deferred to A4.5.
 
 ### Phase A3 — Vsock proxy: add the nesting hop
 
