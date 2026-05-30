@@ -228,6 +228,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      # Plan 115 / ADR-065 — mvm-cli's build.rs needs zigbuild.
+      - uses: ./.github/actions/install-zigbuild
+
       - name: Install system build deps (see test job for why)
         run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
 
