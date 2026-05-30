@@ -998,16 +998,10 @@ jobs:
           filters: |
             spawn:
               - 'crates/mvm-host-vm-init/**'
-              - 'nix/images/builder/**'
-              - 'nix/lib/**'
 
       - name: Install Rust toolchain
         if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Nix
-        if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
-        uses: DeterminateSystems/nix-installer-action@main
 
       - name: Install firecracker
         if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
@@ -1052,21 +1046,41 @@ jobs:
           key: ${{ runner.os }}-cargo-spawn-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-spawn-
 
-      - name: Build workload kernel + rootfs via host Nix
+      - name: Fetch Firecracker CI kernel + build rootfs
         if: steps.filter.outputs.spawn == 'true' || github.ref == 'refs/heads/main'
-        # Reuse the same artifacts the ch-linux lane boots — a known
-        # Firecracker/CH-bootable vmlinux + ext4 rootfs. chmod after cp:
-        # nix/store files are mode 0444 and firecracker opens the rootfs
-        # RW by default.
+        # The mvm Firecracker path uses the upstream Firecracker-CI
+        # kernel (`crates/mvm-backend/src/firecracker.rs` downloads
+        # `firecracker-ci/<ver>/x86_64/vmlinux-5.10.*` from S3), NOT the
+        # Nix `vmlinux` outputs — on x86_64 those are bzImage (for
+        # libkrun/cloud-hypervisor/Vz, which accept bzImage), and
+        # Firecracker's loader requires an *uncompressed ELF* vmlinux
+        # (it rejects bzImage with "Invalid Elf magic number"). So the
+        # smoke boots the same ELF kernel production Firecracker uses.
+        # The rootfs only needs to be a valid block device the kernel
+        # attempts to mount — a small empty ext4 is enough for the
+        # VMM-viability gate (the kernel prints "Linux version" to
+        # ttyS0 before it ever touches root).
+        env:
+          FC_CI_VER: v1.10
         run: |
           set -euo pipefail
-          nix build "./nix/images/builder#packages.x86_64-linux.default" \
-            --no-link --print-out-paths > /tmp/store-path.txt
-          STORE_PATH=$(head -1 /tmp/store-path.txt)
           mkdir -p ci-artifacts
-          cp "$STORE_PATH/vmlinux"     ci-artifacts/vmlinux
-          cp "$STORE_PATH/rootfs.ext4" ci-artifacts/rootfs.ext4
+          # Resolve the latest vmlinux-5.10.NNN key from the S3 index
+          # (same listing the production path uses), then download it.
+          KEY=$(curl -fsSL "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/${FC_CI_VER}/x86_64/vmlinux-5.10&list-type=2" \
+            | grep -oE "firecracker-ci/${FC_CI_VER}/x86_64/vmlinux-5\.10\.[0-9]+" \
+            | sort -V | tail -1)
+          if [ -z "$KEY" ]; then
+            echo "::error::could not resolve a Firecracker-CI vmlinux-5.10 key from S3" >&2
+            exit 1
+          fi
+          echo "Firecracker CI kernel: $KEY"
+          curl -fL -o ci-artifacts/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/${KEY}"
+          # Minimal valid ext4 root drive (64 MiB, empty).
+          truncate -s 64M ci-artifacts/rootfs.ext4
+          mkfs.ext4 -F -q ci-artifacts/rootfs.ext4
           chmod 0644 ci-artifacts/vmlinux ci-artifacts/rootfs.ext4
+          file ci-artifacts/vmlinux
           ls -la ci-artifacts/
 
       - name: Run workload spawn smoke
