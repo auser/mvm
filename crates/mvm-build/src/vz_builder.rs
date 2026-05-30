@@ -687,7 +687,7 @@ impl BuilderVm for VzBuilderVm {
                 host_path: job_dir.clone(),
                 read_only: false,
             },
-            // Plan 115 / ADR-064: mount the extracted host-vm binaries
+            // Plan 115 / ADR-065: mount the extracted host-vm binaries
             // at /mvm-bins inside the builder VM (read-only). The cmd.sh
             // sees MVM_HOST_BIN_DIR=/mvm-bins so the flake can reference
             // the correct pre-compiled binaries.

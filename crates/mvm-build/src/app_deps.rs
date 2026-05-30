@@ -311,7 +311,7 @@ impl<T: BuilderVm> InstallDriver for T {
         let job = BuilderJob::Install {
             spec_path: spec_path.to_path_buf(),
         };
-        // Plan 115 / ADR-064: install jobs don't embed host-vm binaries
+        // Plan 115 / ADR-065: install jobs don't embed host-vm binaries
         // into a rootfs, so host_bin_dir is unused. Use a private temp
         // dir as a valid placeholder so validate_mounts passes.
         let _host_bins_tmp = tempfile::TempDir::new().map_err(|e| {

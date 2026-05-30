@@ -82,6 +82,14 @@ jobs:
         # for linux-gnu targets — see the comment in that file.
         run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
 
+      # Plan 115 / ADR-065 — mvm-cli's build.rs cross-compiles
+      # mvm-host-vm-init + mvm-egress-proxy for aarch64-unknown-linux-gnu
+      # via cargo-zigbuild and embeds the binaries via include_bytes!.
+      # Pinned versions live in [workspace.metadata.mvm.toolchain] in
+      # the root Cargo.toml; the composite action keeps the install
+      # step in lockstep.
+      - uses: ./.github/actions/install-zigbuild
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -136,11 +144,11 @@ jobs:
       - name: Unique spec numbers
         run: cargo run -p xtask -- check-spec-numbers
 
-      # Plan 115 / ADR-064 — Rust manifest ⇔ Nix attrset parity.
+      # Plan 115 / ADR-065 — Rust manifest ⇔ Nix attrset parity.
       # Adding or renaming a host binary requires updating both
       # crates/mvm-cli/src/host_binaries/manifest.rs and
       # nix/lib/mvm-host-binaries.nix in the same PR.
-      - name: host-binaries manifest parity (Plan 115 / ADR-064)
+      - name: host-binaries manifest parity (Plan 115 / ADR-065)
         run: cargo run -p xtask -- check-mvm-host-binaries-sync
 
   test:
@@ -167,6 +175,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcap-ng-dev lld
+
+      # Plan 115 / ADR-065 — see comment in `lint` job.
+      - uses: ./.github/actions/install-zigbuild
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -404,6 +415,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      # Plan 115 / ADR-065 — mvm-cli's build.rs needs zigbuild.
+      - uses: ./.github/actions/install-zigbuild
+
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
@@ -456,6 +470,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
+
+      # Plan 115 / ADR-065 — mvm-cli's build.rs needs zigbuild.
+      - uses: ./.github/actions/install-zigbuild
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -551,10 +568,26 @@ jobs:
         # gives us the store path to inspect afterward. The four
         # outputs the flake commits to (per `flake.nix` line 14):
         # `vmlinux`, `rootfs.ext4`, `cmdline.txt`, `manifest.json`.
+        #
+        # Plan 115 / ADR-065: the flake reads `MVM_HOST_BIN_DIR`
+        # under `--impure` to inject mvm-host-vm-init + mvm-egress-proxy
+        # via extraFiles. mvmctl normally extracts its embedded copy
+        # before invoking nix; CI uses placeholder files so the flake
+        # evaluates + builds (the rootfs will contain placeholder
+        # bytes at the binary install paths, which is fine for an
+        # eval-and-realise smoke).
         run: |
           set -euo pipefail
-          nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
-            --no-link --print-out-paths > /tmp/builder-vm-store-path.txt
+          HOST_BIN_DIR=$(mktemp -d)
+          # Placeholder bytes — flake just needs the files to exist
+          # at the names the manifest declares.
+          : > "$HOST_BIN_DIR/mvm-host-vm-init"
+          : > "$HOST_BIN_DIR/mvm-egress-proxy"
+          chmod 0755 "$HOST_BIN_DIR"/mvm-*
+          MVM_HOST_BIN_DIR="$HOST_BIN_DIR" \
+            nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
+              --impure --no-link --print-out-paths \
+              > /tmp/builder-vm-store-path.txt
           STORE_PATH=$(head -1 /tmp/builder-vm-store-path.txt)
           echo "STORE_PATH=$STORE_PATH"
           ls -la "$STORE_PATH/"
@@ -992,7 +1025,7 @@ jobs:
               - 'crates/mvm-backend/src/ch_runtime.rs'
               - 'crates/mvm-backend/examples/ch-bootcheck.rs'
               - 'crates/mvm-backend/Cargo.toml'
-              - 'nix/images/builder/**'
+              - 'nix/images/builder-vm/**'
               - 'nix/lib/**'
               - 'specs/plans/57-libkrun-spike.md'
               - 'specs/plans/72-builder-vm-via-libkrun.md'
@@ -1000,6 +1033,10 @@ jobs:
       - name: Install Rust toolchain
         if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
         uses: dtolnay/rust-toolchain@stable
+
+      # Plan 115 / ADR-065 — mvm-cli's build.rs needs zigbuild.
+      - if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        uses: ./.github/actions/install-zigbuild
 
       - name: Install Nix
         if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
@@ -1058,10 +1095,21 @@ jobs:
         # the rootfs RW by default and fails with
         # `VmBoot(DeviceManager(Disk(... PermissionDenied)))` against a
         # read-only file. The runner owns the copy, so 0644 is fine.
+        #
+        # Plan 115 / ADR-065: the consolidated builder-vm flake reads
+        # MVM_HOST_BIN_DIR under --impure. CI uses placeholder files
+        # so the flake evaluates + builds (the rootfs will contain
+        # placeholder bytes at the binary install paths; fine for the
+        # eval-and-realise smoke that ch-bootcheck performs).
         run: |
           set -euo pipefail
-          nix build "./nix/images/builder#packages.x86_64-linux.default" \
-            --no-link --print-out-paths > /tmp/store-path.txt
+          HOST_BIN_DIR=$(mktemp -d)
+          : > "$HOST_BIN_DIR/mvm-host-vm-init"
+          : > "$HOST_BIN_DIR/mvm-egress-proxy"
+          chmod 0755 "$HOST_BIN_DIR"/mvm-*
+          MVM_HOST_BIN_DIR="$HOST_BIN_DIR" \
+            nix build "./nix/images/builder-vm#packages.x86_64-linux.default" \
+              --impure --no-link --print-out-paths > /tmp/store-path.txt
           STORE_PATH=$(head -1 /tmp/store-path.txt)
           mkdir -p ci-artifacts
           cp "$STORE_PATH/vmlinux"     ci-artifacts/vmlinux
@@ -1386,6 +1434,10 @@ jobs:
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
         uses: dtolnay/rust-toolchain@nightly
 
+      # Plan 115 / ADR-065 — mvm-cli's build.rs needs zigbuild.
+      - if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: ./.github/actions/install-zigbuild
+
       - name: Install system build deps
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
         run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
@@ -1485,6 +1537,10 @@ jobs:
       - name: Install Rust toolchain
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
         uses: dtolnay/rust-toolchain@nightly
+
+      # Plan 115 / ADR-065 — mvm-cli's build.rs needs zigbuild.
+      - if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: ./.github/actions/install-zigbuild
 
       - name: Install system build deps
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'

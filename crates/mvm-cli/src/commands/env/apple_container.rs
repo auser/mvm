@@ -783,7 +783,7 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
 pub(super) fn ensure_dev_image() -> Result<(String, String)> {
-    // Plan 115 / ADR-064: source-checkout dispatch.
+    // Plan 115 / ADR-065: source-checkout dispatch.
     //
     // The dev-shell image now comes from `packages.<sys>.dev` in
     // `nix/images/builder-vm/flake.nix` (the same flake as the
@@ -1903,7 +1903,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
 
 /// Locate the builder-VM flake at `nix/images/builder-vm/flake.nix`.
 ///
-/// Plan 115 / ADR-064: the consolidated flake produces both the
+/// Plan 115 / ADR-065: the consolidated flake produces both the
 /// headless builder VM (`packages.<sys>.default`) and the interactive
 /// dev-shell image (`packages.<sys>.dev`). Used by `ensure_dev_image`
 /// to detect a source checkout, and by `bootstrap_builder_vm_image`
@@ -1989,7 +1989,7 @@ fn bootstrap_builder_vm_image() -> Result<()> {
                 "Builder VM image not in cache; building locally from {flake_dir}..."
             ));
 
-            // Plan 115 / ADR-064: the Alpine root-dir Stage 0 is the
+            // Plan 115 / ADR-065: the Alpine root-dir Stage 0 is the
             // only bootstrap path. The dev-image Stage 0 path
             // (bootstrap_builder_vm_image_via_dev_image_stage0) has been
             // removed; `nix/images/builder/flake.nix` is deleted.
@@ -3401,7 +3401,7 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     // three levels up. The consolidated flake reads `MVM_WORKSPACE_PATH=/work`
     // (set in the guest's `cmd.sh` by `LibkrunBuilderVm`) under
     // `--impure`, so the flake's `builtins.path` import lands on the
-    // mount rather than the store-copied flake dir. Plan 115 / ADR-064
+    // mount rather than the store-copied flake dir. Plan 115 / ADR-065
     // collapsed `nix/images/builder/` into `nix/images/builder-vm/`;
     // the interactive dev-shell image is now `packages.<sys>.dev`.
     let builder_flake = find_builder_vm_flake().context(
@@ -3420,8 +3420,8 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     // the git fetcher, which would discover `/work/.git` and trip on
     // worktree files whose `gitdir:` redirects point outside the
     // mount). `packages.<sys>.dev` is the interactive (dev-shell) attr
-    // added by Plan 115 / ADR-064.
-    // Plan 115 / ADR-064: extract the embedded host-vm binaries to the
+    // added by Plan 115 / ADR-065.
+    // Plan 115 / ADR-065: extract the embedded host-vm binaries to the
     // host-bins cache dir and mount them at /mvm-bins inside the builder VM.
     // The builder-vm flake's cmd.sh reads MVM_HOST_BIN_DIR=/mvm-bins to
     // install the correct cross-compiled binaries into the rootfs.

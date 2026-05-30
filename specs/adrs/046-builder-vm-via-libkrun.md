@@ -310,9 +310,9 @@ Per `feedback_adr_out_of_scope_discipline.md` this Security-claim-parity subsect
 
 ---
 
-> **Superseded in part by ADR-064 (Plan 115).** ADR-046's
+> **Superseded in part by ADR-065 (Plan 115).** ADR-046's
 > "Two artifact layers, two acquisition paths" rule is amended:
 > the dev image and the builder VM image collapse into a single
 > flake with two attrs (`default` / `dev`); mvm's own Linux
 > binaries are embedded in mvmctl at its own build time rather
-> than re-built per `dev up`. See ADR-064.
+> than re-built per `dev up`. See ADR-065.

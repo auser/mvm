@@ -763,7 +763,7 @@ impl BuilderVm for LibkrunBuilderVm {
             .add_virtio_fs("work", path_to_str(&mounts.flake_src, "flake_src")?)
             .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
             .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
-            // Plan 115 / ADR-064: mount the extracted host-vm binaries
+            // Plan 115 / ADR-065: mount the extracted host-vm binaries
             // at /mvm-bins inside the builder VM (read-only). The cmd.sh
             // sees MVM_HOST_BIN_DIR=/mvm-bins so the flake can reference
             // the correct pre-compiled binaries without a host nix build.

@@ -84,7 +84,7 @@
         in
         if envPath != "" then /. + envPath else ../../..;
 
-      # ADR-064 / Plan 115: host binaries are embedded in mvmctl and
+      # ADR-065 / Plan 115: host binaries are embedded in mvmctl and
       # extracted by `host_binaries::ensure_extracted()` before invoking
       # `nix build path:... --impure`. The dir is passed in via env var;
       # no rustPlatform.buildRustPackage calls are permitted in this flake.
@@ -93,7 +93,7 @@
         in if envPath != ""
            then /. + envPath
            else throw ''
-             MVM_HOST_BIN_DIR is not set. Plan 115 / ADR-064 contract:
+             MVM_HOST_BIN_DIR is not set. Plan 115 / ADR-065 contract:
              mvmctl populates this dir via host_binaries::ensure_extracted()
              before invoking `nix build path:... --impure`. To run nix
              build by hand: extract the embedded binaries from your
@@ -158,7 +158,7 @@
       #
       # Plan 73 Followup B.2.x closed the egress side: the
       # builder VM runs `mvm-egress-proxy`, embedded in mvmctl
-      # at its own build time (Plan 115 / ADR-064) and baked
+      # at its own build time (Plan 115 / ADR-065) and baked
       # into the rootfs via `hostBinExtraFiles` (read from
       # `MVM_HOST_BIN_DIR` under `--impure`) at the install
       # path declared in `nix/lib/mvm-host-binaries.nix`.
@@ -261,7 +261,7 @@
       # the full builder-VM image or the Stage 0 seed.
       # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
       #
-      # ADR-064 / Plan 115: host binaries (mvm-builder-init,
+      # ADR-065 / Plan 115: host binaries (mvm-builder-init,
       # mvm-egress-proxy) are no longer built from source here.
       # They come in from `hostBinExtraFiles` (keyed by install_path)
       # and are read from MVM_HOST_BIN_DIR at eval time.
@@ -289,7 +289,7 @@
           # need to declare one to satisfy the type contract.
           entrypoint.shell = "/bin/sh";
           packages = (builderPackages pkgs) ++ extraPkgs;
-          # ADR-064 / Plan 115: host binaries
+          # ADR-065 / Plan 115: host binaries
           # (mvm-host-vm-init, mvm-egress-proxy) come from
           # MVM_HOST_BIN_DIR via hostBinExtraFiles — embedded
           # in mvmctl, no rustPlatform.buildRustPackage calls
@@ -306,7 +306,7 @@
           };
         };
 
-      # ADR-064 / Plan 115: two attrs.
+      # ADR-065 / Plan 115: two attrs.
       #   default — headless builder VM (production use, mvmctl build/up).
       #   dev     — interactive builder VM (cargo + rustc + nano + bashInteractive).
       #             Used by `mvmctl dev shell` for contributor debugging.

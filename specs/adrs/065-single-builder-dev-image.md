@@ -1,4 +1,4 @@
-# ADR-064 — Single builder/dev image with mvmctl-embedded Linux binaries
+# ADR-065 — Single builder/dev image with mvmctl-embedded Linux binaries
 
 **Status:** Proposed (2026-05-29). Refactored 2026-05-29 to embed the
 Linux binaries in `mvmctl` itself (`build.rs` + `include_bytes!`)
@@ -10,7 +10,7 @@ story (`crates/mvm-sdk/src/compile/flake.rs`, ADR-0007), and ADR-046's
 source-checkout invariant (preserved unchanged here).
 **Concurrent work to track:** Plan 107 A1a/A1b — `mvm-builder-init` is
 being renamed to `mvm-host-vm-init` (commit `58c737dd` merged, PR
-#506 open for the crate rename). ADR-064 names match whichever lands
+#506 open for the crate rename). ADR-065 names match whichever lands
 first; the implementation plan should adopt the final name.
 
 ## Context
@@ -414,7 +414,7 @@ paint future work into corners.)
   repo (claim 10) for the end-user workload path. Using the same
   pattern for the *builder/dev VM rootfs* — Debian/Alpine base + mvm
   binaries on top, no nixpkgs busybox/iptables/etc. — would drain
-  Nix from the rootfs userland side, complementing how ADR-064 drains
+  Nix from the rootfs userland side, complementing how ADR-065 drains
   it from the Rust-build side. Big architectural shift with its own
   threat-model implications (provenance of the OCI base, signature
   chain). Worth its own brainstorm later.
@@ -425,7 +425,7 @@ paint future work into corners.)
   `fetchCrate`-independent the moment `mkGuest` consumes the same
   contract.
 - **Plan 107 A1b crate rename.** `mvm-builder-init` →
-  `mvm-host-vm-init` is in flight (PR #506). ADR-064's implementation
+  `mvm-host-vm-init` is in flight (PR #506). ADR-065's implementation
   plan should adopt whichever name lands first and is expected to
   use the new name end-to-end if A1b merges before this work begins.
 
@@ -533,7 +533,7 @@ change. Specifically:
   doubles down on as the only Stage 0 path going forward.
 - Plan 107 A1a/A1b — Concurrent `mvm-builder-init` →
   `mvm-host-vm-init` crate rename (commit `58c737dd` merged; PR
-  #506 open). ADR-064 implementation should adopt the final name.
+  #506 open). ADR-065 implementation should adopt the final name.
 - `crates/mvm-sdk/src/compile/flake.rs` and ADR-0007 — the end-user
   flake generation path, which adopts the same embedded-binary
   contract in a future spec.

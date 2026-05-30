@@ -519,7 +519,7 @@ opt-level = 3
 [workspace.metadata.mvm.toolchain]
 # Pinned cross-compile toolchain for the embedded host-vm binaries
 # baked into mvmctl. Bump in lockstep across this file and CI to keep
-# the embedded payload reproducible (Plan 115 / ADR-064 claim 11).
+# the embedded payload reproducible (Plan 115 / ADR-065 claim 11).
 zig = "0.13.0"
 cargo-zigbuild = "0.20.0"
 target = "aarch64-unknown-linux-gnu.2.17"

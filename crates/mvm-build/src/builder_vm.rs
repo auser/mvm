@@ -68,7 +68,7 @@ pub struct BuilderMounts {
     /// here. ADR-013 step 5 extracts from this path back to the
     /// host's per-build artifact directory.
     pub artifact_out: PathBuf,
-    /// Plan 115 / ADR-064: dir containing the mvm host-vm binaries
+    /// Plan 115 / ADR-065: dir containing the mvm host-vm binaries
     /// extracted from mvmctl's embedded payload, mounted read-only at
     /// `/mvm-bins` inside the builder VM and exposed via
     /// `MVM_HOST_BIN_DIR=/mvm-bins` to the flake's `cmd.sh`.

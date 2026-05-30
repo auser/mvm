@@ -97,7 +97,7 @@ fn main() -> Result<()> {
                 "  check-spec-numbers                     Reject duplicate numeric prefixes in specs/plans and specs/adrs"
             );
             eprintln!(
-                "  check-mvm-host-binaries-sync            Plan 115 / ADR-064: assert Rust manifest and Nix attrset agree"
+                "  check-mvm-host-binaries-sync            Plan 115 / ADR-065: assert Rust manifest and Nix attrset agree"
             );
             eprintln!(
                 "  perf <subcommand>                       Plan 60 Phase 9 perf gates (rootfs-size, boot)"

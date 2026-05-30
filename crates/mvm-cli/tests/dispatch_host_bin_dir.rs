@@ -1,4 +1,4 @@
-/// Integration test for Plan 115 / ADR-064 T7:
+/// Integration test for Plan 115 / ADR-065 T7:
 /// ensure_extracted populates the host-bin dir that dispatch wires into
 /// BuilderMounts.host_bin_dir before launching the builder VM.
 #[test]

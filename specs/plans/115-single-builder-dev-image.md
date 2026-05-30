@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement ADR-064. Collapse `nix/images/builder/flake.nix` into `nix/images/builder-vm/flake.nix` with two attrs (`default` headless / `dev` interactive); move `mvm-builder-init` and `mvm-egress-proxy` builds from in-flake `rustPlatform.buildRustPackage` to host-cargo via `mvm-cli`'s `build.rs` with `include_bytes!`-embedded payload; delete the Stage 0 dev-image bootstrap path.
+**Goal:** Implement ADR-065. Collapse `nix/images/builder/flake.nix` into `nix/images/builder-vm/flake.nix` with two attrs (`default` headless / `dev` interactive); move `mvm-builder-init` and `mvm-egress-proxy` builds from in-flake `rustPlatform.buildRustPackage` to host-cargo via `mvm-cli`'s `build.rs` with `include_bytes!`-embedded payload; delete the Stage 0 dev-image bootstrap path.
 
 **Architecture:** mvmctl carries the in-VM Linux binaries embedded at its own build time. `crates/mvm-cli/build.rs` cross-compiles via `cargo zigbuild` (or native cargo on aarch64-linux hosts), writes outputs to `$OUT_DIR/mvm-host-bins/`, and the runtime extracts them to `~/.cache/mvm/host-bins/<content-hash>/` on first use. Stage 0 receives the extracted dir via virtio-fs at `/mvm-bins` and the flake reads `MVM_HOST_BIN_DIR` under `--impure` to bake the binaries via `extraFiles`. No `rustPlatform.buildRustPackage` for mvm binaries; no `fetchCrate` on the critical path.
 
@@ -12,11 +12,11 @@
 
 ## Spec
 
-Authoritative spec: `specs/adrs/064-single-builder-dev-image.md` (commit `89dafd28` is the most-detailed Path-C version; the current main version is Path A — this plan tracks main).
+Authoritative spec: `specs/adrs/065-single-builder-dev-image.md` (commit `89dafd28` is the most-detailed Path-C version; the current main version is Path A — this plan tracks main).
 
 ## Reference reads (orient before starting)
 
-- `specs/adrs/064-single-builder-dev-image.md` — the ADR.
+- `specs/adrs/065-single-builder-dev-image.md` — the ADR.
 - `specs/adrs/046-builder-vm-via-libkrun.md` — Plan 72's ADR; the rule we're amending.
 - `crates/mvm-build/src/libkrun_builder.rs` — current Stage 0 / persistent builder VM driver.
 - `crates/mvm-cli/src/commands/env/apple_container.rs` — the dispatch surface that changes most (search for `find_dev_image_flake`, `bootstrap_builder_vm_image`, `ensure_source_checkout_dev_image`).
@@ -118,7 +118,7 @@ Append to root `Cargo.toml`:
 [workspace.metadata.mvm.toolchain]
 # Pinned cross-compile toolchain for the embedded host-vm binaries
 # baked into mvmctl. Bump in lockstep across this file and CI to keep
-# the embedded payload reproducible (Plan 115 / ADR-064 claim 11).
+# the embedded payload reproducible (Plan 115 / ADR-065 claim 11).
 zig = "0.13.0"
 cargo-zigbuild = "0.20.0"
 target = "aarch64-unknown-linux-gnu.2.17"
@@ -212,7 +212,7 @@ Expected: PASS.
 git add Cargo.toml crates/mvm-cli/Cargo.toml crates/mvm-cli/build.rs \
         crates/mvm-cli/src/doctor.rs \
         crates/mvm-cli/tests/doctor_zigbuild_probe.rs
-git commit -m "feat(plan-115): pin zig/cargo-zigbuild versions + doctor probe (ADR-064)"
+git commit -m "feat(plan-115): pin zig/cargo-zigbuild versions + doctor probe (ADR-065)"
 ```
 
 ---
@@ -271,9 +271,9 @@ Expected: FAIL — module not found.
 # name set and install paths; CI enforces parity (see
 # xtasks/src/check_mvm_host_binaries_sync.rs).
 #
-# Adding a binary here is part of the Plan 115 / ADR-064 contract;
+# Adding a binary here is part of the Plan 115 / ADR-065 contract;
 # new uses of rustPlatform.buildRustPackage in mvm's flakes are
-# forbidden (see ADR-064 §Principle).
+# forbidden (see ADR-065 §Principle).
 {
   mvm-builder-init = {
     install_path = "/sbin/mvm-builder-init";
@@ -291,7 +291,7 @@ Expected: FAIL — module not found.
 Create `crates/mvm-cli/src/host_binaries/mod.rs`:
 
 ```rust
-//! Plan 115 / ADR-064 — mvm's Linux binaries embedded in mvmctl.
+//! Plan 115 / ADR-065 — mvm's Linux binaries embedded in mvmctl.
 //!
 //! Three submodules:
 //!   - `manifest` — compile-time list of embedded binaries,
@@ -361,7 +361,7 @@ git add nix/lib/mvm-host-binaries.nix \
         crates/mvm-cli/src/host_binaries/manifest.rs \
         crates/mvm-cli/src/lib.rs \
         crates/mvm-cli/tests/host_binaries_manifest.rs
-git commit -m "feat(plan-115): mvm-host-binaries manifest (Nix + Rust mirror, ADR-064)"
+git commit -m "feat(plan-115): mvm-host-binaries manifest (Nix + Rust mirror, ADR-065)"
 ```
 
 ---
@@ -405,7 +405,7 @@ Expected: FAIL — `check-mvm-host-binaries-sync` is not a registered xtask comm
 Create `xtasks/src/check_mvm_host_binaries_sync.rs`:
 
 ```rust
-//! Plan 115 / ADR-064 CI lint — asserts the Rust manifest in
+//! Plan 115 / ADR-065 CI lint — asserts the Rust manifest in
 //! `crates/mvm-cli/src/host_binaries/manifest.rs` and the Nix
 //! attrset in `nix/lib/mvm-host-binaries.nix` agree on the set
 //! of entries and their install paths. Adding or renaming a
@@ -531,7 +531,7 @@ git add xtasks/src/check_mvm_host_binaries_sync.rs \
         xtasks/src/main.rs \
         xtasks/tests/check_sync.rs \
         .github/workflows/ci.yml
-git commit -m "feat(plan-115): xtask + CI lane for host-binaries manifest sync (ADR-064)"
+git commit -m "feat(plan-115): xtask + CI lane for host-binaries manifest sync (ADR-065)"
 ```
 
 ---
@@ -945,7 +945,7 @@ hostBinDir =
   in if envPath != ""
      then /. + envPath
      else throw ''
-       MVM_HOST_BIN_DIR is not set. Plan 115 / ADR-064 contract:
+       MVM_HOST_BIN_DIR is not set. Plan 115 / ADR-065 contract:
        mvmctl populates this dir via host_binaries::ensure_extracted()
        before invoking `nix build path:... --impure`. To run nix
        build by hand: extract the embedded binaries from your
@@ -999,7 +999,7 @@ In `nix/lib/workspace-filter.nix`, update the leading comment:
 #   nix/images/builder-vm/flake.nix
 #   nix/images/runtime-overlay/flake.nix
 #
-# (Plan 115 / ADR-064 deleted nix/images/builder/flake.nix; its
+# (Plan 115 / ADR-065 deleted nix/images/builder/flake.nix; its
 # consumer slot is gone.)
 ```
 
@@ -1007,7 +1007,7 @@ In `nix/lib/workspace-filter.nix`, update the leading comment:
 
 ```bash
 git add nix/images/builder-vm/flake.nix nix/lib/workspace-filter.nix
-git commit -m "refactor(builder-vm/flake): two attrs (default/dev), read MVM_HOST_BIN_DIR (ADR-064)"
+git commit -m "refactor(builder-vm/flake): two attrs (default/dev), read MVM_HOST_BIN_DIR (ADR-065)"
 ```
 
 ---
@@ -1034,7 +1034,7 @@ pub struct BuilderMounts {
     pub flake_src: std::path::PathBuf,
     pub host_nix_store: Option<std::path::PathBuf>,
     pub artifact_out: std::path::PathBuf,
-    /// Plan 115 / ADR-064: dir containing the mvm host-vm binaries
+    /// Plan 115 / ADR-065: dir containing the mvm host-vm binaries
     /// extracted from mvmctl's embedded payload, mounted at
     /// `/mvm-bins` inside the builder VM and exposed via
     /// MVM_HOST_BIN_DIR to the flake.
@@ -1110,7 +1110,7 @@ git add crates/mvm-build/src/builder_vm.rs \
         crates/mvm-build/src/pipeline/dev_build.rs \
         crates/mvm-cli/src/commands/env/apple_container.rs \
         crates/mvm-cli/tests/dispatch_host_bin_dir.rs
-git commit -m "feat(plan-115): dispatch extracts embedded host-bins + mounts /mvm-bins (ADR-064)"
+git commit -m "feat(plan-115): dispatch extracts embedded host-bins + mounts /mvm-bins (ADR-065)"
 ```
 
 ---
@@ -1162,7 +1162,7 @@ Expected: all green.
 ```bash
 git rm nix/images/builder/flake.nix
 git add crates/mvm-cli/src/commands/env/apple_container.rs crates/mvm-cli/tests/
-git commit -m "refactor(plan-115): delete dev-image flake + Stage 0 dev-image dispatch (ADR-064)"
+git commit -m "refactor(plan-115): delete dev-image flake + Stage 0 dev-image dispatch (ADR-065)"
 ```
 
 ---
@@ -1171,7 +1171,7 @@ git commit -m "refactor(plan-115): delete dev-image flake + Stage 0 dev-image di
 
 **Files:**
 - Modify: `CLAUDE.md` — extend "Host dependencies (macOS)" with zig + cargo-zigbuild
-- Modify: `specs/adrs/046-builder-vm-via-libkrun.md` — add "Superseded in part by ADR-064" footer
+- Modify: `specs/adrs/046-builder-vm-via-libkrun.md` — add "Superseded in part by ADR-065" footer
 - Create: `crates/mvm-cli/tests/dev_up_smoke.rs` — gated E2E smoke
 
 - [ ] **Step 1: Update CLAUDE.md "Host dependencies (macOS)"**
@@ -1183,7 +1183,7 @@ For source-checkout contributors only: zig + cargo-zigbuild are needed
 at `cargo build`-of-mvmctl time so `crates/mvm-cli/build.rs` can
 cross-compile the embedded host-vm binaries (`mvm-builder-init`,
 `mvm-egress-proxy`) for aarch64-unknown-linux-gnu. See
-Plan 115 / ADR-064.
+Plan 115 / ADR-065.
 
 ```sh
 brew install zig
@@ -1201,12 +1201,12 @@ Append to `specs/adrs/046-builder-vm-via-libkrun.md`:
 ```markdown
 ---
 
-> **Superseded in part by ADR-064 (Plan 115).** ADR-046's
+> **Superseded in part by ADR-065 (Plan 115).** ADR-046's
 > "Two artifact layers, two acquisition paths" rule is amended:
 > the dev image and the builder VM image collapse into a single
 > flake with two attrs (`default` / `dev`); mvm's own Linux
 > binaries are embedded in mvmctl at its own build time rather
-> than re-built per `dev up`. See ADR-064.
+> than re-built per `dev up`. See ADR-065.
 ```
 
 - [ ] **Step 3: Add the gated E2E smoke**
@@ -1214,7 +1214,7 @@ Append to `specs/adrs/046-builder-vm-via-libkrun.md`:
 Create `crates/mvm-cli/tests/dev_up_smoke.rs`:
 
 ```rust
-// Plan 115 / ADR-064 E2E smoke. Boots Stage 0, lets it produce
+// Plan 115 / ADR-065 E2E smoke. Boots Stage 0, lets it produce
 // the builder-VM image with the embedded host-bins baked in,
 // asserts the produced rootfs.ext4 has the expected files with
 // the expected SHA-256.
@@ -1259,13 +1259,13 @@ git commit -m "feat(plan-115): CLAUDE.md zig dep + ADR-046 footer + E2E smoke"
 
 ```bash
 git push -u origin worktree-plan-115-single-builder-dev-image
-gh pr create --title "Plan 115 — Single builder/dev image with mvmctl-embedded Linux binaries (ADR-064)" \
+gh pr create --title "Plan 115 — Single builder/dev image with mvmctl-embedded Linux binaries (ADR-065)" \
   --body "$(cat <<'EOF'
 ## Summary
 - Collapses nix/images/builder/ → nix/images/builder-vm/ with two attrs (default headless / dev interactive)
 - Embeds mvm-builder-init + mvm-egress-proxy in mvmctl via build.rs + include_bytes!
 - Deletes the dev-image Stage 0 bootstrap chicken-and-egg
-- ADR-064 §Decision applied end-to-end
+- ADR-065 §Decision applied end-to-end
 
 ## Test plan
 - [x] cargo test --workspace (all green)
@@ -1292,10 +1292,10 @@ EOF
 
 ## Self-review notes
 
-- **Spec coverage:** ADR-064 §Decision items 1, 2, and 3 all land in Tasks 6, 4+5+7, and 6 respectively. §Component-level diff "New" entries are covered in T2, T3, T4, T5. "Modified" entries are covered in T1, T6, T7, T9. "Deleted" entries are covered in T8.
+- **Spec coverage:** ADR-065 §Decision items 1, 2, and 3 all land in Tasks 6, 4+5+7, and 6 respectively. §Component-level diff "New" entries are covered in T2, T3, T4, T5. "Modified" entries are covered in T1, T6, T7, T9. "Deleted" entries are covered in T8.
 - **Type consistency:** `HostBinary { name, install_path, mode }` defined in T2, referenced by T4 (`EMBEDDED`), T5 (`extract`), and T7 (`BuilderMounts.host_bin_dir`). Method names: `ensure_extracted` (T5) reused in T7. `MVM_HOST_BIN_DIR` env var named consistently in T6 (flake side) and T7 (host side).
 - **Placeholders:** none — every step has either exact code, exact commands, or exact file paths.
-- **Future work explicitly out of scope** (don't bundle these in this plan): adding `mvmctl inspect host-bins`, runtime-overlay conversion, mvm-guest-agent / mvm-addon-dns conversion, ADR-064's §Future directions items. Each of those is its own plan.
+- **Future work explicitly out of scope** (don't bundle these in this plan): adding `mvmctl inspect host-bins`, runtime-overlay conversion, mvm-guest-agent / mvm-addon-dns conversion, ADR-065's §Future directions items. Each of those is its own plan.
 
 ---
 
@@ -1305,4 +1305,4 @@ After all tasks land, the merge candidate is:
 - The dev-image vs builder-VM split is dissolved.
 - `mvmctl` is a single-binary unit of distribution; end-users download one file.
 - `fetchCrate` is off the critical path of `mvmctl dev up`.
-- The §Principle inventory in ADR-064 drops 3 entries (sites 1-3 of 6).
+- The §Principle inventory in ADR-065 drops 3 entries (sites 1-3 of 6).
