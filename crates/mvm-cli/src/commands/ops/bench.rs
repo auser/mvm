@@ -95,6 +95,41 @@ pub struct IterationTiming {
     pub total_ready_ms: f64,
 }
 
+/// Four host-monotonic instants captured during one boot. `start` is
+/// `LibkrunBackend::start` entry; `pid_seen` is when the supervisor
+/// PID file first appears; `connected` is the first successful vsock
+/// connect to the guest agent; `ready` is when the guest reports the
+/// control plane Ready.
+// Task 5 (live probe wiring) will construct BootMarks from the real
+// instants captured during the boot sequence.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootMarks {
+    pub start: std::time::Instant,
+    pub pid_seen: std::time::Instant,
+    pub connected: std::time::Instant,
+    pub ready: std::time::Instant,
+}
+
+impl BootMarks {
+    /// Collapse the marks into the four reported spans. All arithmetic
+    /// is `Instant`-difference so it can never go negative for marks
+    /// captured in order. Takes `self` by value (`BootMarks` is `Copy`).
+    // Task 5 (live probe wiring) is the first non-test caller.
+    #[allow(dead_code)]
+    pub fn to_timing(self) -> IterationTiming {
+        let ms = |a: std::time::Instant, b: std::time::Instant| {
+            b.saturating_duration_since(a).as_secs_f64() * 1000.0
+        };
+        IterationTiming {
+            start_to_pid_ms: ms(self.start, self.pid_seen),
+            pid_to_connect_ms: ms(self.pid_seen, self.connected),
+            handshake_ms: ms(self.connected, self.ready),
+            total_ready_ms: ms(self.start, self.ready),
+        }
+    }
+}
+
 /// Summary statistics for one phase across all measured iterations.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct PhaseStats {
@@ -603,5 +638,23 @@ mod tests {
             calls: 0,
         };
         assert!(run_benchmark(&mut probe, 0, 0).is_err());
+    }
+
+    #[test]
+    fn spans_from_marks_are_non_negative_and_ordered() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let marks = BootMarks {
+            start: t0,
+            pid_seen: t0 + Duration::from_millis(10),
+            connected: t0 + Duration::from_millis(25),
+            ready: t0 + Duration::from_millis(40),
+        };
+        let it = marks.to_timing();
+        approx(it.start_to_pid_ms, 10.0);
+        approx(it.pid_to_connect_ms, 15.0);
+        approx(it.handshake_ms, 15.0);
+        approx(it.total_ready_ms, 40.0);
+        assert!(it.total_ready_ms >= it.start_to_pid_ms);
     }
 }
