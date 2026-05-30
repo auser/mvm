@@ -8,6 +8,6 @@
 //!   - `extract` — race-safe extraction to
 //!     `~/.cache/mvm/host-bins/<content-hash>/` on first use.
 
+pub mod embedded;
 pub mod manifest;
-// pub mod embedded;   // added in Task 4
 // pub mod extract;    // added in Task 5
