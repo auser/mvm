@@ -21,7 +21,7 @@ use super::host_signer::load_or_init_at;
 use super::managed_secrets::lower_workload_secrets;
 use super::plan_admission::{
     AdmittedPlan, BundleAdmissionContext, InMemoryNonceLedger, SystemClock, admit_for_run,
-    populate_audit_substrate,
+    populate_audit_substrate, stash_plan_for_bridge,
 };
 use super::plan_builder::SynthesisInput;
 use super::policy_resolver::{
@@ -1330,6 +1330,10 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // for no-admission flows.
         if let Some(ctx) = admission.as_ref() {
             populate_audit_substrate(&mut start_config, &ctx.admitted)?;
+            // Plan 113 §Task 13 — Firecracker bridge sidecar reads
+            // plan.json + bundle.json from the per-VM state dir at
+            // spawn time. Stash them now (mode 0600, tmp+rename).
+            stash_plan_for_bridge(&start_config)?;
         }
 
         let backend = AnyBackend::from_hypervisor(effective_hypervisor);
@@ -1754,6 +1758,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // path. None keeps the legacy supervisor path for no-admission flows.
         if let Some(ctx) = admission_main.as_ref() {
             populate_audit_substrate(&mut start_config, &ctx.admitted)?;
+            // Plan 113 §Task 13 — stash plan.json + bundle.json for the
+            // Firecracker bridge sidecar to read at spawn time.
+            stash_plan_for_bridge(&start_config)?;
         }
 
         // Apple Container with -d: install a launchd agent instead of
@@ -2076,6 +2083,10 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             // main path. None → legacy supervisor path.
             if let Some(ctx) = watch_admission.as_ref() {
                 populate_audit_substrate(&mut w_start_config, &ctx.admitted)?;
+                // Plan 113 §Task 13 — re-stash plan.json + bundle.json
+                // for the Firecracker bridge sidecar on every watch-loop
+                // re-boot; the prior admission's files are stale.
+                stash_plan_for_bridge(&w_start_config)?;
             }
             let w_backend = AnyBackend::from_hypervisor(effective_hypervisor);
             if let Err(e) = w_backend.start(&w_start_config) {
