@@ -356,16 +356,25 @@ process-spawn delta, not the headline number.
 
 ### PR-10a — live bench probe
 
-- [ ] `LibkrunProbe::measure_once` boots `ensure_default_microvm_image()`
-      through `admit_plan_for_boot` → `admit_for_run`, times four
-      spans, tears down. No artifact flags.
+- [x] `LibkrunProbe::measure_once` boots `ensure_default_microvm_image()`
+      through `admit_probe_plan` → `admit_for_run`, times four
+      spans, tears down. No artifact flags. (`bench_probe::boot_measure_once`.)
 - [ ] `BootTimingReport` recorded for cross-check (not folded into
-      host spans).
-- [ ] `libkrun-live`-gated integration test asserts finite, ordered
-      spans.
-- [ ] First real run committed as baseline JSON.
-- [ ] `HostDescriptor` populated (libkrun version, kernel sha256,
-      cmdline) so the regression gate is meaningful.
+      host spans). **Deferred:** v1 reads readiness via the atomic
+      `vsock::ping` (Pong), not the `ReadinessReport.boot_millis`
+      report; the guest-monotonic cross-check is a tracked follow-up.
+- [x] `libkrun-live`-gated integration test asserts finite, ordered
+      spans. Validated on the dev host through `backend.start` (see
+      baseline note).
+- [ ] First real run committed as baseline JSON. **Blocked:** the
+      cached `default-microvm` image on the dev host is stale
+      (predates the W1.4b runtime-overlay / `mvm-meta.json` sidecar),
+      so `backend.start` correctly refuses it — the probe path is
+      validated end-to-end, but the committed baseline needs a
+      freshly-built `default-microvm` image.
+- [x] `HostDescriptor` populated (kernel sha256 + runtime cmdline) so
+      the regression gate is meaningful. (`libkrun_version` left
+      `None` — no accessor today.)
 
 ### PR-10b — supervisor standby pool
 
