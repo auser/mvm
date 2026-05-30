@@ -54,11 +54,7 @@ fn verify_sha(path: &Path, expected_hex: &str) -> std::io::Result<bool> {
 }
 
 fn write_atomic(target: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    let tmp = target.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        rand_suffix()
-    ));
+    let tmp = target.with_extension(format!("tmp.{}.{}", std::process::id(), rand_suffix()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;

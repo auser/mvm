@@ -767,7 +767,10 @@ impl BuilderVm for LibkrunBuilderVm {
             // at /mvm-bins inside the builder VM (read-only). The cmd.sh
             // sees MVM_HOST_BIN_DIR=/mvm-bins so the flake can reference
             // the correct pre-compiled binaries without a host nix build.
-            .add_virtio_fs("mvm-bins", path_to_str(&mounts.host_bin_dir, "host_bin_dir")?)
+            .add_virtio_fs(
+                "mvm-bins",
+                path_to_str(&mounts.host_bin_dir, "host_bin_dir")?,
+            )
             .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
         krun = apply_networking_mode(krun, &vm_state_dir)?;

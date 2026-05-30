@@ -9,5 +9,5 @@
 //!     `~/.cache/mvm/host-bins/<content-hash>/` on first use.
 
 pub mod embedded;
-pub mod manifest;
 pub mod extract;
+pub mod manifest;

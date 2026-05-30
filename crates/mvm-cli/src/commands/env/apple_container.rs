@@ -783,42 +783,20 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
 pub(super) fn ensure_dev_image() -> Result<(String, String)> {
-    // Plan 72 W5.B + W5.C — source-checkout dispatch.
+    // Plan 115 / ADR-064: source-checkout dispatch.
     //
-    // libkrun is the only supported builder for the dev-shell flake.
-    // Plan 72 W5.C removed the legacy direct-libkrun fallback
-    // because:
-    //
-    //   1. The dev-shell rustc + cargo closure overflows libkrun's
-    //      hardcoded 4 GiB writable overlay (the load-bearing reason
-    //      ADR-046 / Plan 72 exists). A fallback that would fail with
-    //      "No space left on device" is worse than a clear install
-    //      hint.
-    //
-    //   2. libkrun is now a documented prerequisite for the source-
-    //      checkout dev loop on macOS Apple Silicon / Linux KVM hosts.
-    //      `mvmctl doctor` reports its absence; `brew install libkrun`
-    //      (macOS) / distro package (Linux) is the install path.
-    //
-    // Failures are loud and refuse silent fallback to the prebuilt,
-    // since the typical failure mode (libkrun runtime mismatch, builder-
-    // vm image cache missing) is a config error that hiding behind the
-    // prebuilt would mask.
-    // Gate the dispatch itself on `builder-vm`.
+    // The dev-shell image now comes from `packages.<sys>.dev` in
+    // `nix/images/builder-vm/flake.nix` (the same flake as the
+    // headless builder VM). The old separate `nix/images/builder/`
+    // flake has been deleted. `find_builder_vm_flake()` detects a
+    // source checkout; when present, `build_image_via_libkrun` is
+    // invoked against the `dev` attr of the consolidated flake.
     #[cfg(feature = "builder-vm")]
-    if let Some(flake_dir) =
-        resolve_source_checkout_dev_image(find_dev_image_flake(), find_builder_vm_flake())?
-    {
+    if find_builder_vm_flake().is_ok() {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
         prepare_dev_image_out_dir(&out_dir)?;
 
-        return ensure_source_checkout_dev_image(
-            &flake_dir,
-            &out_dir,
-            mvm_libkrun::is_available(),
-            mvm_libkrun::install_hint(),
-            build_image_via_libkrun,
-        );
+        return build_image_via_libkrun(&out_dir);
     }
 
     // No local source checkout — download the published prebuilt.
@@ -827,7 +805,7 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     // automatically invalidates older caches. We sweep older version
     // dirs on every miss so disk usage tracks the *current* version,
     // not the union of every version ever installed.
-    ui::info("No local dev-image flake found; downloading published prebuilt.");
+    ui::info("No local builder-vm flake found; downloading published prebuilt.");
     let version = env!("CARGO_PKG_VERSION");
     let prebuilt_root = format!("{}/dev/prebuilt", mvm_core::config::mvm_data_dir());
     let prebuilt_dir = format!("{prebuilt_root}/v{version}");
@@ -924,65 +902,6 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     }
 }
 
-#[cfg(feature = "builder-vm")]
-fn resolve_source_checkout_dev_image(
-    dev_flake: Result<String>,
-    builder_flake: Result<String>,
-) -> Result<Option<String>> {
-    let dev_flake = match dev_flake {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-
-    builder_flake.with_context(|| {
-        format!(
-            "source checkout dev-image flake found at {dev_flake}, but the builder VM flake is missing. \
-             Refusing to download the published prebuilt because it would mask local rootfs changes; \
-             restore nix/images/builder-vm/flake.nix or move/delete nix/images/builder/flake.nix \
-             to opt into published prebuilts."
-        )
-    })?;
-
-    Ok(Some(dev_flake))
-}
-
-#[cfg(feature = "builder-vm")]
-fn ensure_source_checkout_dev_image(
-    flake_dir: &str,
-    out_dir: &str,
-    libkrun_available: bool,
-    install_hint: &str,
-    build_image: impl FnOnce(&str) -> Result<(String, String)>,
-) -> Result<(String, String)> {
-    if !libkrun_available {
-        anyhow::bail!(
-            "libkrun is required to build the dev image from source.\n\
-             {install_hint}\n\n\
-             Once installed, retry `mvmctl dev up`. If you intend to use the published\n\
-             prebuilt instead (no local builds), move or delete\n\
-             nix/images/builder/flake.nix so the source-checkout heuristic stops matching.",
-        );
-    }
-
-    ui::info(&format!(
-        "Building dev image via libkrun builder VM from: {flake_dir}"
-    ));
-    match build_image(out_dir) {
-        Ok((kernel, rootfs)) => {
-            ui::success(&format!("Dev image ready at {out_dir}."));
-            Ok((kernel, rootfs))
-        }
-        Err(e) => {
-            anyhow::bail!(
-                "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
-                 Refusing to fall back to the published prebuilt because it would mask\n\
-                 local rootfs changes. To force the prebuilt anyway, move or delete\n\
-                 nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
-            );
-        }
-    }
-}
-
 /// Search for any locally-cached dev image as a fallback when the
 /// published-prebuilt download fails or as a Stage 0 seed when the
 /// builder VM cache is empty. Looks under, in order of precedence
@@ -1006,61 +925,6 @@ fn ensure_source_checkout_dev_image(
 /// warning surface. `None` means nothing usable was found.
 fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
     find_local_fallback_image_with(|_| true)
-}
-
-#[cfg(feature = "builder-vm")]
-fn find_local_stage0_bootstrap_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
-    find_local_fallback_image_with(|rootfs| rootfs_contains_builder_init(rootfs).unwrap_or(false))
-}
-
-#[cfg(feature = "builder-vm")]
-fn find_or_download_stage0_bootstrap_image()
--> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    find_or_download_stage0_bootstrap_image_with(download_published_stage0_bootstrap_image)
-}
-
-#[cfg(feature = "builder-vm")]
-fn find_or_download_stage0_bootstrap_image_with(
-    download_seed: impl FnOnce() -> Result<(std::path::PathBuf, std::path::PathBuf, String)>,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    if let Some(seed) = find_local_stage0_bootstrap_image() {
-        return Ok(seed);
-    }
-
-    download_seed()
-}
-
-#[cfg(feature = "builder-vm")]
-fn download_published_stage0_bootstrap_image()
--> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let version = env!("CARGO_PKG_VERSION");
-    let prebuilt_dir = std::path::PathBuf::from(mvm_core::config::mvm_data_dir())
-        .join("dev")
-        .join("prebuilt")
-        .join(format!("v{version}"));
-    std::fs::create_dir_all(&prebuilt_dir)
-        .with_context(|| format!("creating Stage 0 seed cache dir {}", prebuilt_dir.display()))?;
-
-    let kernel = prebuilt_dir.join("vmlinux");
-    let rootfs = prebuilt_dir.join("rootfs.ext4");
-    ui::warn(
-        "No local Stage 0 dev image contains /sbin/mvm-host-vm-init; \
-         downloading the verified published dev image as a bootstrap seed only. \
-         The builder VM image will still be built from this source checkout.",
-    );
-    download_dev_image(
-        kernel
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Stage 0 seed kernel path is not valid UTF-8"))?,
-        rootfs
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Stage 0 seed rootfs path is not valid UTF-8"))?,
-    )
-    .context("downloading verified published dev image for Stage 0 seed")?;
-
-    ensure_stage0_seed_manifest(&rootfs).context("validating downloaded Stage 0 seed image")?;
-
-    Ok((kernel, rootfs, format!("prebuilt/v{version}")))
 }
 
 fn find_local_fallback_image_with(
@@ -2037,48 +1901,14 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find the dev-image Nix flake directory.
+/// Locate the builder-VM flake at `nix/images/builder-vm/flake.nix`.
 ///
-/// Returns `Ok(path)` only when `nix/images/builder/flake.nix` is present —
-/// that flake is the only one whose `packages.<sys>.default` output
-/// produces the vmlinux + rootfs.ext4 + sidecar shape that
-/// `LibkrunBuilderVm::run_build` extracts from `/out`. The
-/// parent `nix/flake.nix` exposes a library (`lib.mkGuest`) plus an
-/// `internal-minimal-runner` test fixture, neither of which match
-/// that contract — falling back to it earlier yielded a misleading
-/// "double-prefix attribute" `nix build` failure inside the
-/// sandbox. The bail signals `ensure_dev_image` to take the
-/// published-prebuilt download path (W5.1 — hash-verified).
-#[cfg(feature = "builder-vm")]
-fn find_dev_image_flake() -> Result<String> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot find workspace root"))?;
-
-    let candidate = workspace_root.join("nix").join("images").join("builder");
-    if candidate.join("flake.nix").exists() {
-        return Ok(candidate.to_str().unwrap_or(".").to_string());
-    }
-
-    anyhow::bail!("Dev image flake not found. Expected at nix/images/builder/flake.nix")
-}
-
-/// Plan 72 W5 sibling of [`find_dev_image_flake`] — locate the
-/// **builder VM** flake at `nix/images/builder-vm/flake.nix`.
-///
-/// Distinct from the dev-shell image flake at `nix/images/builder/`:
-/// the builder-vm flake produces the small busybox+nix+tools rootfs
-/// that `LibkrunBuilderVm` uses for the source-checkout dev loop.
-///
-/// W5.B (this PR) wires this into `ensure_dev_image` as a precondition
-/// for the libkrun dispatch path — when it returns `Ok`, the host has
-/// the Layer 1 builder-VM flake it needs to bootstrap.
-///
-/// `allow(dead_code)`: the function is only called from the
-/// libkrun-dispatch path inside `ensure_dev_image`.
-#[allow(dead_code)]
+/// Plan 115 / ADR-064: the consolidated flake produces both the
+/// headless builder VM (`packages.<sys>.default`) and the interactive
+/// dev-shell image (`packages.<sys>.dev`). Used by `ensure_dev_image`
+/// to detect a source checkout, and by `bootstrap_builder_vm_image`
+/// to locate Layer 1. Returns `Err` when not in a source checkout,
+/// signalling the caller to fall back to the published prebuilt.
 fn find_builder_vm_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
@@ -2159,21 +1989,10 @@ fn bootstrap_builder_vm_image() -> Result<()> {
                 "Builder VM image not in cache; building locally from {flake_dir}..."
             ));
 
-            // Plan 86: prefer a contract-compliant dev image as the
-            // Stage 0 seed (existing Plan 77 W5 path). If none exists,
-            // fall through to an ur-seed cache.
-            #[cfg(feature = "builder-vm")]
-            {
-                if find_local_stage0_bootstrap_image().is_some() {
-                    return bootstrap_builder_vm_image_via_dev_image_stage0(
-                        &flake_dir,
-                        &out_dir,
-                        &source_fingerprint,
-                    )
-                    .context("building the source-checkout builder VM image");
-                }
-            }
-
+            // Plan 115 / ADR-064: the Alpine root-dir Stage 0 is the
+            // only bootstrap path. The dev-image Stage 0 path
+            // (bootstrap_builder_vm_image_via_dev_image_stage0) has been
+            // removed; `nix/images/builder/flake.nix` is deleted.
             #[cfg(feature = "builder-vm")]
             {
                 bootstrap_builder_vm_image_via_root_dir_stage0(
@@ -2261,335 +2080,6 @@ fn resolve_builder_vm_bootstrap_action(
         Ok(flake_dir) => Ok(BuilderVmBootstrapAction::BuildFromSource { flake_dir }),
         Err(_) => Ok(BuilderVmBootstrapAction::DownloadPublished),
     }
-}
-
-#[cfg(feature = "builder-vm")]
-const STAGE0_BOOTSTRAP_CMDLINE: &str =
-    "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-host-vm-init";
-
-// Plan 77 W5 — Stage 0 seed contract.
-//
-// The dev-image flake (`nix/images/builder/flake.nix`) emits a
-// `manifest.json` sidecar next to `vmlinux` + `rootfs.ext4`. Before
-// `bootstrap_builder_vm_image_via_dev_image_stage0` launches libkrun
-// against a seed image, [`validate_stage0_seed_contract`] reads the
-// sidecar and refuses to proceed if the seed predates the contract
-// (e.g. lacks `/sbin/mvm-host-vm-init`, which would kernel-panic at
-// PID 1). The check is a pure host-side file read — no VM boot, no
-// nix evaluation, no network — so the new failure path costs
-// milliseconds and surfaces a precise, actionable error before any
-// expensive work runs.
-//
-// The constants below are the contract: bump them in lockstep with
-// the matching field in `nix/images/builder/flake.nix`'s manifest
-// emission whenever the boot contract changes incompatibly.
-
-/// Minimum `contract_version` in the seed manifest. `2` is the first
-/// value the dev image flake publishes (manifest didn't exist before
-/// Plan 77 W5).
-#[cfg(feature = "builder-vm")]
-const STAGE0_REQUIRED_CONTRACT_VERSION: u32 = 2;
-
-/// Highest `schema_version` this binary knows how to parse. A manifest
-/// claiming a higher schema is rejected — `mvmctl` is too old.
-#[cfg(feature = "builder-vm")]
-const STAGE0_SUPPORTED_MANIFEST_SCHEMA: u32 = 1;
-
-/// `image_kind` values acceptable as a Stage 0 seed.
-///
-/// - `"dev"` — a dev image built by `nix/images/builder/flake.nix`
-///   (Plan 77 W1 seed type).
-/// - `"ur-seed"` — the Stage -1 bootstrap rootfs built by
-///   `nix/ur-seed/flake.nix` (Plan 86 / ADR-054). Used when no dev
-///   image is available locally.
-///
-/// Sister artifacts (e.g. the builder-vm image itself) have other
-/// kinds; one must not be used in place of these.
-#[cfg(feature = "builder-vm")]
-const STAGE0_ACCEPTED_IMAGE_KINDS: &[&str] = &["dev", "ur-seed"];
-
-/// Paths the seed rootfs is contractually required to ship. The
-/// manifest declares what the flake's `extraFiles` installed; mvmctl
-/// validates the declaration. The host has no ext4 walker — so this
-/// is a metadata check, not a filesystem walk. See Plan 77 security
-/// consideration 13.
-#[cfg(feature = "builder-vm")]
-const STAGE0_REQUIRED_INIT_PATHS: &[&str] = &["/sbin/mvm-host-vm-init"];
-
-#[cfg(feature = "builder-vm")]
-#[derive(Debug, serde::Deserialize)]
-struct Stage0SeedManifest {
-    schema_version: u32,
-    contract_version: u32,
-    image_kind: String,
-    init_paths: Vec<String>,
-    // `system` is informational; we don't reject on mismatch (a
-    // contributor running an x86_64 mvmctl against an aarch64 seed
-    // will fail at the libkrun layer with a clearer error).
-    #[serde(default)]
-    #[allow(dead_code)]
-    system: Option<String>,
-}
-
-#[cfg(feature = "builder-vm")]
-#[derive(Debug)]
-enum SeedContractError {
-    MissingManifest {
-        manifest_path: std::path::PathBuf,
-    },
-    UnreadableManifest {
-        manifest_path: std::path::PathBuf,
-        source: std::io::Error,
-    },
-    MalformedJson {
-        manifest_path: std::path::PathBuf,
-        source: serde_json::Error,
-    },
-    UnsupportedSchema {
-        manifest_path: std::path::PathBuf,
-        actual: u32,
-        supported: u32,
-    },
-    WrongImageKind {
-        manifest_path: std::path::PathBuf,
-        actual: String,
-        expected: &'static str,
-    },
-    ContractStale {
-        manifest_path: std::path::PathBuf,
-        actual: u32,
-        required: u32,
-    },
-    MissingInitPath {
-        manifest_path: std::path::PathBuf,
-        missing: &'static str,
-        present: Vec<String>,
-    },
-}
-
-#[cfg(feature = "builder-vm")]
-impl SeedContractError {
-    /// Stable, parser-friendly value for the `Stage0Failed` audit
-    /// detail's `reason=` field. No spaces, no `=`, no commas.
-    fn audit_reason(&self) -> &'static str {
-        match self {
-            Self::MissingManifest { .. } => "seed_contract_missing_manifest",
-            Self::UnreadableManifest { .. } => "seed_contract_unreadable_manifest",
-            Self::MalformedJson { .. } => "seed_contract_malformed_json",
-            Self::UnsupportedSchema { .. } => "seed_contract_unsupported_schema",
-            Self::WrongImageKind { .. } => "seed_contract_wrong_image_kind",
-            Self::ContractStale { .. } => "seed_contract_stale",
-            Self::MissingInitPath { .. } => "seed_contract_missing_init_path",
-        }
-    }
-}
-
-#[cfg(feature = "builder-vm")]
-impl std::fmt::Display for SeedContractError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingManifest { manifest_path } => write!(
-                f,
-                "Stage 0 seed is missing `manifest.json` at {} — likely built before \
-                 the seed-contract requirement landed. Rebuild the dev image \
-                 (e.g. `mvmctl dev rebuild`) or import a signed published image \
-                 (`mvmctl dev import-image`) and retry `mvmctl dev up`.",
-                manifest_path.display()
-            ),
-            Self::UnreadableManifest {
-                manifest_path,
-                source,
-            } => write!(
-                f,
-                "Stage 0 seed manifest at {} could not be read: {source}. \
-                 Check filesystem permissions on the dev image cache directory.",
-                manifest_path.display()
-            ),
-            Self::MalformedJson {
-                manifest_path,
-                source,
-            } => write!(
-                f,
-                "Stage 0 seed manifest at {} is not valid JSON: {source}. \
-                 The dev-image flake emits this file; a malformed manifest indicates a corrupted \
-                 cache. Remove the directory and retry `mvmctl dev up`.",
-                manifest_path.display()
-            ),
-            Self::UnsupportedSchema {
-                manifest_path,
-                actual,
-                supported,
-            } => write!(
-                f,
-                "Stage 0 seed manifest at {} declares schema_version={actual}, but this `mvmctl` \
-                 only understands schema_version <= {supported}. Upgrade `mvmctl` to a build that \
-                 understands the newer manifest schema.",
-                manifest_path.display()
-            ),
-            Self::WrongImageKind {
-                manifest_path,
-                actual,
-                expected,
-            } => write!(
-                f,
-                "Stage 0 seed manifest at {} declares image_kind={actual:?}, but a seed must be \
-                 image_kind={expected:?}. The cache directory likely contains the wrong artifact \
-                 (e.g. a builder-vm image copied into a dev-image slot).",
-                manifest_path.display()
-            ),
-            Self::ContractStale {
-                manifest_path,
-                actual,
-                required,
-            } => write!(
-                f,
-                "Stage 0 seed manifest at {} declares contract_version={actual}, but this \
-                 `mvmctl` requires contract_version >= {required}. The dev image was built \
-                 before the current Stage 0 boot contract; rebuild it (e.g. `mvmctl dev \
-                 rebuild`) or import a signed published image with `mvmctl dev import-image`.",
-                manifest_path.display()
-            ),
-            Self::MissingInitPath {
-                manifest_path,
-                missing,
-                present,
-            } => write!(
-                f,
-                "Stage 0 seed manifest at {} does not declare required init path {missing:?} \
-                 (declared init_paths: {present:?}). The dev image was built without the \
-                 PID-1 binary Stage 0 expects; rebuild or re-import as above.",
-                manifest_path.display()
-            ),
-        }
-    }
-}
-
-#[cfg(feature = "builder-vm")]
-impl std::error::Error for SeedContractError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UnreadableManifest { source, .. } => Some(source),
-            Self::MalformedJson { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-/// Plan 77 W5 — preflight Stage 0 seed contract check.
-///
-/// Validates the `manifest.json` sidecar that the dev-image flake
-/// emits next to `rootfs.ext4`. On success, the seed is contractually
-/// compatible with the Stage 0 boot expectations (`/sbin/mvm-host-vm-init`
-/// as PID 1, etc.). On failure, the caller bails before any libkrun
-/// boot — turning what would be a 10-minute kernel-panic hang into a
-/// 2-second diagnosable error.
-///
-/// `seed_rootfs` is the path the caller resolved via
-/// [`find_local_fallback_image`]; the manifest lives in the same
-/// directory.
-#[cfg(feature = "builder-vm")]
-fn validate_stage0_seed_contract(
-    seed_rootfs: &std::path::Path,
-) -> std::result::Result<(), SeedContractError> {
-    let seed_dir = seed_rootfs
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let manifest_path = seed_dir.join("manifest.json");
-
-    if !manifest_path.is_file() {
-        return Err(SeedContractError::MissingManifest { manifest_path });
-    }
-
-    let bytes =
-        std::fs::read(&manifest_path).map_err(|source| SeedContractError::UnreadableManifest {
-            manifest_path: manifest_path.clone(),
-            source,
-        })?;
-
-    let manifest: Stage0SeedManifest =
-        serde_json::from_slice(&bytes).map_err(|source| SeedContractError::MalformedJson {
-            manifest_path: manifest_path.clone(),
-            source,
-        })?;
-
-    if manifest.schema_version > STAGE0_SUPPORTED_MANIFEST_SCHEMA {
-        return Err(SeedContractError::UnsupportedSchema {
-            manifest_path,
-            actual: manifest.schema_version,
-            supported: STAGE0_SUPPORTED_MANIFEST_SCHEMA,
-        });
-    }
-
-    if !STAGE0_ACCEPTED_IMAGE_KINDS
-        .iter()
-        .any(|k| *k == manifest.image_kind)
-    {
-        return Err(SeedContractError::WrongImageKind {
-            manifest_path,
-            actual: manifest.image_kind,
-            // First entry is the canonical kind; reporting it keeps the
-            // error message focused on what the user most likely meant
-            // to install. The accepted-kinds list is logged separately.
-            expected: STAGE0_ACCEPTED_IMAGE_KINDS[0],
-        });
-    }
-
-    if manifest.contract_version < STAGE0_REQUIRED_CONTRACT_VERSION {
-        return Err(SeedContractError::ContractStale {
-            manifest_path,
-            actual: manifest.contract_version,
-            required: STAGE0_REQUIRED_CONTRACT_VERSION,
-        });
-    }
-
-    for required in STAGE0_REQUIRED_INIT_PATHS {
-        if !manifest.init_paths.iter().any(|p| p == required) {
-            return Err(SeedContractError::MissingInitPath {
-                manifest_path,
-                missing: required,
-                present: manifest.init_paths,
-            });
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "builder-vm")]
-fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
-    if !rootfs_contains_builder_init(seed_rootfs)? {
-        anyhow::bail!(
-            "Stage 0 seed rootfs at {} does not contain /sbin/mvm-host-vm-init; \
-             this dev image cannot bootstrap the source-checkout builder VM cache.",
-            seed_rootfs.display()
-        );
-    }
-
-    let seed_dir = seed_rootfs
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let manifest_path = seed_dir.join("manifest.json");
-    if manifest_path.exists() {
-        return Ok(());
-    }
-
-    let system = if cfg!(target_arch = "aarch64") {
-        "aarch64-linux"
-    } else {
-        "x86_64-linux"
-    };
-    let manifest = serde_json::json!({
-        "schema_version": STAGE0_SUPPORTED_MANIFEST_SCHEMA,
-        "contract_version": STAGE0_REQUIRED_CONTRACT_VERSION,
-        "image_kind": STAGE0_ACCEPTED_IMAGE_KINDS[0],
-        "system": system,
-        "init_paths": STAGE0_REQUIRED_INIT_PATHS,
-    });
-    let body =
-        serde_json::to_string_pretty(&manifest).context("serializing Stage 0 seed manifest")?;
-    std::fs::write(&manifest_path, format!("{body}\n"))
-        .with_context(|| format!("writing Stage 0 seed manifest {}", manifest_path.display()))?;
-    Ok(())
 }
 
 /// Stage 0 bootstrap via libkrun's `krun_set_root` mode — extract
@@ -2740,110 +2230,6 @@ fn run_stage0_root_dir(
     Ok(())
 }
 
-#[cfg(feature = "builder-vm")]
-fn bootstrap_builder_vm_image_via_dev_image_stage0(
-    builder_flake_dir: &str,
-    out_dir: &str,
-    source_fingerprint: &str,
-) -> Result<()> {
-    // Plan 77 W2 — serialize concurrent Stage 0 invocations on the same
-    // host before any side effects. Two `mvmctl dev up` runs in parallel
-    // would race on the persistent `~/.cache/mvm/builder-vm/nix-store-<arch>.img`
-    // volume that libkrun mounts read-write inside the bootstrap VM;
-    // letting both proceed risks Nix-store corruption (and at minimum
-    // duplicates 10–30 minutes of work). The lock lives one directory
-    // above the per-arch cache so it serializes across arches too —
-    // overkill, but the contention cost is zero in practice (single
-    // contributor host) and the simpler invariant is worth it.
-    let _stage0_guard = acquire_stage0_lock(out_dir)?;
-
-    let (kernel, rootfs, source_label) = find_or_download_stage0_bootstrap_image().context(
-        "source checkout builder VM cache is missing and no local Stage 0 dev image cache was found \
-         under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/ \
-         that contains /sbin/mvm-host-vm-init. Failed to acquire a verified published dev-image \
-         seed as the bootstrap fallback.",
-    )?;
-
-    ensure_stage0_seed_manifest(&rootfs)
-        .with_context(|| format!("preparing Stage 0 seed manifest for {source_label}"))?;
-
-    // Plan 77 W5 — preflight seed contract check. Catches the
-    // contract-stale dev-image-rootfs case (no `/sbin/mvm-host-vm-init`
-    // -> kernel panics at PID 1, host hangs in `Child::wait` on the
-    // libkrun supervisor) before any VM boot. The check runs before
-    // staging-dir creation so a clean abort doesn't leave half-built
-    // state. We emit a Stage0Failed audit line with `stage=preflight`
-    // so dashboards can break this class out from in-VM build
-    // failures.
-    if let Err(e) = validate_stage0_seed_contract(&rootfs) {
-        let reason = e.audit_reason();
-        let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
-        mvm_core::audit_emit!(
-            Stage0Failed,
-            "stage=preflight reason={reason} seed={source_label} fingerprint_prefix={fingerprint_prefix}"
-        );
-        return Err(anyhow::Error::from(e).context(format!(
-            "Stage 0 seed contract check failed for seed at {} (source: {source_label})",
-            rootfs.display()
-        )));
-    }
-
-    ui::info(&format!(
-        "Using local dev image cache ({source_label}) as Stage 0 bootstrap image."
-    ));
-    let out_dir = std::path::Path::new(out_dir);
-    let staging_dir = unique_builder_vm_stage0_staging_dir(out_dir)?;
-    std::fs::create_dir_all(&staging_dir)
-        .with_context(|| format!("creating Stage 0 staging dir {}", staging_dir.display()))?;
-
-    // Plan 77 W3: bracket the bootstrap with audit emits. `Stage0Boot`
-    // fires once we have a seed image and a staging dir on disk —
-    // before that point, failures are pre-flight (no seed, can't
-    // create staging) and the existing UI surface already explains
-    // them. From here on, every exit path lands either a
-    // `Stage0CachePromoted` or a `Stage0Failed` line so a contributor
-    // can answer "did Stage 0 ever finish, and how" after the fact.
-    let started = std::time::Instant::now();
-    let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
-    mvm_core::audit_emit!(
-        Stage0Boot,
-        "seed={source_label} fingerprint_prefix={fingerprint_prefix} flavor={flavor}",
-        flavor = STAGE0_FLAVOR_CURRENT,
-    );
-
-    let result = run_stage0_bootstrap(
-        &staging_dir,
-        out_dir,
-        source_fingerprint,
-        builder_flake_dir,
-        kernel,
-        rootfs,
-        Stage0BootstrapOpts::default_image(),
-    );
-    let duration_ms = started.elapsed().as_millis() as u64;
-
-    match result {
-        Ok(()) => {
-            mvm_core::audit_emit!(
-                Stage0CachePromoted,
-                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms} flavor={flavor}",
-                cache = out_dir.display(),
-                flavor = STAGE0_FLAVOR_CURRENT,
-            );
-            Ok(())
-        }
-        Err((stage, e)) => {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            let reason = stage0_failure_reason_summary(&e);
-            mvm_core::audit_emit!(
-                Stage0Failed,
-                "stage={stage} duration_ms={duration_ms} reason={reason}"
-            );
-            Err(e)
-        }
-    }
-}
-
 /// Plan 93 Phase 0: which Stage 0 bootstrap variant this build runs.
 ///
 /// The `flavor=` field on `Stage0Boot` / `Stage0CachePromoted` audit
@@ -2863,23 +2249,6 @@ const STAGE0_FLAVOR_CURRENT: &str = "current";
 enum Stage0FailureStage {
     Build,
     Validate,
-    Promote,
-}
-
-#[cfg(feature = "builder-vm")]
-struct Stage0BootstrapOpts<'a> {
-    attr_name: &'a str,
-    output_kernel: Option<&'a std::path::Path>,
-}
-
-#[cfg(feature = "builder-vm")]
-impl<'a> Stage0BootstrapOpts<'a> {
-    fn default_image() -> Self {
-        Self {
-            attr_name: "default",
-            output_kernel: None,
-        }
-    }
 }
 
 #[cfg(feature = "builder-vm")]
@@ -2888,7 +2257,6 @@ impl Stage0FailureStage {
         match self {
             Self::Build => "build",
             Self::Validate => "validate",
-            Self::Promote => "promote",
         }
     }
 }
@@ -2898,87 +2266,6 @@ impl std::fmt::Display for Stage0FailureStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-/// Plan 77 W3: the inner bootstrap pipeline, with each phase tagged
-/// so the outer caller can attribute a failure to a specific
-/// `Stage0FailureStage` in the audit emit.
-///
-/// Extracting this out of [`bootstrap_builder_vm_image_via_dev_image_stage0`]
-/// keeps the audit-bracketing logic in the outer function and the
-/// pipeline itself readable top-to-bottom. The
-/// `(Stage0FailureStage, anyhow::Error)` return type lets the caller
-/// preserve the underlying error for normal anyhow chaining while
-/// still recording which phase failed.
-#[cfg(feature = "builder-vm")]
-fn run_stage0_bootstrap(
-    staging_dir: &std::path::Path,
-    final_dir: &std::path::Path,
-    source_fingerprint: &str,
-    builder_flake_dir: &str,
-    bootstrap_kernel: std::path::PathBuf,
-    bootstrap_rootfs: std::path::PathBuf,
-    opts: Stage0BootstrapOpts<'_>,
-) -> std::result::Result<(), (Stage0FailureStage, anyhow::Error)> {
-    use mvm_build::builder_vm::BuilderVm as _;
-    use mvm_build::libkrun_builder::LibkrunBuilderVm;
-
-    let staging_dir_str = staging_dir
-        .to_str()
-        .ok_or_else(|| {
-            (
-                Stage0FailureStage::Build,
-                anyhow::anyhow!(
-                    "Stage 0 staging path is not valid UTF-8: {}",
-                    staging_dir.display()
-                ),
-            )
-        })?
-        .to_string();
-    let (job, mounts, bootstrap_image) = builder_vm_stage0_bootstrap_plan(
-        builder_flake_dir,
-        &staging_dir_str,
-        bootstrap_kernel,
-        bootstrap_rootfs,
-        opts.attr_name,
-    )
-    .map_err(|e| (Stage0FailureStage::Build, e))?;
-
-    LibkrunBuilderVm::default()
-        .with_image_override(bootstrap_image)
-        .run_build(&job, &mounts)
-        .map_err(|e| {
-            (
-                Stage0FailureStage::Build,
-                anyhow::anyhow!("Stage 0 builder VM build: {e}"),
-            )
-        })?;
-
-    if let Some(kernel) = opts.output_kernel {
-        let dst = staging_dir.join("vmlinux");
-        std::fs::copy(kernel, &dst).map_err(|e| {
-            (
-                Stage0FailureStage::Build,
-                anyhow::anyhow!(
-                    "copying Stage 0 output kernel {} -> {}: {e}",
-                    kernel.display(),
-                    dst.display()
-                ),
-            )
-        })?;
-    }
-
-    write_builder_vm_source_fingerprint(staging_dir, source_fingerprint)
-        .map_err(|e| (Stage0FailureStage::Validate, e))?;
-    write_builder_vm_artifact_digest_manifest(staging_dir)
-        .map_err(|e| (Stage0FailureStage::Validate, e))?;
-    write_builder_vm_source_cache_provenance(staging_dir, source_fingerprint)
-        .map_err(|e| (Stage0FailureStage::Validate, e))?;
-
-    promote_builder_vm_stage0_cache(staging_dir, final_dir, source_fingerprint)
-        .map_err(|e| (Stage0FailureStage::Promote, e))?;
-
-    Ok(())
 }
 
 /// Extract libkrunfw's bundled TSI-patched kernel into the host cache
@@ -3044,55 +2331,6 @@ fn stage0_failure_reason_summary(err: &anyhow::Error) -> String {
         .collect();
     let truncated: String = cleaned.chars().take(160).collect();
     truncated
-}
-
-#[cfg(feature = "builder-vm")]
-fn builder_vm_stage0_bootstrap_plan(
-    builder_flake_dir: &str,
-    out_dir: &str,
-    bootstrap_kernel: std::path::PathBuf,
-    bootstrap_rootfs: std::path::PathBuf,
-    attr_name: &str,
-) -> Result<(
-    mvm_build::builder_vm::BuilderJob,
-    mvm_build::builder_vm::BuilderMounts,
-    mvm_build::libkrun_builder::BuilderVmImage,
-)> {
-    use mvm_build::builder_vm::{BuilderJob, BuilderMounts, host_system_linux};
-    use mvm_build::libkrun_builder::BuilderVmImage;
-
-    let workspace_root = std::path::Path::new(builder_flake_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {builder_flake_dir}"))?
-        .to_path_buf();
-
-    // Plan 115 / ADR-064: extract the embedded host-vm binaries and
-    // mount them at /mvm-bins so the Stage 0 builder-vm flake can
-    // install the cross-compiled binaries into the rootfs it builds.
-    let host_bins_cache = format!("{}/host-bins", mvm_core::config::mvm_cache_dir());
-    let host_bin_dir =
-        crate::host_binaries::extract::ensure_extracted(std::path::Path::new(&host_bins_cache))
-            .map_err(|e| anyhow::anyhow!("extract embedded host-vm binaries: {e}"))?;
-
-    let job = BuilderJob::Flake {
-        flake_ref: "path:/work/nix/images/builder-vm".to_string(),
-        attr_path: format!("packages.{}.{attr_name}", host_system_linux()),
-    };
-    let mounts = BuilderMounts {
-        flake_src: workspace_root,
-        host_nix_store: None,
-        artifact_out: std::path::PathBuf::from(out_dir),
-        host_bin_dir,
-    };
-    let bootstrap_image = BuilderVmImage::new(
-        bootstrap_kernel,
-        bootstrap_rootfs,
-        STAGE0_BOOTSTRAP_CMDLINE.to_string(),
-    );
-
-    Ok((job, mounts, bootstrap_image))
 }
 
 /// Plan 77 W2 — RAII advisory lock at
@@ -4158,30 +3396,31 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     bootstrap_builder_vm_image()
         .context("Stage 0 builder-VM image bootstrap (precondition for libkrun dispatch)")?;
 
-    // Workspace root for the `/work` virtio-fs share. `find_dev_image_flake()`
-    // returns `<workspace>/nix/images/builder`; the workspace itself is
-    // three levels up. The dev-shell flake at
-    // `nix/images/builder/flake.nix` reads `MVM_WORKSPACE_PATH=/work`
+    // Workspace root for the `/work` virtio-fs share. `find_builder_vm_flake()`
+    // returns `<workspace>/nix/images/builder-vm`; the workspace itself is
+    // three levels up. The consolidated flake reads `MVM_WORKSPACE_PATH=/work`
     // (set in the guest's `cmd.sh` by `LibkrunBuilderVm`) under
     // `--impure`, so the flake's `builtins.path` import lands on the
-    // mount rather than the store-copied flake dir. Plan 72 W0
-    // wired both halves of this.
-    let dev_flake = find_dev_image_flake().context(
-        "dev-shell flake missing at nix/images/builder/flake.nix; libkrun dispatch needs it as Layer 2 source",
+    // mount rather than the store-copied flake dir. Plan 115 / ADR-064
+    // collapsed `nix/images/builder/` into `nix/images/builder-vm/`;
+    // the interactive dev-shell image is now `packages.<sys>.dev`.
+    let builder_flake = find_builder_vm_flake().context(
+        "builder-vm flake missing at nix/images/builder-vm/flake.nix; libkrun dispatch needs it as Layer 2 source",
     )?;
-    let workspace_root = std::path::Path::new(&dev_flake)
+    let workspace_root = std::path::Path::new(&builder_flake)
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {dev_flake}"))?
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {builder_flake}"))?
         .to_path_buf();
 
-    // Inside the guest, `/work` is the workspace mount. The dev-shell
-    // flake lives at `/work/nix/images/builder` from the cmd.sh's
+    // Inside the guest, `/work` is the workspace mount. The builder-vm
+    // flake lives at `/work/nix/images/builder-vm` from the cmd.sh's
     // perspective. `path:` forces Nix's filesystem flake fetcher (not
     // the git fetcher, which would discover `/work/.git` and trip on
     // worktree files whose `gitdir:` redirects point outside the
-    // mount).
+    // mount). `packages.<sys>.dev` is the interactive (dev-shell) attr
+    // added by Plan 115 / ADR-064.
     // Plan 115 / ADR-064: extract the embedded host-vm binaries to the
     // host-bins cache dir and mount them at /mvm-bins inside the builder VM.
     // The builder-vm flake's cmd.sh reads MVM_HOST_BIN_DIR=/mvm-bins to
@@ -4192,8 +3431,8 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
             .map_err(|e| anyhow::anyhow!("extract embedded host-vm binaries: {e}"))?;
 
     let job = BuilderJob::Flake {
-        flake_ref: "path:/work/nix/images/builder".to_string(),
-        attr_path: format!("packages.{}.default", host_system_linux()),
+        flake_ref: "path:/work/nix/images/builder-vm".to_string(),
+        attr_path: format!("packages.{}.dev", host_system_linux()),
     };
     let mounts = BuilderMounts {
         flake_src: workspace_root,
@@ -4618,133 +3857,6 @@ mod dev_status_image_tests {
         );
 
         assert!(find_local_fallback_image().is_none());
-    }
-
-    #[cfg(feature = "builder-vm")]
-    #[test]
-    fn stage0_fallback_skips_rootfs_missing_builder_init() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let _env = EnvGuard::set(
-            &tmp.path().join("home"),
-            &data_dir,
-            &tmp.path().join("cache"),
-        );
-
-        let current = data_dir.join("dev/current");
-        write_valid_dev_image(&current);
-        let mut bad_rootfs = std::fs::read(current.join("rootfs.ext4")).unwrap();
-        for b in &mut bad_rootfs {
-            if *b != 0 {
-                *b = 0;
-            }
-        }
-        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
-        bad_rootfs[EXT4_MAGIC_OFFSET] = 0x53;
-        bad_rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
-        std::fs::write(current.join("rootfs.ext4"), bad_rootfs).unwrap();
-
-        let prebuilt = data_dir.join("dev/prebuilt/v0.0.2");
-        write_valid_dev_image(&prebuilt);
-
-        let (kernel, rootfs, label) =
-            find_local_stage0_bootstrap_image().expect("valid prebuilt seed should be selected");
-        assert_eq!(kernel, prebuilt.join("vmlinux"));
-        assert_eq!(rootfs, prebuilt.join("rootfs.ext4"));
-        assert_eq!(label, "prebuilt/v0.0.2");
-    }
-
-    #[cfg(feature = "builder-vm")]
-    #[test]
-    fn stage0_seed_resolution_prefers_local_seed_without_downloading() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let _env = EnvGuard::set(
-            &tmp.path().join("home"),
-            &data_dir,
-            &tmp.path().join("cache"),
-        );
-
-        let current = data_dir.join("dev/current");
-        write_valid_dev_image(&current);
-
-        let (kernel, rootfs, label) = find_or_download_stage0_bootstrap_image_with(|| {
-            panic!("valid local Stage 0 seed should avoid download")
-        })
-        .expect("local seed should resolve");
-
-        assert_eq!(kernel, current.join("vmlinux"));
-        assert_eq!(rootfs, current.join("rootfs.ext4"));
-        assert_eq!(label, "current");
-    }
-
-    #[cfg(feature = "builder-vm")]
-    #[test]
-    fn stage0_seed_resolution_downloads_when_local_seed_missing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let _env = EnvGuard::set(
-            &tmp.path().join("home"),
-            &data_dir,
-            &tmp.path().join("cache"),
-        );
-
-        let downloaded = tmp.path().join("downloaded");
-        write_valid_dev_image(&downloaded);
-        let (kernel, rootfs, label) = find_or_download_stage0_bootstrap_image_with(|| {
-            Ok((
-                downloaded.join("vmlinux"),
-                downloaded.join("rootfs.ext4"),
-                "downloaded".to_string(),
-            ))
-        })
-        .expect("download fallback should resolve");
-
-        assert_eq!(kernel, downloaded.join("vmlinux"));
-        assert_eq!(rootfs, downloaded.join("rootfs.ext4"));
-        assert_eq!(label, "downloaded");
-    }
-
-    #[cfg(feature = "builder-vm")]
-    #[test]
-    fn ensure_stage0_seed_manifest_writes_missing_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_valid_dev_image(tmp.path());
-        let rootfs = tmp.path().join("rootfs.ext4");
-
-        ensure_stage0_seed_manifest(&rootfs).expect("valid seed should get a manifest");
-
-        let manifest = tmp.path().join("manifest.json");
-        assert!(manifest.is_file(), "manifest sidecar should be written");
-        validate_stage0_seed_contract(&rootfs).expect("written manifest should satisfy contract");
-    }
-
-    #[cfg(feature = "builder-vm")]
-    #[test]
-    fn ensure_stage0_seed_manifest_rejects_rootfs_without_builder_init() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_valid_dev_image(tmp.path());
-        let rootfs = tmp.path().join("rootfs.ext4");
-        let mut bytes = std::fs::read(&rootfs).unwrap();
-        for b in &mut bytes {
-            if *b != 0 {
-                *b = 0;
-            }
-        }
-        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
-        bytes[EXT4_MAGIC_OFFSET] = 0x53;
-        bytes[EXT4_MAGIC_OFFSET + 1] = 0xEF;
-        std::fs::write(&rootfs, bytes).unwrap();
-
-        let err = ensure_stage0_seed_manifest(&rootfs)
-            .expect_err("seed without builder init must be rejected");
-        assert!(
-            format!("{err:#}").contains("/sbin/mvm-host-vm-init"),
-            "error should name missing Stage 0 init path: {err:#}"
-        );
     }
 
     #[test]
@@ -5203,77 +4315,6 @@ mod builder_vm_bootstrap_tests {
             !std::path::Path::new("/tmp/mvm-w4-test-out").exists(),
             "structural failure must not touch the filesystem"
         );
-    }
-
-    #[test]
-    fn builder_vm_stage0_bootstrap_plan_targets_builder_vm_flake() {
-        let (job, mounts, image) = builder_vm_stage0_bootstrap_plan(
-            "/repo/nix/images/builder-vm",
-            "/cache/builder-vm/aarch64",
-            std::path::PathBuf::from("/dev-cache/vmlinux"),
-            std::path::PathBuf::from("/dev-cache/rootfs.ext4"),
-            "default",
-        )
-        .expect("valid builder flake path should produce a plan");
-
-        match job {
-            mvm_build::builder_vm::BuilderJob::Flake {
-                flake_ref,
-                attr_path,
-            } => {
-                assert_eq!(flake_ref, "path:/work/nix/images/builder-vm");
-                assert!(
-                    attr_path == "packages.aarch64-linux.default"
-                        || attr_path == "packages.x86_64-linux.default",
-                    "unexpected attr path: {attr_path}"
-                );
-            }
-            other => panic!("unexpected stage0 job: {other:?}"),
-        }
-        assert_eq!(mounts.flake_src, std::path::PathBuf::from("/repo"));
-        assert!(mounts.host_nix_store.is_none());
-        assert_eq!(
-            mounts.artifact_out,
-            std::path::PathBuf::from("/cache/builder-vm/aarch64")
-        );
-        match image {
-            mvm_build::libkrun_builder::BuilderVmImage::Rootfs {
-                kernel_path,
-                rootfs_path,
-                cmdline,
-            } => {
-                assert_eq!(kernel_path, std::path::PathBuf::from("/dev-cache/vmlinux"));
-                assert_eq!(
-                    rootfs_path,
-                    std::path::PathBuf::from("/dev-cache/rootfs.ext4")
-                );
-                assert_eq!(cmdline, STAGE0_BOOTSTRAP_CMDLINE);
-            }
-            other => panic!("expected Rootfs variant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn builder_vm_stage0_bootstrap_plan_can_target_rootfs_only_attr() {
-        let (job, _mounts, _image) = builder_vm_stage0_bootstrap_plan(
-            "/repo/nix/images/builder-vm",
-            "/cache/builder-vm/aarch64",
-            std::path::PathBuf::from("/seed/vmlinux"),
-            std::path::PathBuf::from("/seed/rootfs.ext4"),
-            "stage0-rootfs",
-        )
-        .expect("valid builder flake path should produce a plan");
-
-        match job {
-            mvm_build::builder_vm::BuilderJob::Flake { attr_path, .. } => {
-                assert!(
-                    attr_path == "packages.aarch64-linux.stage0-rootfs"
-                        || attr_path == "packages.x86_64-linux.stage0-rootfs",
-                    "unexpected attr path: {attr_path}"
-                );
-            }
-            other => panic!("unexpected stage0 job: {other:?}"),
-        }
     }
 
     fn write_valid_builder_vm_artifacts(dir: &std::path::Path) {
@@ -6104,127 +5145,10 @@ mod builder_vm_bootstrap_tests {
         assert!(builder_vm_source_cache_ready(&final_dir, "new"));
     }
 
-    #[test]
-    fn source_checkout_resolution_requires_builder_vm_flake() {
-        let err = resolve_source_checkout_dev_image(
-            Ok("/repo/nix/images/builder".to_string()),
-            Err(anyhow::anyhow!("missing builder-vm flake")),
-        )
-        .expect_err("source checkout without builder-vm flake must fail closed");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("builder VM flake is missing"), "{msg}");
-        assert!(
-            msg.contains("Refusing to download the published prebuilt"),
-            "{msg}"
-        );
-        assert!(msg.contains("nix/images/builder-vm/flake.nix"), "{msg}");
-    }
-
-    #[test]
-    fn source_checkout_resolution_absent_dev_flake_allows_prebuilt_path() {
-        let result = resolve_source_checkout_dev_image(
-            Err(anyhow::anyhow!("no dev flake")),
-            Err(anyhow::anyhow!("no builder-vm flake")),
-        )
-        .expect("missing dev flake means installed/prebuilt path may continue");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn source_checkout_dev_image_refuses_missing_libkrun_before_building() {
-        let called = Cell::new(false);
-        let err = ensure_source_checkout_dev_image(
-            "/repo/nix/images/builder",
-            "/tmp/out",
-            false,
-            "install libkrun with your platform package manager",
-            |_| {
-                called.set(true);
-                Ok((
-                    "/tmp/out/vmlinux".to_string(),
-                    "/tmp/out/rootfs.ext4".to_string(),
-                ))
-            },
-        )
-        .expect_err("missing libkrun must fail before build dispatch");
-
-        assert!(!called.get(), "build callback must not run without libkrun");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("libkrun is required"), "{msg}");
-        assert!(msg.contains("install libkrun"), "{msg}");
-        assert!(
-            msg.contains("move or delete") && msg.contains("nix/images/builder/flake.nix"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn source_checkout_dev_image_refuses_prebuilt_fallback_on_builder_failure() {
-        let called = Cell::new(false);
-        let err = ensure_source_checkout_dev_image(
-            "/repo/nix/images/builder",
-            "/tmp/out",
-            true,
-            "unused",
-            |_| {
-                called.set(true);
-                anyhow::bail!("Stage 0 builder-VM image bootstrap failed")
-            },
-        )
-        .expect_err("builder failure must not fall back to downloads");
-
-        assert!(
-            called.get(),
-            "build callback should run when libkrun is present"
-        );
-        let msg = format!("{err:#}");
-        assert!(msg.contains("libkrun builder VM build failed"), "{msg}");
-        assert!(
-            msg.contains("Refusing to fall back to the published prebuilt"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("Stage 0 builder-VM image bootstrap failed"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn source_checkout_dev_image_returns_builder_outputs() {
-        let called = Cell::new(false);
-        let result = ensure_source_checkout_dev_image(
-            "/repo/nix/images/builder",
-            "/tmp/out",
-            true,
-            "unused",
-            |out_dir| {
-                called.set(true);
-                assert_eq!(out_dir, "/tmp/out");
-                Ok((
-                    format!("{out_dir}/vmlinux"),
-                    format!("{out_dir}/rootfs.ext4"),
-                ))
-            },
-        )
-        .expect("source checkout build should return builder outputs");
-
-        assert!(called.get(), "build callback should run");
-        assert_eq!(
-            result,
-            (
-                "/tmp/out/vmlinux".to_string(),
-                "/tmp/out/rootfs.ext4".to_string()
-            )
-        );
-    }
-
     // -------------------------------------------------------------------
     // Plan 77 W3 — Stage 0 audit-emit helpers.
     //
-    // The full `bootstrap_builder_vm_image_via_dev_image_stage0`
-    // function takes a real libkrun supervisor and a live builder VM
-    // image cache to exercise — neither available in unit tests. The
-    // tests below pin the *details* of the audit emits (which strings
+    // Tests below pin the *details* of the audit emits (which strings
     // the macro will write into `kind`, `detail`) so that the
     // downstream log shippers don't break on a typo, plus a structural
     // test for the failure-summary truncation rule.
@@ -6279,7 +5203,6 @@ mod builder_vm_bootstrap_tests {
         // refactor from accidentally renaming the variant.
         assert_eq!(Stage0FailureStage::Build.as_str(), "build");
         assert_eq!(Stage0FailureStage::Validate.as_str(), "validate");
-        assert_eq!(Stage0FailureStage::Promote.as_str(), "promote");
         assert_eq!(format!("{}", Stage0FailureStage::Build), "build");
     }
 
@@ -6291,257 +5214,5 @@ mod builder_vm_bootstrap_tests {
         // introduce additional variants (e.g. `"alpine"`). Pinning the
         // current literal here so a rename surfaces immediately.
         assert_eq!(STAGE0_FLAVOR_CURRENT, "current");
-    }
-
-    /// Plan 77 W3 — `run_stage0_bootstrap` returns a tagged
-    /// `(Stage0FailureStage, anyhow::Error)` on every error path so
-    /// the outer caller can attribute the failure to a phase. This
-    /// test pins one of the cheap error paths (non-UTF-8 staging dir)
-    /// to confirm the tagging contract.
-    #[cfg(unix)]
-    #[test]
-    fn run_stage0_bootstrap_tags_non_utf8_staging_as_build_failure() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        use std::path::PathBuf;
-
-        // 0xFF is invalid UTF-8 (RFC 3629). The staging-path check
-        // happens before any I/O, so no actual filesystem support for
-        // non-UTF-8 names is required.
-        let bad = PathBuf::from(OsStr::from_bytes(b"/tmp/non-utf8-\xff"));
-        let final_dir = std::path::Path::new("/tmp/final");
-        let result = run_stage0_bootstrap(
-            &bad,
-            final_dir,
-            "fingerprint",
-            "/repo/nix/images/builder-vm",
-            PathBuf::from("/tmp/kernel"),
-            PathBuf::from("/tmp/rootfs"),
-            Stage0BootstrapOpts::default_image(),
-        );
-        let (stage, err) = result.expect_err("non-UTF-8 staging dir must fail");
-        assert!(matches!(stage, Stage0FailureStage::Build));
-        assert!(
-            err.to_string().contains("non-UTF-8") || err.to_string().contains("not valid UTF-8"),
-            "unexpected error: {err}"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Plan 77 W5 — preflight Stage 0 seed contract check.
-    //
-    // `validate_stage0_seed_contract` is a pure host-side function that
-    // reads `manifest.json` next to a `rootfs.ext4`. These tests exercise
-    // each failure variant with a fixture manifest, plus the happy path,
-    // plus the audit-reason wire format. The full
-    // `bootstrap_builder_vm_image_via_dev_image_stage0` call site is not
-    // exercised here (same rationale as the W3 audit tests above:
-    // requires a live libkrun supervisor).
-    // -------------------------------------------------------------------
-
-    /// Drop a `rootfs.ext4` placeholder + `manifest.json` with the given
-    /// JSON body into a fresh tempdir; return the rootfs path the
-    /// validator takes as input. The rootfs contents don't matter (the
-    /// validator only reads its parent dir's `manifest.json`), so we
-    /// keep the byte count tiny.
-    fn write_seed_manifest_fixture(
-        tmp: &std::path::Path,
-        manifest_json: &str,
-    ) -> std::path::PathBuf {
-        let rootfs = tmp.join("rootfs.ext4");
-        std::fs::write(&rootfs, b"stub-rootfs-for-tests").expect("write rootfs stub");
-        std::fs::write(tmp.join("manifest.json"), manifest_json).expect("write manifest fixture");
-        rootfs
-    }
-
-    const VALID_MANIFEST_JSON: &str = r#"{
-      "schema_version": 1,
-      "contract_version": 2,
-      "image_kind": "dev",
-      "system": "aarch64-linux",
-      "init_paths": ["/sbin/mvm-host-vm-init"]
-    }"#;
-
-    #[test]
-    fn validate_stage0_seed_contract_accepts_well_formed_manifest() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let rootfs = write_seed_manifest_fixture(tmp.path(), VALID_MANIFEST_JSON);
-        validate_stage0_seed_contract(&rootfs).expect("valid manifest must pass");
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_accepts_manifest_without_system_field() {
-        // `system` is informational and defaulted on the deserializer.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = r#"{
-          "schema_version": 1,
-          "contract_version": 2,
-          "image_kind": "dev",
-          "init_paths": ["/sbin/mvm-host-vm-init"]
-        }"#;
-        let rootfs = write_seed_manifest_fixture(tmp.path(), manifest);
-        validate_stage0_seed_contract(&rootfs)
-            .expect("manifest without optional `system` must still pass");
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_rejects_missing_manifest() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let rootfs = tmp.path().join("rootfs.ext4");
-        std::fs::write(&rootfs, b"stub").expect("write rootfs stub");
-        // No manifest.json written.
-        let err = validate_stage0_seed_contract(&rootfs).expect_err("missing manifest must fail");
-        assert!(matches!(err, SeedContractError::MissingManifest { .. }));
-        assert_eq!(err.audit_reason(), "seed_contract_missing_manifest");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("missing `manifest.json`") && msg.contains("seed-contract requirement"),
-            "remediation message must point the user at the fix: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_rejects_malformed_json() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let rootfs = write_seed_manifest_fixture(tmp.path(), "{ not valid json");
-        let err = validate_stage0_seed_contract(&rootfs).expect_err("malformed json must fail");
-        assert!(matches!(err, SeedContractError::MalformedJson { .. }));
-        assert_eq!(err.audit_reason(), "seed_contract_malformed_json");
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_rejects_future_schema_version() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = format!(
-            r#"{{
-              "schema_version": {},
-              "contract_version": 2,
-              "image_kind": "dev",
-              "init_paths": ["/sbin/mvm-host-vm-init"]
-            }}"#,
-            STAGE0_SUPPORTED_MANIFEST_SCHEMA + 1
-        );
-        let rootfs = write_seed_manifest_fixture(tmp.path(), &manifest);
-        let err = validate_stage0_seed_contract(&rootfs).expect_err("future schema must fail");
-        assert!(matches!(err, SeedContractError::UnsupportedSchema { .. }));
-        assert_eq!(err.audit_reason(), "seed_contract_unsupported_schema");
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_rejects_wrong_image_kind() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = r#"{
-          "schema_version": 1,
-          "contract_version": 2,
-          "image_kind": "builder-vm",
-          "init_paths": ["/sbin/mvm-host-vm-init"]
-        }"#;
-        let rootfs = write_seed_manifest_fixture(tmp.path(), manifest);
-        let err = validate_stage0_seed_contract(&rootfs).expect_err("wrong image_kind must fail");
-        assert!(matches!(err, SeedContractError::WrongImageKind { .. }));
-        assert_eq!(err.audit_reason(), "seed_contract_wrong_image_kind");
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_rejects_contract_stale() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = format!(
-            r#"{{
-              "schema_version": 1,
-              "contract_version": {},
-              "image_kind": "dev",
-              "init_paths": ["/sbin/mvm-host-vm-init"]
-            }}"#,
-            STAGE0_REQUIRED_CONTRACT_VERSION - 1
-        );
-        let rootfs = write_seed_manifest_fixture(tmp.path(), &manifest);
-        let err =
-            validate_stage0_seed_contract(&rootfs).expect_err("stale contract_version must fail");
-        assert!(matches!(err, SeedContractError::ContractStale { .. }));
-        assert_eq!(err.audit_reason(), "seed_contract_stale");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("rebuild") || msg.contains("import-image"),
-            "remediation should mention rebuild or import-image: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_stage0_seed_contract_rejects_missing_required_init_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let manifest = r#"{
-          "schema_version": 1,
-          "contract_version": 2,
-          "image_kind": "dev",
-          "init_paths": ["/sbin/some-other-init"]
-        }"#;
-        let rootfs = write_seed_manifest_fixture(tmp.path(), manifest);
-        let err = validate_stage0_seed_contract(&rootfs)
-            .expect_err("missing required init path must fail");
-        let SeedContractError::MissingInitPath { missing, .. } = &err else {
-            panic!("expected MissingInitPath, got {err:?}");
-        };
-        assert_eq!(*missing, "/sbin/mvm-host-vm-init");
-        assert_eq!(err.audit_reason(), "seed_contract_missing_init_path");
-    }
-
-    #[test]
-    fn seed_contract_error_audit_reasons_have_no_unsafe_chars() {
-        // The audit detail format is space-separated `key=value` pairs.
-        // Each `reason=<variant>` string must not contain `=`, spaces,
-        // commas, or newlines — otherwise downstream parsers (the
-        // dashboards reading `~/.mvm/audit/<tenant>.jsonl`) misattribute
-        // the field.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let rootfs = tmp.path().join("rootfs.ext4");
-        std::fs::write(&rootfs, b"stub").unwrap();
-
-        let cases = [
-            SeedContractError::MissingManifest {
-                manifest_path: rootfs.clone(),
-            },
-            SeedContractError::UnreadableManifest {
-                manifest_path: rootfs.clone(),
-                source: std::io::Error::other("x"),
-            },
-            // Skip MalformedJson — `serde_json::Error` has no public
-            // constructor for tests. Its `audit_reason` is exercised by
-            // the dedicated test above and the const-string match arm
-            // can't drift from this list without compilation breaking.
-            SeedContractError::UnsupportedSchema {
-                manifest_path: rootfs.clone(),
-                actual: 99,
-                supported: 1,
-            },
-            SeedContractError::WrongImageKind {
-                manifest_path: rootfs.clone(),
-                actual: "builder-vm".to_string(),
-                expected: "dev",
-            },
-            SeedContractError::ContractStale {
-                manifest_path: rootfs.clone(),
-                actual: 1,
-                required: 2,
-            },
-            SeedContractError::MissingInitPath {
-                manifest_path: rootfs.clone(),
-                missing: "/sbin/mvm-host-vm-init",
-                present: vec!["/sbin/other".to_string()],
-            },
-        ];
-        for case in cases {
-            let r = case.audit_reason();
-            assert!(!r.contains('='), "audit_reason must not contain `=`: {r}");
-            assert!(!r.contains(' '), "audit_reason must not contain space: {r}");
-            assert!(!r.contains(','), "audit_reason must not contain `,`: {r}");
-            assert!(
-                !r.contains('\n'),
-                "audit_reason must not contain newline: {r}"
-            );
-            assert!(
-                r.starts_with("seed_contract_"),
-                "audit_reason must namespace with seed_contract_: {r}"
-            );
-        }
     }
 }

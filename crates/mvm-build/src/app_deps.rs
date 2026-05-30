@@ -314,8 +314,9 @@ impl<T: BuilderVm> InstallDriver for T {
         // Plan 115 / ADR-064: install jobs don't embed host-vm binaries
         // into a rootfs, so host_bin_dir is unused. Use a private temp
         // dir as a valid placeholder so validate_mounts passes.
-        let _host_bins_tmp = tempfile::TempDir::new()
-            .map_err(|e| BuilderVmError::ExtractionFailed(format!("creating temp host_bin_dir: {e}")))?;
+        let _host_bins_tmp = tempfile::TempDir::new().map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!("creating temp host_bin_dir: {e}"))
+        })?;
         let mounts = BuilderMounts {
             flake_src: source_root.to_path_buf(),
             host_nix_store: None,

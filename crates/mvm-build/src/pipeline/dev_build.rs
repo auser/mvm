@@ -559,8 +559,8 @@ fn dev_build_with_builder_vm<B: crate::builder_vm::BuilderVm>(
     // user-flake builds (mvmctl build / dev up against the user's flake).
     // User flakes do not embed host-vm binaries, so /mvm-bins is unused
     // here. A temp dir satisfies validate_mounts' directory-exists check.
-    let host_bins_tmp = tempfile::TempDir::new()
-        .with_context(|| "creating temp host_bin_dir for dev build")?;
+    let host_bins_tmp =
+        tempfile::TempDir::new().with_context(|| "creating temp host_bin_dir for dev build")?;
     let mounts = BuilderMounts {
         flake_src,
         host_nix_store: None,
