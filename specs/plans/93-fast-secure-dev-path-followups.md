@@ -148,6 +148,28 @@ PR-A is ~150-250 lines, ships in 1-2 days.
 
 ## Phase 1 — fast Layer 2 dev cycles
 
+> **SUPERSEDED by [ADR-064](../adrs/064-single-builder-dev-image.md)
+> (Proposed 2026-05-29).** ADR-064 landed on `main` while Phases 1–3
+> were in flight and reshapes this phase end-to-end, so the Lever 1/2
+> design below is retained only for history — **do not implement it as
+> written.** Reconciliation:
+> - **Lever 1** (split `nix/images/builder/flake.nix` into
+>   `dev-minimal`/`dev-compile`) → ADR-064 **deletes** that flake and
+>   makes `nix/images/builder-vm/flake.nix` the single flake with
+>   `default` (headless) + `dev` (interactive) attributes.
+> - **Lever 2** (host **musl** cross-compile + virtiofs **bind-mount**
+>   into the running dev shell) → ADR-064 **embeds** the Linux binaries
+>   into `mvmctl` at *mvmctl's own* build time (`build.rs` + `cargo
+>   zigbuild --target aarch64-unknown-linux-gnu` + `include_bytes!`),
+>   extracted at runtime to `~/.cache/mvm/host-bins/`. This uses
+>   **glibc via zigbuild, not static musl** — the musl decision recorded
+>   in the Context above is therefore moot.
+>
+> PR-4..8 are **deferred**; the new Phase 1 is "implement ADR-064,"
+> coordinated with the `specs/prompts/93-phase-1-2-3-fast-secure-dev.md`
+> track rather than raced. Phase 2 (PR-9/10) and the shipped Phase 0 /
+> PR-1/2/3 observability work are unaffected.
+
 Decoupled from Stage 0. The dev-shell flake at
 `nix/images/builder/flake.nix` builds the rootfs contributors
 `dev shell` into. Today it pulls rustc + cargo + gcc + busy
