@@ -45,7 +45,9 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::builder_protocol::{BootTimingsWire, HostVmRequest, HostVmResponse, JobId, JobTimings};
+use crate::builder_protocol::{
+    BootTimingsWire, HostVmRequest, HostVmResponse, JobId, JobTimings, WorkloadId,
+};
 use crate::builder_vm::BuilderJob;
 
 /// Plan 89 W3 part 14 — host-side hook the persistent dispatch
@@ -140,6 +142,30 @@ pub struct DispatchOutcome {
     pub job_timings: JobTimings,
 }
 
+/// Plan 107 A4 — the spawn config for a nested workload microVM,
+/// the host-side input to [`HostVmRequest::WorkloadStart`]. All
+/// paths are resolved *inside the host VM* (see the protocol doc);
+/// A4's backend branch stages the artifacts into a host-VM share and
+/// fills these with the guest-visible paths.
+#[derive(Debug, Clone)]
+pub struct WorkloadStartParams {
+    pub kernel_path: String,
+    pub rootfs_path: String,
+    pub vsock_socket_dir: String,
+    pub vcpus: u32,
+    pub memory_mib: u32,
+    pub kernel_cmdline_extras: String,
+}
+
+/// Plan 107 A4 — outcome of a successful `WorkloadStart` dispatch:
+/// the host-minted id the guest echoed and the spawned VMM pid
+/// (inside the host VM) the host tracks for lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadStartOutcome {
+    pub workload_id: WorkloadId,
+    pub pid: u32,
+}
+
 /// Typed error surface for [`PersistentBuilderSupervisor`].
 #[derive(Debug, Error)]
 pub enum PersistentBuilderError {
@@ -182,6 +208,25 @@ pub enum PersistentBuilderError {
     /// mid-flight). Caller should rebuild the supervisor.
     #[error("dispatch mutex poisoned — caller must restart the supervisor")]
     MutexPoisoned,
+
+    /// Plan 107 A4 — the guest returned [`HostVmResponse::WorkloadFailed`]
+    /// for a workload lifecycle request (spawn / stop). Carries the
+    /// guest's failure reason.
+    #[error("workload {workload_id} failed in host VM: {error}")]
+    WorkloadFailed {
+        workload_id: WorkloadId,
+        error: String,
+    },
+
+    /// Plan 107 A4 — the guest answered a workload request with a
+    /// frame of the wrong kind (e.g. a `WorkloadStopped` for a
+    /// `WorkloadStart`). A protocol violation — the dispatch loop is
+    /// corrupted or out of sync.
+    #[error("unexpected response to {expected}: got {got}")]
+    UnexpectedResponse {
+        expected: &'static str,
+        got: &'static str,
+    },
 }
 
 /// Persistent builder VM dispatch supervisor.
@@ -312,6 +357,117 @@ impl PersistentBuilderSupervisor {
         }
     }
 
+    /// Plan 107 A4 — dispatch a [`HostVmRequest::WorkloadStart`] to
+    /// the host VM, which spawns the workload microVM (Firecracker)
+    /// inside itself. Mints a fresh [`WorkloadId`], returns the
+    /// echoed id + spawned VMM pid on success, or
+    /// [`PersistentBuilderError::WorkloadFailed`] if the guest
+    /// refused. Workload requests get a single reply (no streaming),
+    /// so this uses [`Self::dispatch_single_response`] rather than the
+    /// build-job [`Self::dispatch`] streaming loop.
+    pub fn submit_workload_start(
+        &self,
+        params: WorkloadStartParams,
+    ) -> Result<WorkloadStartOutcome, PersistentBuilderError> {
+        let _guard = self
+            .dispatch_mutex
+            .lock()
+            .map_err(|_| PersistentBuilderError::MutexPoisoned)?;
+        let workload_id = WorkloadId::new();
+        let request = HostVmRequest::WorkloadStart {
+            workload_id,
+            kernel_path: params.kernel_path,
+            rootfs_path: params.rootfs_path,
+            vsock_socket_dir: params.vsock_socket_dir,
+            vcpus: params.vcpus,
+            memory_mib: params.memory_mib,
+            kernel_cmdline_extras: params.kernel_cmdline_extras,
+        };
+        match self.dispatch_single_response(&request)? {
+            HostVmResponse::WorkloadStarted {
+                workload_id: got,
+                pid,
+            } => Ok(WorkloadStartOutcome {
+                workload_id: got,
+                pid,
+            }),
+            HostVmResponse::WorkloadFailed { workload_id, error } => {
+                Err(PersistentBuilderError::WorkloadFailed { workload_id, error })
+            }
+            other => Err(PersistentBuilderError::UnexpectedResponse {
+                expected: "workload_started",
+                got: response_kind(&other),
+            }),
+        }
+    }
+
+    /// Plan 107 A4 — dispatch a [`HostVmRequest::WorkloadStop`] and
+    /// confirm the guest tore the workload down.
+    pub fn submit_workload_stop(
+        &self,
+        workload_id: WorkloadId,
+    ) -> Result<(), PersistentBuilderError> {
+        let _guard = self
+            .dispatch_mutex
+            .lock()
+            .map_err(|_| PersistentBuilderError::MutexPoisoned)?;
+        let request = HostVmRequest::WorkloadStop { workload_id };
+        match self.dispatch_single_response(&request)? {
+            HostVmResponse::WorkloadStopped { .. } => Ok(()),
+            HostVmResponse::WorkloadFailed { workload_id, error } => {
+                Err(PersistentBuilderError::WorkloadFailed { workload_id, error })
+            }
+            other => Err(PersistentBuilderError::UnexpectedResponse {
+                expected: "workload_stopped",
+                got: response_kind(&other),
+            }),
+        }
+    }
+
+    /// Plan 107 A4 — dispatch a [`HostVmRequest::WorkloadStatus`].
+    /// Returns the guest's status string (`"running"` / `"stopped"`
+    /// / `"not_found"`).
+    pub fn submit_workload_status(
+        &self,
+        workload_id: WorkloadId,
+    ) -> Result<String, PersistentBuilderError> {
+        let _guard = self
+            .dispatch_mutex
+            .lock()
+            .map_err(|_| PersistentBuilderError::MutexPoisoned)?;
+        let request = HostVmRequest::WorkloadStatus { workload_id };
+        match self.dispatch_single_response(&request)? {
+            HostVmResponse::WorkloadStatusReport { status, .. } => Ok(status),
+            HostVmResponse::WorkloadFailed { workload_id, error } => {
+                Err(PersistentBuilderError::WorkloadFailed { workload_id, error })
+            }
+            other => Err(PersistentBuilderError::UnexpectedResponse {
+                expected: "workload_status_report",
+                got: response_kind(&other),
+            }),
+        }
+    }
+
+    /// Connect, write `request`, and read exactly one response frame.
+    /// Used by the workload lifecycle calls, which (unlike build-job
+    /// dispatch) expect a single reply rather than a stderr stream +
+    /// terminating Result. A clean EOF before any frame is a
+    /// [`PersistentBuilderError::PrematureEof`] (guest crashed).
+    fn dispatch_single_response(
+        &self,
+        request: &HostVmRequest,
+    ) -> Result<HostVmResponse, PersistentBuilderError> {
+        let mut stream = self.connect()?;
+        let _ = stream.set_read_timeout(Some(self.frame_read_timeout));
+        let _ = stream.set_write_timeout(Some(self.frame_read_timeout));
+        mvm_guest::vsock::write_frame(&mut stream, request)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        match read_next_response(&mut stream, self.frame_read_timeout)? {
+            Some(resp) => Ok(resp),
+            None => Err(PersistentBuilderError::PrematureEof { chunks: 0 }),
+        }
+    }
+
     /// Send a [`HostVmRequest::Shutdown`] to the guest's dispatch
     /// loop and wait for the matching [`HostVmResponse::Bye`].
     /// Consumes `self` because the supervisor is one-shot after
@@ -424,6 +580,20 @@ impl PersistentBuilderSupervisor {
                 }
             }
         }
+    }
+}
+
+/// The wire `kind` tag of a response, for `UnexpectedResponse`
+/// diagnostics. Mirrors the serde `rename_all = "snake_case"` tags.
+fn response_kind(resp: &HostVmResponse) -> &'static str {
+    match resp {
+        HostVmResponse::StderrChunk { .. } => "stderr_chunk",
+        HostVmResponse::Result { .. } => "result",
+        HostVmResponse::Bye {} => "bye",
+        HostVmResponse::WorkloadStarted { .. } => "workload_started",
+        HostVmResponse::WorkloadStopped { .. } => "workload_stopped",
+        HostVmResponse::WorkloadStatusReport { .. } => "workload_status_report",
+        HostVmResponse::WorkloadFailed { .. } => "workload_failed",
     }
 }
 
