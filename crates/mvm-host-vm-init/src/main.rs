@@ -101,6 +101,13 @@ mod proxy;
 /// signal-based stop/status helpers are Linux-only.
 #[allow(dead_code)]
 mod workload;
+/// Plan 107 A3 — in-host-VM vsock forwarder (the nesting hop). The
+/// cross-platform CONNECT+splice core is unit-tested on every host;
+/// the AF_VSOCK listener wiring (A3.b) is Linux-only. `unix`-gated
+/// because it uses `UnixStream` (the crate is inert on Windows).
+#[cfg(unix)]
+#[allow(dead_code)]
+mod workload_proxy;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
@@ -794,13 +801,14 @@ mod linux {
         fn close(fd: i32) -> i32;
     }
 
-    /// Open + bind + listen an AF_VSOCK socket on
-    /// [`BUILDER_DISPATCH_PORT`]. Returns the listening fd or
-    /// `None` on any setup failure (with stderr breadcrumb).
-    /// `accept_timeout_secs = Some(n)` applies `SO_RCVTIMEO` so
-    /// subsequent `accept()` calls bound the wait at `n`s; `None`
-    /// means accept blocks until a peer connects.
-    fn open_dispatch_listener_fd(accept_timeout_secs: Option<i64>) -> Option<i32> {
+    /// Open + bind + listen an AF_VSOCK socket on `port`. Returns the
+    /// listening fd or `None` on any setup failure (with stderr
+    /// breadcrumb). `accept_timeout_secs = Some(n)` applies
+    /// `SO_RCVTIMEO` so subsequent `accept()` calls bound the wait at
+    /// `n`s; `None` means accept blocks until a peer connects. Used
+    /// for both the dispatch port (21471) and the Plan 107 A3
+    /// workload-forward port (21472).
+    fn open_vsock_listener_fd(port: u32, accept_timeout_secs: Option<i64>) -> Option<i32> {
         let listen_fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if listen_fd < 0 {
             eprintln!("mvm-host-vm-init: vsock: socket() failed");
@@ -809,7 +817,7 @@ mod linux {
         let addr = SockAddrVm {
             svm_family: AF_VSOCK as u16,
             svm_reserved1: 0,
-            svm_port: BUILDER_DISPATCH_PORT,
+            svm_port: port,
             svm_cid: VMADDR_CID_ANY,
             svm_zero: [0; 4],
         };
@@ -821,7 +829,7 @@ mod linux {
             )
         };
         if rc < 0 {
-            eprintln!("mvm-host-vm-init: vsock: bind() failed on port {BUILDER_DISPATCH_PORT}");
+            eprintln!("mvm-host-vm-init: vsock: bind() failed on port {port}");
             unsafe { close(listen_fd) };
             return None;
         }
@@ -869,6 +877,49 @@ mod linux {
         unsafe { std::fs::File::from_raw_fd(conn_fd) }
     }
 
+    /// Plan 107 A3 — the workload-vsock forwarder listener. Binds the
+    /// AF_VSOCK [`crate::workload_proxy::WORKLOAD_FORWARD_PORT`] and
+    /// loops accepting outer-host connections, handing each to
+    /// [`crate::workload_proxy::handle_forward_conn`] on its own
+    /// thread (the handler reads the multiplex handshake, resolves the
+    /// named workload's `v.sock`, and splices). Runs for the VM's
+    /// lifetime; spawned as a background thread at dispatch-loop entry.
+    /// Never returns under normal operation.
+    fn run_forward_listener() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::path::Path;
+
+        let Some(listen_fd) =
+            open_vsock_listener_fd(crate::workload_proxy::WORKLOAD_FORWARD_PORT, None)
+        else {
+            eprintln!("mvm-host-vm-init: forward listener: setup failed (nesting hop disabled)");
+            return;
+        };
+        eprintln!(
+            "mvm-host-vm-init: forward listener ready on AF_VSOCK port {}",
+            crate::workload_proxy::WORKLOAD_FORWARD_PORT
+        );
+        loop {
+            let Some(conn_fd) = accept_one(listen_fd) else {
+                eprintln!("mvm-host-vm-init: forward listener: accept failed (retrying)");
+                continue;
+            };
+            std::thread::spawn(move || {
+                // The accepted fd is an AF_VSOCK SOCK_STREAM socket;
+                // UnixStream only touches its read/write/clone, so
+                // wrapping it is sound (address family is irrelevant).
+                let inbound = unsafe { UnixStream::from_raw_fd(conn_fd) };
+                if let Err(e) = crate::workload_proxy::handle_forward_conn(
+                    inbound,
+                    Path::new(crate::workload::WORKLOAD_STATE_BASE),
+                ) {
+                    eprintln!("mvm-host-vm-init: forward conn ended: {e}");
+                }
+            });
+        }
+    }
+
     /// Write a length-prefixed (u32 BE) frame on an existing conn.
     /// Mirrors `mvm_guest::vsock::write_frame`. Returns `true` on
     /// successful full-frame write. Doesn't close — caller owns
@@ -908,7 +959,9 @@ mod linux {
 
     fn send_dispatch_response_via_vsock(payload: &crate::dispatch_response::DispatchResponse) {
         const ACCEPT_TIMEOUT_SECS: i64 = 10;
-        let Some(listen_fd) = open_dispatch_listener_fd(Some(ACCEPT_TIMEOUT_SECS)) else {
+        let Some(listen_fd) =
+            open_vsock_listener_fd(BUILDER_DISPATCH_PORT, Some(ACCEPT_TIMEOUT_SECS))
+        else {
             return;
         };
         let Some(conn_fd) = accept_one(listen_fd) else {
@@ -955,7 +1008,14 @@ mod linux {
         // blocks waiting for the supervisor's next submit. The
         // outer `mvmctl dev down` signals shutdown via a
         // `HostVmRequest::Shutdown` frame on a fresh connection.
-        let Some(listen_fd) = open_dispatch_listener_fd(None) else {
+        // Plan 107 A3 — bring up the workload-vsock forwarder before
+        // the dispatch loop. It runs for the VM's lifetime on its own
+        // AF_VSOCK port, bridging the outer host to each workload's
+        // Firecracker v.sock. Failure here is non-fatal: builds still
+        // dispatch; only the nesting hop is unavailable (logged).
+        std::thread::spawn(run_forward_listener);
+
+        let Some(listen_fd) = open_vsock_listener_fd(BUILDER_DISPATCH_PORT, None) else {
             eprintln!("mvm-host-vm-init: dispatch loop: listener setup failed");
             return 1;
         };

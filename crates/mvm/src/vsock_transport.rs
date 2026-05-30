@@ -161,6 +161,59 @@ impl VsockTransport for VsockProxyTransport {
     }
 }
 
+/// Connects through the Plan 107 A3 nesting hop: the outer host
+/// reaches a workload microVM's vsock *via* the long-lived libkrun
+/// host VM. The hop socket is the host VM's libkrun UDS for
+/// [`mvm_guest::builder_agent::WORKLOAD_FORWARD_PORT`]
+/// (`<vm_state_dir>/vsock-21472.sock`). On connect, the host writes a
+/// `<workload_id> <port>` handshake and the in-host-VM forwarder
+/// (`mvm_host_vm_init::workload_proxy`) multiplexes the stream to that
+/// workload's Firecracker `v.sock`. The workload guest agent is
+/// unchanged — it still sees vsock CID 3, just one nesting level in.
+pub struct NestingHopTransport {
+    hop_socket_path: PathBuf,
+    workload_id: String,
+}
+
+impl NestingHopTransport {
+    pub fn new(hop_socket_path: impl Into<PathBuf>, workload_id: impl Into<String>) -> Self {
+        Self {
+            hop_socket_path: hop_socket_path.into(),
+            workload_id: workload_id.into(),
+        }
+    }
+
+    /// Build the hop transport for a host VM whose libkrun vsock
+    /// sockets live under `vm_state_dir`, targeting `workload_id`. The
+    /// forward-port socket name mirrors libkrun's `vsock-<port>.sock`
+    /// convention.
+    pub fn for_host_vm(vm_state_dir: impl Into<PathBuf>, workload_id: impl Into<String>) -> Self {
+        let dir: PathBuf = vm_state_dir.into();
+        let hop = dir.join(format!(
+            "vsock-{}.sock",
+            mvm_guest::builder_agent::WORKLOAD_FORWARD_PORT
+        ));
+        Self::new(hop, workload_id)
+    }
+}
+
+impl VsockTransport for NestingHopTransport {
+    fn connect(&self, port: u32) -> Result<UnixStream> {
+        let mut stream = UnixStream::connect(&self.hop_socket_path).with_context(|| {
+            format!(
+                "Failed to connect to nesting hop at {}",
+                self.hop_socket_path.display()
+            )
+        })?;
+        let handshake =
+            mvm_guest::builder_agent::encode_workload_forward_handshake(&self.workload_id, port);
+        stream
+            .write_all(&handshake)
+            .with_context(|| "Failed to write nesting-hop handshake")?;
+        Ok(stream)
+    }
+}
+
 /// Pick a transport for a VM by name.
 ///
 /// Probes Apple Container first by attempting a real connect to the
@@ -238,5 +291,61 @@ mod tests {
             msg.contains("/tmp/no-such-libkrun-vm"),
             "error didn't mention socket dir: {msg}"
         );
+    }
+
+    #[test]
+    fn nesting_hop_for_host_vm_derives_forward_socket_path() {
+        let t = NestingHopTransport::for_host_vm("/tmp/vm-state", "wl-1");
+        assert_eq!(
+            t.hop_socket_path,
+            PathBuf::from("/tmp/vm-state/vsock-21472.sock")
+        );
+        assert_eq!(t.workload_id, "wl-1");
+    }
+
+    #[test]
+    fn nesting_hop_connect_error_mentions_hop_path() {
+        let t = NestingHopTransport::new("/tmp/no-such-hop-21472.sock", "wl-1");
+        let err = t
+            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+            .expect_err("should fail to connect");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nesting hop") && msg.contains("/tmp/no-such-hop-21472.sock"),
+            "error didn't mention hop path: {msg}"
+        );
+    }
+
+    #[test]
+    fn nesting_hop_writes_handshake_on_connect() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hop = dir.path().join("vsock-21472.sock");
+        let listener = UnixListener::bind(&hop).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut len = [0u8; 4];
+            conn.read_exact(&mut len).unwrap();
+            let n = u32::from_be_bytes(len) as usize;
+            let mut body = vec![0u8; n];
+            conn.read_exact(&mut body).unwrap();
+            (len.to_vec(), body)
+        });
+
+        let t = NestingHopTransport::new(&hop, "wl-abc");
+        let _stream = t.connect(5252).expect("connect + handshake");
+
+        let (len, body) = server.join().unwrap();
+        // The bytes on the wire must be exactly what the shared
+        // host-side encoder produces (which the guest forwarder
+        // parses) — pins the hop wire shape end-to-end.
+        let mut expected =
+            mvm_guest::builder_agent::encode_workload_forward_handshake("wl-abc", 5252);
+        let expected_body = expected.split_off(4);
+        assert_eq!(len, expected, "length prefix mismatch");
+        assert_eq!(body, expected_body, "handshake body mismatch");
+        assert_eq!(String::from_utf8(body).unwrap(), "wl-abc 5252");
     }
 }

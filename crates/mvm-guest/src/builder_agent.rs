@@ -34,6 +34,32 @@ pub const BUILDER_AGENT_PORT: u32 = 21470;
 /// guest. The guest-side send code lands in W2 part 3.
 pub const BUILDER_DISPATCH_PORT: u32 = 21471;
 
+/// Plan 107 A3 — AF_VSOCK port the in-host-VM workload forwarder
+/// listens on (the nesting hop). Registered on the persistent host
+/// VM's libkrun vsock config alongside [`BUILDER_DISPATCH_PORT`]; the
+/// host opens `<vm_state_dir>/vsock-21472.sock` and the forwarder
+/// multiplexes per workload (see
+/// `mvm_host_vm_init::workload_proxy`). Must stay in lock-step with
+/// the guest's hardcoded `WORKLOAD_FORWARD_PORT` (the guest init
+/// deliberately doesn't depend on `mvm-guest`); the literal-pin tests
+/// on each side catch divergence.
+pub const WORKLOAD_FORWARD_PORT: u32 = 21472;
+
+/// Plan 107 A3 — encode the workload-forward multiplex handshake the
+/// in-host-VM forwarder reads before splicing: a u32-BE length prefix
+/// followed by UTF-8 `"<workload_id> <port>"`. The host's
+/// `NestingHopTransport` writes this on connect; the guest side
+/// (`mvm_host_vm_init::workload_proxy::read_handshake`) parses it.
+/// Both pin the exact byte layout by test (the guest can't reference
+/// this crate), so this is the single host-side definition.
+pub fn encode_workload_forward_handshake(workload_id: &str, port: u32) -> Vec<u8> {
+    let body = format!("{workload_id} {port}");
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
 /// Outgoing responses/log frames from the builder agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HostVmResponse {
@@ -213,6 +239,23 @@ pub fn handle_request(req: HostVmRequest) -> Result<HostVmResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_forward_port_literal_is_21472() {
+        // Pin the host-side port; the guest hardcodes the same literal
+        // (it can't depend on this crate). Divergence breaks the hop.
+        assert_eq!(WORKLOAD_FORWARD_PORT, 21472);
+    }
+
+    #[test]
+    fn workload_forward_handshake_byte_layout_is_pinned() {
+        // u32-BE length prefix + UTF-8 "<id> <port>". The guest's
+        // `workload_proxy::encode_handshake` asserts the *same* bytes
+        // for the same input, so the two implementations can't drift.
+        let bytes = encode_workload_forward_handshake("ab", 5);
+        // body "ab 5" = 4 bytes.
+        assert_eq!(bytes, vec![0, 0, 0, 4, b'a', b'b', b' ', b'5']);
+    }
 
     #[test]
     fn serde_round_trip() {
