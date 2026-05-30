@@ -1,4 +1,4 @@
-use mvm_cli::doctor::{ZigbuildProbe, probe_zigbuild};
+use mvm_cli::doctor::probe_zigbuild;
 
 #[test]
 fn probe_reports_pinned_versions_from_workspace_metadata() {

@@ -2097,6 +2097,43 @@ fn security_snapshot_dirs_check() -> Check {
     }
 }
 
+/// Pinned cross-compile toolchain versions, parsed at build time from
+/// the workspace's [workspace.metadata.mvm.toolchain] block.
+pub struct ZigbuildProbe {
+    pub pinned_zig: String,
+    pub pinned_cargo_zigbuild: String,
+    pub pinned_target: String,
+    pub installed_zig: Option<String>,
+    pub installed_cargo_zigbuild: Option<String>,
+}
+
+/// Read the pinned versions baked in at compile time and probe the
+/// installed versions on the host. Used by `mvmctl doctor` to warn
+/// when contributor toolchain drifts from the pin.
+pub fn probe_zigbuild() -> ZigbuildProbe {
+    ZigbuildProbe {
+        pinned_zig: env!("MVM_PINNED_ZIG").to_string(),
+        pinned_cargo_zigbuild: env!("MVM_PINNED_CARGO_ZIGBUILD").to_string(),
+        pinned_target: env!("MVM_PINNED_TARGET").to_string(),
+        installed_zig: which_version("zig", &["version"]),
+        installed_cargo_zigbuild: which_version("cargo-zigbuild", &["--version"]),
+    }
+}
+
+/// Returns the trimmed stdout of `cmd <args...>` when the process
+/// runs and exits 0; returns `None` for any failure mode (binary
+/// not found, non-zero exit, non-UTF-8 output). Used by tool-presence
+/// probes where "I couldn't ask the tool its version" is reported
+/// as "not usefully installed" — the caller surfaces that to the
+/// doctor output, not as a hard error.
+fn which_version(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3066,35 +3103,4 @@ mod tests {
             c.info
         );
     }
-}
-
-/// Pinned cross-compile toolchain versions, parsed at build time from
-/// the workspace's [workspace.metadata.mvm.toolchain] block.
-pub struct ZigbuildProbe {
-    pub pinned_zig: String,
-    pub pinned_cargo_zigbuild: String,
-    pub pinned_target: String,
-    pub installed_zig: Option<String>,
-    pub installed_cargo_zigbuild: Option<String>,
-}
-
-/// Read the pinned versions baked in at compile time and probe the
-/// installed versions on the host. Used by `mvmctl doctor` to warn
-/// when contributor toolchain drifts from the pin.
-pub fn probe_zigbuild() -> ZigbuildProbe {
-    ZigbuildProbe {
-        pinned_zig: env!("MVM_PINNED_ZIG").to_string(),
-        pinned_cargo_zigbuild: env!("MVM_PINNED_CARGO_ZIGBUILD").to_string(),
-        pinned_target: env!("MVM_PINNED_TARGET").to_string(),
-        installed_zig: which_version("zig", &["version"]),
-        installed_cargo_zigbuild: which_version("cargo-zigbuild", &["--version"]),
-    }
-}
-
-fn which_version(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
