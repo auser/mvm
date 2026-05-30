@@ -673,4 +673,39 @@ mod tests {
         approx(it.total_ready_ms, 40.0);
         assert!(it.total_ready_ms >= it.start_to_pid_ms);
     }
+
+    /// Live boot of the canonical default-microvm image through the
+    /// real admission path. Gated behind `libkrun-live` so stock CI
+    /// (no Hypervisor.framework nested virt) skips it; runs on a dev
+    /// host / self-hosted macOS runner with the slp/krun trio + an
+    /// `mvm-libkrun-supervisor` on the launch path.
+    #[cfg(feature = "libkrun-live")]
+    #[test]
+    fn live_probe_returns_finite_ordered_spans() {
+        let mut probe = LibkrunProbe::new(&MicrovmLaunchArgs {
+            runs: 1,
+            warmup: 0,
+            hypervisor: "libkrun".to_string(),
+            out: None,
+            json: false,
+            baseline: None,
+            max_regression_pct: 10.0,
+        })
+        .unwrap();
+        let it = probe
+            .measure_once()
+            .expect("live boot should succeed on a libkrun host");
+        for v in [
+            it.start_to_pid_ms,
+            it.pid_to_connect_ms,
+            it.handshake_ms,
+            it.total_ready_ms,
+        ] {
+            assert!(
+                v.is_finite() && v >= 0.0,
+                "span must be finite and non-negative: {v}"
+            );
+        }
+        assert!(it.total_ready_ms >= it.start_to_pid_ms);
+    }
 }
