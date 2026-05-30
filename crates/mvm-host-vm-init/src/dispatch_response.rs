@@ -113,12 +113,60 @@ pub(crate) fn stderr_chunk_json(job_id: &str, line: &str) -> String {
     out
 }
 
+/// Plan 107 A2.2 — wire JSON for `HostVmResponse::WorkloadStarted`
+/// (`{"kind":"workload_started","workload_id":"...","pid":N}`).
+/// Mirrors the serde-derived field order; the cross-validation test
+/// below pins it against the typed enum.
+pub(crate) fn workload_started_json(workload_id: &str, pid: u32) -> String {
+    let mut out = String::with_capacity(80 + workload_id.len());
+    out.push_str(r#"{"kind":"workload_started","workload_id":""#);
+    push_json_string(&mut out, workload_id);
+    out.push_str(r#"","pid":"#);
+    out.push_str(&pid.to_string());
+    out.push('}');
+    out
+}
+
+/// Plan 107 A2.2 — wire JSON for `HostVmResponse::WorkloadStopped`.
+pub(crate) fn workload_stopped_json(workload_id: &str) -> String {
+    let mut out = String::with_capacity(64 + workload_id.len());
+    out.push_str(r#"{"kind":"workload_stopped","workload_id":""#);
+    push_json_string(&mut out, workload_id);
+    out.push_str(r#""}"#);
+    out
+}
+
+/// Plan 107 A2.2 — wire JSON for
+/// `HostVmResponse::WorkloadStatusReport`.
+pub(crate) fn workload_status_report_json(workload_id: &str, status: &str) -> String {
+    let mut out = String::with_capacity(80 + workload_id.len() + status.len());
+    out.push_str(r#"{"kind":"workload_status_report","workload_id":""#);
+    push_json_string(&mut out, workload_id);
+    out.push_str(r#"","status":""#);
+    push_json_string(&mut out, status);
+    out.push_str(r#""}"#);
+    out
+}
+
+/// Plan 107 A2.2 — wire JSON for `HostVmResponse::WorkloadFailed`,
+/// the fail-closed negative path (spawn / collision / parse error).
+pub(crate) fn workload_failed_json(workload_id: &str, error: &str) -> String {
+    let mut out = String::with_capacity(80 + workload_id.len() + error.len());
+    out.push_str(r#"{"kind":"workload_failed","workload_id":""#);
+    push_json_string(&mut out, workload_id);
+    out.push_str(r#"","error":""#);
+    push_json_string(&mut out, error);
+    out.push_str(r#""}"#);
+    out
+}
+
 /// JSON string-escape per RFC 8259 §7. Inlined rather than calling
 /// the existing `json_escape` in `main.rs` because that one is
 /// `#[cfg(target_os = "linux")]`-gated under the linux module —
 /// this module is cross-platform so `cargo test` on macOS hosts
-/// can exercise the roundtrip.
-fn push_json_string(out: &mut String, s: &str) {
+/// can exercise the roundtrip. `pub(crate)` so [`crate::workload`]
+/// reuses the same escaper for the Firecracker config JSON.
+pub(crate) fn push_json_string(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -315,5 +363,57 @@ mod tests {
             }
             other => panic!("expected Result variant, got {other:?}"),
         }
+    }
+
+    /// Plan 107 A2.2 — every workload-lifecycle emitter must
+    /// deserialize as the typed `HostVmResponse` variant with the
+    /// expected fields. Drift on either side trips this.
+    #[test]
+    fn workload_emitters_parse_as_typed_builder_response() {
+        use mvm_build::builder_protocol::{HostVmResponse, WorkloadId};
+
+        let id = "00000000-0000-0000-0000-000000000000";
+
+        match serde_json::from_str(&workload_started_json(id, 4242)).unwrap() {
+            HostVmResponse::WorkloadStarted { workload_id, pid } => {
+                assert_eq!(workload_id, WorkloadId(uuid::Uuid::nil()));
+                assert_eq!(pid, 4242);
+            }
+            other => panic!("expected WorkloadStarted, got {other:?}"),
+        }
+
+        match serde_json::from_str(&workload_stopped_json(id)).unwrap() {
+            HostVmResponse::WorkloadStopped { workload_id } => {
+                assert_eq!(workload_id, WorkloadId(uuid::Uuid::nil()));
+            }
+            other => panic!("expected WorkloadStopped, got {other:?}"),
+        }
+
+        match serde_json::from_str(&workload_status_report_json(id, "running")).unwrap() {
+            HostVmResponse::WorkloadStatusReport {
+                workload_id,
+                status,
+            } => {
+                assert_eq!(workload_id, WorkloadId(uuid::Uuid::nil()));
+                assert_eq!(status, "running");
+            }
+            other => panic!("expected WorkloadStatusReport, got {other:?}"),
+        }
+
+        match serde_json::from_str(&workload_failed_json(id, "spawn failed: ENOENT")).unwrap() {
+            HostVmResponse::WorkloadFailed { workload_id, error } => {
+                assert_eq!(workload_id, WorkloadId(uuid::Uuid::nil()));
+                assert_eq!(error, "spawn failed: ENOENT");
+            }
+            other => panic!("expected WorkloadFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workload_failed_escapes_control_chars_in_error() {
+        let json = workload_failed_json(NIL_JOB_ID, "oops:\n\"quoted\"\tbad");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must parse");
+        assert_eq!(parsed["kind"], "workload_failed");
+        assert_eq!(parsed["error"], "oops:\n\"quoted\"\tbad");
     }
 }

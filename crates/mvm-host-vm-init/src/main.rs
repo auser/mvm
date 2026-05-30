@@ -95,6 +95,12 @@ mod install_spec;
 mod network;
 #[allow(dead_code)]
 mod proxy;
+/// Plan 107 A2.2 / A2.3 — spawn a workload microVM inside the host
+/// VM via a `WorkloadVmm` backend (Firecracker today). Cross-platform
+/// trait + state-dir/lifecycle logic (tested on macOS); the
+/// signal-based stop/status helpers are Linux-only.
+#[allow(dead_code)]
+mod workload;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
@@ -1006,30 +1012,82 @@ mod linux {
                     drop(conn);
                     break;
                 }
-                // Plan 107 A1b — workload arms reach the guest-side
-                // dispatcher but the Firecracker-in-guest spawn path
-                // doesn't exist yet (A2.2). Until A2.2 lands, the
-                // host-side dispatch path (PersistentBuilderSupervisor
-                // in mvm-build/persistent_builder.rs) only sends `Run`
-                // and `Shutdown` requests, so these arms are
-                // unreachable in production. If a future host slice
-                // accidentally sends a Workload* before the guest is
-                // ready, panic loudly so the regression is caught at
-                // boot rather than silently dropped on the floor.
-                crate::builder_request::HostVmRequest::WorkloadStart { workload_id } => {
-                    unimplemented!(
-                        "mvm-host-vm-init: WorkloadStart received for workload_id={workload_id}; Firecracker-in-guest spawn path lands in Plan 107 A2.2"
-                    );
+                // Plan 107 A2.2 — spawn / stop / query a Firecracker
+                // workload microVM inside the host VM. All three reply
+                // with a typed frame (incl. the fail-closed
+                // `WorkloadFailed` on error) so the host never has to
+                // distinguish a real failure from a transport EOF.
+                crate::builder_request::HostVmRequest::WorkloadStart {
+                    workload_id,
+                    kernel_path,
+                    rootfs_path,
+                    vsock_socket_dir,
+                    vcpus,
+                    memory_mib,
+                    kernel_cmdline_extras,
+                } => {
+                    let cfg = crate::workload::WorkloadSpawnConfig {
+                        workload_id: workload_id.clone(),
+                        kernel_path,
+                        rootfs_path,
+                        vsock_socket_dir,
+                        vcpus,
+                        memory_mib,
+                        kernel_cmdline_extras,
+                    };
+                    let frame = match crate::workload::start_workload(
+                        &crate::workload::FirecrackerVmm,
+                        &cfg,
+                    ) {
+                        Ok(pid) => {
+                            crate::dispatch_response::workload_started_json(&workload_id, pid)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "mvm-host-vm-init: dispatch loop: WorkloadStart {workload_id} failed: {e}"
+                            );
+                            crate::dispatch_response::workload_failed_json(
+                                &workload_id,
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    if !write_frame(&mut conn, frame.as_bytes()) {
+                        eprintln!(
+                            "mvm-host-vm-init: dispatch loop: write WorkloadStart reply failed"
+                        );
+                    }
                 }
                 crate::builder_request::HostVmRequest::WorkloadStop { workload_id } => {
-                    unimplemented!(
-                        "mvm-host-vm-init: WorkloadStop received for workload_id={workload_id}; Firecracker-in-guest stop path lands in Plan 107 A2.2"
-                    );
+                    let base = std::path::Path::new(crate::workload::WORKLOAD_STATE_BASE);
+                    let frame = match crate::workload::stop_workload(base, &workload_id) {
+                        Ok(()) => crate::dispatch_response::workload_stopped_json(&workload_id),
+                        Err(e) => {
+                            eprintln!(
+                                "mvm-host-vm-init: dispatch loop: WorkloadStop {workload_id} failed: {e}"
+                            );
+                            crate::dispatch_response::workload_failed_json(
+                                &workload_id,
+                                &e.to_string(),
+                            )
+                        }
+                    };
+                    if !write_frame(&mut conn, frame.as_bytes()) {
+                        eprintln!(
+                            "mvm-host-vm-init: dispatch loop: write WorkloadStop reply failed"
+                        );
+                    }
                 }
                 crate::builder_request::HostVmRequest::WorkloadStatus { workload_id } => {
-                    unimplemented!(
-                        "mvm-host-vm-init: WorkloadStatus received for workload_id={workload_id}; Firecracker-in-guest status path lands in Plan 107 A2.2"
-                    );
+                    let base = std::path::Path::new(crate::workload::WORKLOAD_STATE_BASE);
+                    let status = crate::workload::workload_status(base, &workload_id);
+                    let frame =
+                        crate::dispatch_response::workload_status_report_json(&workload_id, status);
+                    if !write_frame(&mut conn, frame.as_bytes()) {
+                        eprintln!(
+                            "mvm-host-vm-init: dispatch loop: write WorkloadStatus reply failed"
+                        );
+                    }
                 }
             }
             // Conn drops at end of iteration; the host's read on

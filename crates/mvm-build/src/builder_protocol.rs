@@ -160,22 +160,44 @@ pub enum HostVmRequest {
     /// shape is identical (`{"kind":"shutdown"}`).
     Shutdown {},
 
-    /// Plan 107 W6 / A2 — start a Firecracker workload microVM
-    /// inside the host VM. Stubbed in A1; the guest-side dispatch
-    /// arm panics with `unimplemented!()` until A2.2 fills in the
-    /// payload (workload kernel + rootfs paths, vsock socket dir,
-    /// vcpus, memory, kernel cmdline extras) and the guest-side
-    /// Firecracker spawn.
+    /// Plan 107 W6 / A2.2 — start a workload microVM inside the
+    /// host VM. The guest's dispatch loop hands this to a
+    /// `WorkloadVmm` backend (Firecracker today; the fields are
+    /// generic microVM concepts, not Firecracker-shaped, so a
+    /// second VMM is a pure addition — see
+    /// `mvm-host-vm-init/src/workload.rs`).
     ///
-    /// The payload carries only the [`WorkloadId`] today so that
-    /// (a) the protocol round-trips end-to-end and (b) A2.2's
-    /// payload extension is additive — `#[serde(deny_unknown_fields)]`
-    /// will reject the A2.2 fields until both sides upgrade in
-    /// lockstep, which is the intended fail-closed behaviour.
+    /// All paths are resolved *inside the host VM* (the guest), not
+    /// on the outer host: `kernel_path` / `rootfs_path` point at
+    /// files the host already staged into a share the guest can
+    /// see, and `vsock_socket_dir` is where the guest creates the
+    /// per-workload state dir + vsock UDS.
     WorkloadStart {
         /// Host-minted identifier the guest echoes in
-        /// [`HostVmResponse::WorkloadStarted`].
+        /// [`HostVmResponse::WorkloadStarted`] and keys the
+        /// per-workload state dir on.
         workload_id: WorkloadId,
+        /// Absolute path (inside the host VM) to the workload
+        /// kernel image the VMM boots.
+        kernel_path: String,
+        /// Absolute path (inside the host VM) to the workload root
+        /// filesystem image, attached as the single root drive.
+        rootfs_path: String,
+        /// Directory (inside the host VM) under which the guest
+        /// creates the workload's vsock UDS. The per-workload state
+        /// dir is derived from `workload_id`; this is the parent
+        /// the VMM's vsock socket lands in.
+        vsock_socket_dir: String,
+        /// Number of vCPUs for the workload microVM.
+        vcpus: u32,
+        /// Guest RAM for the workload microVM, in MiB.
+        memory_mib: u32,
+        /// Extra kernel command-line tokens appended to the VMM's
+        /// base cmdline. The host supplies `root=` / `init=` /
+        /// dm-verity roothash here. A single space-joined string
+        /// (not `Vec<String>`) so the guest's no-serde hand-rolled
+        /// parser stays simple.
+        kernel_cmdline_extras: String,
     },
 
     /// Plan 107 W6 / A2 — stop a running workload microVM. Stubbed
@@ -257,31 +279,45 @@ pub enum HostVmResponse {
     /// something to enforce against.
     Bye {},
 
-    /// Plan 107 W6 / A2 — acknowledgement that a workload microVM
-    /// has booted inside the host VM. Stubbed in A1; A2.2 will
-    /// extend the payload with the workload's vsock CID + first-byte
-    /// readiness timing.
+    /// Plan 107 W6 / A2.2 — acknowledgement that a workload microVM
+    /// has been spawned inside the host VM.
     WorkloadStarted {
         /// Echo of the originating [`HostVmRequest::WorkloadStart::workload_id`].
         workload_id: WorkloadId,
+        /// PID of the spawned VMM process *inside the host VM*. The
+        /// host tracks it for the A4 lifecycle (stop / status /
+        /// crash recovery).
+        pid: u32,
     },
 
-    /// Plan 107 W6 / A2 — acknowledgement that a workload microVM
-    /// has shut down. Stubbed in A1.
+    /// Plan 107 W6 / A2.2 — acknowledgement that a workload microVM
+    /// has shut down and its state dir was cleaned up.
     WorkloadStopped {
         /// Echo of the originating [`HostVmRequest::WorkloadStop::workload_id`].
         workload_id: WorkloadId,
     },
 
-    /// Plan 107 W6 / A2 — workload lifecycle status report. Stubbed
-    /// in A1; A2.2 will replace the placeholder string with a typed
-    /// `WorkloadState` enum (`Booting` / `Running` / `Exited { code }`
-    /// / `Unknown`).
+    /// Plan 107 W6 / A2.2 — workload lifecycle status report.
     WorkloadStatusReport {
         /// Echo of the originating [`HostVmRequest::WorkloadStatus::workload_id`].
         workload_id: WorkloadId,
-        /// Placeholder string — A2.2 replaces with a typed enum.
+        /// One of `"running"`, `"stopped"`, `"not_found"`. A typed
+        /// enum is deferred until the host actually consumes the
+        /// distinction (A4); the closed string set is asserted by
+        /// the guest-side emitter tests.
         status: String,
+    },
+
+    /// Plan 107 W6 / A2.2 — a workload lifecycle operation failed.
+    /// Fail-closed negative path: the guest always sends a typed
+    /// frame (spawn error, state-dir collision, parse failure)
+    /// rather than dropping the connection, so the host can
+    /// distinguish a real failure from a transport EOF.
+    WorkloadFailed {
+        /// Echo of the originating request's `workload_id`.
+        workload_id: WorkloadId,
+        /// Human-readable failure reason for logs / surfacing.
+        error: String,
     },
 }
 
@@ -549,12 +585,18 @@ mod tests {
         });
     }
 
-    // Plan 107 A1 — workload variant round-trips. Stubbed payloads
-    // today; A2.2 extends with the real Firecracker spawn config.
+    // Plan 107 A2.2 — workload variant round-trips with the real
+    // spawn config payload.
 
     fn sample_workload_start() -> HostVmRequest {
         HostVmRequest::WorkloadStart {
             workload_id: WorkloadId(Uuid::nil()),
+            kernel_path: "/job/workload/vmlinux".to_string(),
+            rootfs_path: "/job/workload/rootfs.ext4".to_string(),
+            vsock_socket_dir: "/var/lib/mvm/workloads".to_string(),
+            vcpus: 2,
+            memory_mib: 1024,
+            kernel_cmdline_extras: "root=/dev/vda ro init=/init".to_string(),
         }
     }
 
@@ -588,6 +630,7 @@ mod tests {
     fn host_vm_response_workload_started_roundtrips() {
         roundtrip(&HostVmResponse::WorkloadStarted {
             workload_id: WorkloadId(Uuid::nil()),
+            pid: 4242,
         });
     }
 
@@ -602,7 +645,15 @@ mod tests {
     fn host_vm_response_workload_status_report_roundtrips() {
         roundtrip(&HostVmResponse::WorkloadStatusReport {
             workload_id: WorkloadId(Uuid::nil()),
-            status: "booting".to_string(),
+            status: "running".to_string(),
+        });
+    }
+
+    #[test]
+    fn host_vm_response_workload_failed_roundtrips() {
+        roundtrip(&HostVmResponse::WorkloadFailed {
+            workload_id: WorkloadId(Uuid::nil()),
+            error: "spawn /usr/bin/firecracker: No such file or directory".to_string(),
         });
     }
 
@@ -631,23 +682,38 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(HostVmResponse::WorkloadStarted {
-                workload_id: WorkloadId(Uuid::nil())
+                workload_id: WorkloadId(Uuid::nil()),
+                pid: 1,
             })
             .unwrap()["kind"],
             "workload_started"
+        );
+        assert_eq!(
+            serde_json::to_value(HostVmResponse::WorkloadFailed {
+                workload_id: WorkloadId(Uuid::nil()),
+                error: "boom".to_string(),
+            })
+            .unwrap()["kind"],
+            "workload_failed"
         );
     }
 
     #[test]
     fn deny_unknown_fields_rejects_extra_workload_start_field() {
-        // Plan 107 A1: A2.2 will extend WorkloadStart with the real
-        // Firecracker spawn payload (kernel, rootfs, vcpus, memory).
-        // The fail-closed contract is that an old guest seeing a new
-        // host's extended payload rejects with deny_unknown_fields
-        // rather than silently launching with default config.
+        // A *complete* A2.2 payload plus one extra field — exercises
+        // deny_unknown_fields specifically (not a missing-field
+        // error). The fail-closed contract: a future host shipping a
+        // new field against an old guest is rejected rather than
+        // silently launching with the field dropped.
         let bad = serde_json::json!({
             "kind": "workload_start",
             "workload_id": "00000000-0000-0000-0000-000000000000",
+            "kernel_path": "/job/workload/vmlinux",
+            "rootfs_path": "/job/workload/rootfs.ext4",
+            "vsock_socket_dir": "/var/lib/mvm/workloads",
+            "vcpus": 2,
+            "memory_mib": 1024,
+            "kernel_cmdline_extras": "root=/dev/vda ro",
             "future_field": 42,
         });
         let res: Result<HostVmRequest, _> = serde_json::from_value(bad);
@@ -663,12 +729,29 @@ mod tests {
         let bad = serde_json::json!({
             "kind": "workload_started",
             "workload_id": "00000000-0000-0000-0000-000000000000",
+            "pid": 7,
             "future_field": "rogue",
         });
         let res: Result<HostVmResponse, _> = serde_json::from_value(bad);
         assert!(
             res.is_err(),
             "deny_unknown_fields must reject future_field on workload_started, got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_rejects_extra_workload_failed_field() {
+        let bad = serde_json::json!({
+            "kind": "workload_failed",
+            "workload_id": "00000000-0000-0000-0000-000000000000",
+            "error": "boom",
+            "future_field": true,
+        });
+        let res: Result<HostVmResponse, _> = serde_json::from_value(bad);
+        assert!(
+            res.is_err(),
+            "deny_unknown_fields must reject future_field on workload_failed, got {:?}",
             res
         );
     }

@@ -404,15 +404,14 @@ impl PersistentBuilderSupervisor {
                 }
                 Some(HostVmResponse::WorkloadStarted { .. })
                 | Some(HostVmResponse::WorkloadStopped { .. })
-                | Some(HostVmResponse::WorkloadStatusReport { .. }) => {
-                    // Plan 107 A1: workload responses on the build-job
-                    // dispatch path are a protocol violation. The
-                    // guest-side workload arm is `unimplemented!()`
-                    // until A2.2, so this branch cannot fire today;
-                    // when A2 lands, workload responses will flow on a
-                    // dedicated channel (A3 vsock-proxy hop), not this
-                    // one. Treat as premature EOF for now — the host
-                    // can't recover from a wire mismatch.
+                | Some(HostVmResponse::WorkloadStatusReport { .. })
+                | Some(HostVmResponse::WorkloadFailed { .. }) => {
+                    // Plan 107 A2: workload responses on the build-job
+                    // dispatch path are a protocol violation. Workload
+                    // lifecycle responses flow on a dedicated channel
+                    // (A3 vsock-proxy hop), not this build-dispatch
+                    // conn. Treat as premature EOF — the host can't
+                    // recover from a wire mismatch.
                     return Err(PersistentBuilderError::PrematureEof {
                         chunks: stderr_chunks.len(),
                     });
