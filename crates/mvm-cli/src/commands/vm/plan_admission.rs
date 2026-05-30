@@ -278,6 +278,82 @@ pub fn populate_audit_substrate(
     Ok(())
 }
 
+/// Plan 113 §Task 13 — atomically write `body` to `path` at mode 0600 on
+/// Unix hosts.
+///
+/// The Firecracker bridge sidecar reads `plan.json` + `bundle.json` from
+/// the per-VM state dir at spawn time. Those files carry the signed
+/// `ExecutionPlan` envelope and the (optional) bundle pin, which may
+/// resolve through `secrets` / policy refs to credentials per ADR-049 /
+/// Plan 104. They sit at the same trust tier as the host signer key
+/// (mode 0600); `std::fs::write` would default to 0644 minus umask which
+/// on most contributor hosts is 0644 or 0664 — world-readable. Use
+/// `OpenOptionsExt::mode(0o600)` + tmp-and-rename so a concurrent
+/// bridge reader never sees a partial file.
+///
+/// Parent dir is assumed pre-created by the caller (the producer sites
+/// in `up.rs` ensure `mvm_data_dir/vms/<name>/` exists with the same
+/// `0700` umbrella as `~/.mvm`).
+#[cfg(unix)]
+pub(crate) fn write_secret_file(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("write_secret_file: path has no parent: {}", path.display())
+    })?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create parent dir {}", parent.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("open tmp file {}", tmp.display()))?;
+        f.write_all(body)
+            .with_context(|| format!("write secret bytes to {}", tmp.display()))?;
+        // Best-effort fsync; on tmpfs this is a no-op and on a flaky
+        // FS we'd rather succeed-and-warn than fail-and-abort.
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Plan 113 §Task 13 — stash the signed plan envelope + (optional)
+/// bundle pin in the per-VM state dir so the Firecracker bridge
+/// sidecar can read them at spawn time.
+///
+/// Called from every `up.rs` producer site immediately after
+/// `populate_audit_substrate`, before `backend.start()`. No-op when
+/// `cfg.plan_json` is `None` (legacy / no-admission path). Files land
+/// at mode 0600 via [`write_secret_file`] — see that helper's doc for
+/// why `std::fs::write` is insufficient.
+///
+/// Lives in the producer (mvm-cli) rather than `microvm::run_from_build`
+/// because the producer is the only place that has the signed envelope
+/// in scope; `microvm` reads it back from disk inside the
+/// `target_os = "linux"` bridge-spawn block.
+pub(crate) fn stash_plan_for_bridge(cfg: &mvm_core::vm_backend::VmStartConfig) -> Result<()> {
+    let Some(plan_json) = cfg.plan_json.as_deref() else {
+        return Ok(());
+    };
+    let state_dir = std::path::PathBuf::from(mvm_core::config::mvm_data_dir())
+        .join("vms")
+        .join(&cfg.name);
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("create per-VM state dir {}", state_dir.display()))?;
+    write_secret_file(&state_dir.join("plan.json"), plan_json.as_bytes())?;
+    if let Some(bundle_json) = cfg.bundle_json.as_deref() {
+        write_secret_file(&state_dir.join("bundle.json"), bundle_json.as_bytes())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +772,132 @@ mod tests {
         assert_eq!(recovered.plan_id, admitted.plan_id);
         // fixture has no bundle pin, so bundle_json stays None
         assert!(cfg.bundle_json.is_none());
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Plan 113 §Task 13 — write_secret_file + stash_plan_for_bridge
+    // ───────────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secret_file_creates_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.json");
+        write_secret_file(&path, b"{\"hello\":\"world\"}").expect("write");
+        let meta = std::fs::metadata(&path).expect("stat");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be mode 0600 (got {mode:o})");
+        let body = std::fs::read(&path).expect("read");
+        assert_eq!(body, b"{\"hello\":\"world\"}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secret_file_atomic_via_rename() {
+        // Two consecutive writes; the second must fully replace the
+        // first and leave no `*.json.tmp` artifact behind. This proves
+        // the tmp-and-rename happy path doesn't leak partial files.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.json");
+        write_secret_file(&path, b"first body").expect("first write");
+        write_secret_file(&path, b"second body wins").expect("second write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second body wins");
+        // The tmp file path is `plan.json.tmp`; it must not exist after
+        // a clean write.
+        assert!(
+            !dir.path().join("plan.json.tmp").exists(),
+            "tmp file should be renamed away"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secret_file_creates_parent_dir() {
+        // The bridge writes under `~/.mvm/vms/<vm>/`; that dir may not
+        // exist on a first boot. The helper must create it (matching
+        // the `stash_plan_for_bridge` callsite's invariant).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vms").join("foo").join("plan.json");
+        write_secret_file(&path, b"body").expect("write with missing parent");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn stash_plan_for_bridge_skips_when_plan_json_none() {
+        use mvm_core::vm_backend::VmStartConfig;
+        // Legacy / no-admission path: cfg.plan_json is None.
+        // `stash_plan_for_bridge` must succeed without touching disk
+        // because there's nothing to stash.
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by setting MVM_DATA_DIR scoped to this test
+        // process; no other tests in this file race with it. We restore
+        // on the way out.
+        let saved = std::env::var("MVM_DATA_DIR").ok();
+        unsafe { std::env::set_var("MVM_DATA_DIR", dir.path()) };
+
+        let cfg = VmStartConfig {
+            name: "skip-me".into(),
+            ..Default::default()
+        };
+        stash_plan_for_bridge(&cfg).expect("None plan_json is a no-op");
+        assert!(
+            !dir.path().join("vms/skip-me/plan.json").exists(),
+            "no files when plan_json is None"
+        );
+
+        // SAFETY: serialized as above.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("MVM_DATA_DIR", v),
+                None => std::env::remove_var("MVM_DATA_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stash_plan_for_bridge_writes_both_files_when_present() {
+        use mvm_core::vm_backend::VmStartConfig;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let saved = std::env::var("MVM_DATA_DIR").ok();
+        // SAFETY: scoped env var swap, restored below.
+        unsafe { std::env::set_var("MVM_DATA_DIR", dir.path()) };
+
+        let cfg = VmStartConfig {
+            name: "with-plan".into(),
+            plan_json: Some("{\"plan\":\"body\"}".into()),
+            bundle_json: Some("{\"bundle\":\"pin\"}".into()),
+            ..Default::default()
+        };
+        stash_plan_for_bridge(&cfg).expect("stash succeeds");
+
+        let plan_path = dir.path().join("vms/with-plan/plan.json");
+        let bundle_path = dir.path().join("vms/with-plan/bundle.json");
+        assert!(plan_path.exists(), "plan.json must be written");
+        assert!(bundle_path.exists(), "bundle.json must be written");
+        assert_eq!(
+            std::fs::metadata(&plan_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "plan.json must be mode 0600"
+        );
+        assert_eq!(
+            std::fs::metadata(&bundle_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "bundle.json must be mode 0600"
+        );
+
+        // SAFETY: restoring the prior value (or removing).
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("MVM_DATA_DIR", v),
+                None => std::env::remove_var("MVM_DATA_DIR"),
+            }
+        }
     }
 }

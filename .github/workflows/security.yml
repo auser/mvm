@@ -278,6 +278,40 @@ jobs:
         # nightly cron, not on every mvm-oci PR.
         run: cargo fuzz run unpack_layer -- -max_total_time="$DURATION"
 
+      - name: Fuzz Firecracker bridge — BridgeConfigJson (host-side)
+        working-directory: crates/mvm-firecracker-bridge
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        # Plan 113 §Task 15 / ADR-064 — the `mvm-firecracker-bridge`
+        # sidecar reads a `BridgeConfigJson` document on stdin BEFORE
+        # installing `mvm-jailer-lite` confinement or touching the
+        # parent-inherited socketpair fds. The producer (Task 13's
+        # `FirecrackerBackend`) is trusted, but the bytes traverse a
+        # pipe the bridge must defend; a panic here is a hard process
+        # death before the parent's watchdog has a sentinel to react
+        # to. Same contract as `fuzz_supervisor_config`: "never panic
+        # on any input." `#[serde(deny_unknown_fields)]` on
+        # `BridgeConfigJson` (Task 12 — `crates/mvm-firecracker-bridge/
+        # src/parse.rs`) means unknown keys fail-closed inside
+        # deserialization.
+        run: cargo fuzz run fuzz_bridge_config_json -- -max_total_time="$DURATION"
+
+      - name: Fuzz Firecracker bridge — passt-hashes TOML
+        working-directory: crates/mvm-firecracker-bridge
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        # Plan 113 §Task 15 / ADR-064 — `verify_passt_hash` reads
+        # `~/.mvm/passt-hashes.toml` BEFORE confinement so a missing
+        # or malformed allowlist surfaces as a clean operator hint
+        # instead of an opaque EACCES. A panic in the TOML parser at
+        # this leaf is a hard process death before the FlowEvent
+        # pipeline is up; this fuzz target asserts the no-panic
+        # complement of the `verify_passt_hash_rejects_*` unit-test
+        # suite.
+        run: cargo fuzz run fuzz_passt_hashes_toml -- -max_total_time="$DURATION"
+
       - name: Upload corpus on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -292,6 +326,8 @@ jobs:
             crates/mvm-vz/fuzz/artifacts/
             crates/mvm-oci/fuzz/corpus/
             crates/mvm-oci/fuzz/artifacts/
+            crates/mvm-firecracker-bridge/fuzz/corpus/
+            crates/mvm-firecracker-bridge/fuzz/artifacts/
 
   # ── Lane 5: Hash-verify regression ─────────────────────────────────
   # ADR-002 §W5.1 — the unit tests that exercise the

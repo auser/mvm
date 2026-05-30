@@ -497,3 +497,5 @@ gets the allowlist guard but defers full chain-emit wiring to the
 NetworkProvider trait plan (needs lockstep Swift `Config.swift` schema
 update + a Rust drainer for `events_ingest_socket_path`). Live smokes
 scheduled for the Phase 3c PR merge.
+
+🟢 **Plan 113 — NetworkProvider observer fan-out + Firecracker substrate (Path X)** — shipped on `worktree-plan-113-network-provider`. Observer trait + Pipeline + ObserverAllowlist live inside mvm-supervisor (alongside the existing gateway_bridge); BridgeConfig gains observers field; signer_task fans out under catch_unwind before chain signing. Vz drainer + Firecracker bridge ship as thin binaries linking mvm-supervisor. A2 confinement via new mvm-jailer-lite crate (seccompiler + landlock). ADR: [ADR-064](../adrs/064-network-provider-trait.md). Plan: [Plan 113](113-network-provider-trait-firecracker-substrate.md).

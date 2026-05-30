@@ -51,6 +51,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror = "1"
+# Plan 113 / ADR-064 — `ObserverAllowlist` parses the host-trusted
+# observer allowlist at `~/.mvm/observers/allowlist.toml` (mode 0600).
+toml.workspace = true
 # Plan 60 Phase 7 — `web_fetch` tool parses RFC-3986 URLs to enforce
 # scheme/host invariants before the allowlist check.
 url = "2"

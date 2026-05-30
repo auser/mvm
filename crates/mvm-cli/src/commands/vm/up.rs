@@ -21,7 +21,7 @@ use super::host_signer::load_or_init_at;
 use super::managed_secrets::lower_workload_secrets;
 use super::plan_admission::{
     AdmittedPlan, BundleAdmissionContext, InMemoryNonceLedger, SystemClock, admit_for_run,
-    populate_audit_substrate,
+    populate_audit_substrate, stash_plan_for_bridge,
 };
 use super::plan_builder::SynthesisInput;
 use super::policy_resolver::{
@@ -754,10 +754,15 @@ pub(in crate::commands) struct Args {
     /// Default behaviour resumes on connect.
     #[arg(long)]
     pub no_auto_resume: bool,
-    /// Tenant for the synthesized `ExecutionPlan` (plan 64). Defaults
-    /// to `"local"` per ADR-002's "one guest = one workload" model.
-    #[arg(long, default_value = "local")]
-    pub tenant: String,
+    /// Tenant for the synthesized `ExecutionPlan` (plan 64). When
+    /// unset the value is resolved via the 4-level precedence chain
+    /// (ADR-064 §Decision 9 — built-in `"local"` →
+    /// `~/.mvm/config.toml` `[tenant] name` → `MVM_TENANT` env →
+    /// `--tenant` flag). Identity / `mvmctl auth` is the subject of
+    /// a separate ADR + plan (Plan M); this flag is just the audit
+    /// chain string label.
+    #[arg(long)]
+    pub tenant: Option<String>,
     /// Skip plan-64 admission (`synthesize → sign → verify → check_window
     /// → nonce`). One-release escape hatch; prints a deprecation warning
     /// when set. Will be removed once admission is the only path.
@@ -978,6 +983,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     let user_supplied_name = args.name.clone();
     let template_name_for_envelope = resolved_template_arg.clone();
 
+    // Plan 113 §Task 6 / ADR-064 §Decision 9 — 4-level tenant value
+    // precedence: built-in `"local"` → `~/.mvm/config.toml`
+    // `[tenant] name` → `MVM_TENANT` env → `--tenant` flag (highest).
+    // Identity / `mvmctl auth` is a separate ADR + plan (Plan M); this
+    // value is only the string label that names the audit chain file.
+    let resolved_tenant = super::tenant_resolution::resolve_tenant(args.tenant.as_deref());
+
     cmd_run(RunParams {
         flake_ref: args.flake.as_deref(),
         template_name: resolved_template_arg.as_deref(),
@@ -1004,7 +1016,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
-        tenant: &args.tenant,
+        tenant: &resolved_tenant,
         no_supervisor: args.no_supervisor,
         bundle_pin: args.bundle_pin.as_deref(),
         build_mode,
@@ -1318,6 +1330,10 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // for no-admission flows.
         if let Some(ctx) = admission.as_ref() {
             populate_audit_substrate(&mut start_config, &ctx.admitted)?;
+            // Plan 113 §Task 13 — Firecracker bridge sidecar reads
+            // plan.json + bundle.json from the per-VM state dir at
+            // spawn time. Stash them now (mode 0600, tmp+rename).
+            stash_plan_for_bridge(&start_config)?;
         }
 
         let backend = AnyBackend::from_hypervisor(effective_hypervisor);
@@ -1742,6 +1758,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // path. None keeps the legacy supervisor path for no-admission flows.
         if let Some(ctx) = admission_main.as_ref() {
             populate_audit_substrate(&mut start_config, &ctx.admitted)?;
+            // Plan 113 §Task 13 — stash plan.json + bundle.json for the
+            // Firecracker bridge sidecar to read at spawn time.
+            stash_plan_for_bridge(&start_config)?;
         }
 
         // Apple Container with -d: install a launchd agent instead of
@@ -2064,6 +2083,10 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             // main path. None → legacy supervisor path.
             if let Some(ctx) = watch_admission.as_ref() {
                 populate_audit_substrate(&mut w_start_config, &ctx.admitted)?;
+                // Plan 113 §Task 13 — re-stash plan.json + bundle.json
+                // for the Firecracker bridge sidecar on every watch-loop
+                // re-boot; the prior admission's files are stale.
+                stash_plan_for_bridge(&w_start_config)?;
             }
             let w_backend = AnyBackend::from_hypervisor(effective_hypervisor);
             if let Err(e) = w_backend.start(&w_start_config) {

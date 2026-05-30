@@ -120,6 +120,11 @@ fn build_supervisor_config(config: &VmStartConfig, state_dir: &Path) -> Result<S
         signing_key_path: substrate.signing_key_path,
         plan,
         bundle,
+        // Plan 113 §Task 14 / ADR-064 §Decision 6 — only `HardFail` is
+        // implemented today. Defaulting here keeps the producer site
+        // explicit while a future plan can change the default or
+        // introduce policy-driven selection.
+        bridge_restart_policy: mvm_libkrun::BridgeRestartPolicy::HardFail,
     })
 }
 

@@ -40,6 +40,16 @@ pub struct NetworkPolicy {
     /// default-deny. Plan 60 Phase 3 Slice B.
     #[serde(default)]
     pub l4: Vec<L4RuleSpec>,
+    /// Plan 113 / ADR-064 — observer chain. Each entry is a name
+    /// resolved against the host's `ObserverAllowlist`
+    /// (`~/.mvm/observers/allowlist.toml`). Empty Vec = no observers
+    /// (only the always-on chain signer fires).
+    ///
+    /// Default is empty for backward compatibility: claim-10 v1 bundles
+    /// that don't have this field still parse and behave identically to
+    /// pre-Plan-113 (no fan-out, chain entries unchanged).
+    #[serde(default)]
+    pub observers: Vec<String>,
 }
 
 /// Wire-format L4 rule row inside `[[network.l4]]`. The supervisor's
@@ -182,4 +192,49 @@ pub struct AuditPolicy {
     /// Per-tenant audit-stream destinations. Resolved by
     /// `AuditSigner` per Wave 3.
     pub stream_destinations: Vec<String>,
+}
+
+#[cfg(test)]
+mod plan_113_observer_tests {
+    use super::*;
+
+    #[test]
+    fn network_policy_parses_observers_chain() {
+        let toml = r#"
+preset = "deny-by-default"
+observers = ["flow-count-metrics"]
+"#;
+        let p: NetworkPolicy = toml::from_str(toml).expect("parse");
+        assert_eq!(p.observers, vec!["flow-count-metrics".to_string()]);
+    }
+
+    #[test]
+    fn network_policy_missing_observers_defaults_empty() {
+        let toml = r#"
+preset = "deny-by-default"
+"#;
+        let p: NetworkPolicy = toml::from_str(toml).expect("parse");
+        assert!(p.observers.is_empty());
+    }
+
+    #[test]
+    fn network_policy_backward_compat_with_v1_bundle() {
+        // A bundle file written before Plan 113 has no `observers`
+        // field; it must still parse and behave like an empty chain.
+        // L4RuleSpec uses `proto` / `dst_cidr` / `port_lo` / `port_hi`
+        // (see definition above) — the v1 bundle row matches that
+        // shape exactly.
+        let toml = r#"
+preset = "deny-by-default"
+
+[[l4]]
+proto    = "tcp"
+dst_cidr = "10.0.0.0/24"
+port_lo  = 443
+port_hi  = 443
+"#;
+        let p: NetworkPolicy = toml::from_str(toml).expect("parse v1 bundle");
+        assert_eq!(p.l4.len(), 1);
+        assert!(p.observers.is_empty());
+    }
 }

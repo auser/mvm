@@ -282,6 +282,112 @@ jobs:
         # or rename — the count guard turns that into a red lane.
         run: ./scripts/check-sealed-prod-allowlist.sh
 
+  # ── Lane: jailer-lite-property (Plan 113 §Task 9 + Task 15) ───────
+  # Runs the `#[ignore]`-gated seccomp + Landlock property tests in
+  # `crates/mvm-jailer-lite/tests/{seccomp_property,landlock_property}.rs`.
+  # Both tests are integration-test binaries gated behind
+  # `#![cfg(target_os = "linux")]` and `#[ignore = "..."]` so a
+  # plain `cargo test -p mvm-jailer-lite` is a no-op on Linux + a
+  # zero-binary on macOS / Windows. This lane drives them explicitly
+  # with `-- --ignored` on Ubuntu 24.04 (kernel 6.x, which strictly
+  # satisfies Landlock ABI v2 best-effort installation — see
+  # `crates/mvm-jailer-lite/src/landlock.rs::install_landlock`).
+  # Ubuntu 22.04 ships kernel 5.15 (borderline for ABI v2) and lacks
+  # passt in its default apt repos (passt landed in main archives only
+  # in 24.04 / noble), so this lane targets 24.04 outright.
+  #
+  # Runtime: a few seconds. PR-time, every push.
+  jailer-lite-property:
+    name: jailer-lite property tests (seccomp + Landlock) (Plan 113 §Task 9)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps (see `test` job for why)
+        # `lld` matches `.cargo/config.toml`'s linux-gnu link-arg
+        # override. mvm-jailer-lite itself doesn't link libcap-ng,
+        # but the workspace's `mvm-supervisor` transitive does on
+        # other crates the cache restores, so keep the apt set
+        # aligned with the `test` lane to maximise cache reuse.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev lld
+
+      - name: Install passt
+        # Both property tests construct
+        # ConfinementSpec::firecracker_bridge(audit_dir, keys_dir,
+        # "/usr/bin/passt") and confine_self() calls landlock::apply,
+        # which calls PathFd::new on every readable_path — including
+        # /usr/bin/passt. Task 8 P1.4 made that fail-closed
+        # (JailerError::PathNotFound), which is the correct security
+        # posture but means the runner must actually ship passt.
+        # Ubuntu 24.04 ships passt in main and installs the binary at
+        # /usr/bin/passt (Debian convention); the post-install probe
+        # fails loudly with a clear message if a future package lands
+        # it elsewhere. Ubuntu 22.04 was tried first but its default
+        # apt repos don't carry passt (only backports / source).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y passt
+          test -x /usr/bin/passt || { echo "passt not at /usr/bin/passt"; ls -la /usr/bin/passt* 2>/dev/null; exit 1; }
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-jailer-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-jailer-
+
+      - name: Probe Landlock kernel support
+        id: landlock_probe
+        # Plan 113 §Task 9 — the Landlock property test asserts ABI v2
+        # best-effort *enforcement*. The Landlock sysfs node exposes
+        # `abi_versions` only when the kernel ships an active Landlock
+        # LSM. GitHub's stock ubuntu-24.04 runners boot an Azure kernel
+        # with Landlock compiled but not in the active `lsm=` list, so
+        # the node is absent and `confine_self()` reports
+        # PartiallyEnforced (which the code correctly refuses). Record
+        # availability as a step output; the combined property-test
+        # step below gates on it so the lane *skips* (not fails) where
+        # the LSM can't enforce.
+        run: |
+          set -euo pipefail
+          uname -r
+          if [ ! -d /sys/kernel/security/landlock ]; then
+            echo "::warning::Landlock LSM not active on this runner — skipping the jailer-lite property tests (both seccomp and Landlock probes share confine_self, which applies Landlock first)."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Landlock ABI versions exposed:"
+          cat /sys/kernel/security/landlock/abi_versions 2>/dev/null || echo "(file missing)"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run property tests (seccomp + Landlock)
+        # Both property tests share mvm_jailer_lite::confine_self, which
+        # applies Landlock first then seccomp. On runners where Landlock
+        # isn't fully enforced (Azure kernel on GitHub's stock
+        # ubuntu-24.04, etc.), confine_self errors out before the
+        # seccomp probe runs. Gate both tests on Landlock availability
+        # rather than skipping one and letting the other surface the
+        # same PartiallyEnforced error. A real seccomp or Landlock
+        # regression still fails the lane wherever the LSM is active
+        # (self-hosted runners / runner images booted with
+        # `lsm=...,landlock`). `--ignored` runs the `#[ignore]`-gated
+        # property suite; `--nocapture` keeps SIGSYS diagnostics
+        # readable in the log.
+        if: steps.landlock_probe.outputs.available == 'true'
+        run: |
+          cargo test -p mvm-jailer-lite \
+            --test seccomp_property \
+            --test landlock_property \
+            -- --ignored --nocapture
+
   mcp-server-smoke:
     name: MCP server stdio roundtrip (plan 32 / Proposal A)
     runs-on: ubuntu-latest

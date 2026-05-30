@@ -1209,6 +1209,36 @@ fn install_shutdown_handler(_krun: &sys::Context) -> Result<(), Error> {
     Ok(())
 }
 
+/// Bridge crash policy — what the libkrun supervisor does when the
+/// in-process bridge thread panics or its child dies.
+///
+/// ADR-064 §Decision 6 / Plan 113 — bridge crash policy is hard-fail
+/// in this plan; restart variants ship in a future plan with their
+/// own ADR. The enum + serde field reservation lives here so that
+/// future addition is a schema extension, not a migration: old
+/// configs continue to deserialize (the field is `#[serde(default)]`
+/// to `HardFail`), and old supervisors reading new configs that name
+/// a future variant fail closed at deserialize time with a clear
+/// "unknown variant" error.
+///
+/// Scope: this reservation is `mvm-libkrun::SupervisorConfig`-only.
+/// The `mvm-firecracker-bridge` and `mvm-vz-drainer` sidecar binaries
+/// don't need an equivalent field because their crash policy is
+/// enforced by the parent `mvm-backend` process via the watchdog
+/// thread — the bridge dies, the parent observes the exit, the
+/// parent tears down the VM. libkrun is different because the bridge
+/// runs in-process; the supervisor itself is the only thing in a
+/// position to enforce a policy on bridge panics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeRestartPolicy {
+    /// Supervisor exits when the bridge thread panics or its child
+    /// dies; the parent `mvm-backend` process observes the exit and
+    /// tears down the libkrun VM. Only variant implemented today.
+    #[default]
+    HardFail,
+}
+
 /// Configuration consumed by [`run_supervisor`] — the JSON shape that
 /// the `mvm-libkrun-supervisor` binary reads from stdin and that
 /// `LibkrunBackend::start()` produces. Holds the [`KrunContext`] plus
@@ -1290,6 +1320,22 @@ pub struct SupervisorConfig {
     /// in `BridgeConfig`).
     #[serde(default)]
     pub bundle: Option<serde_json::Value>,
+
+    // --- ADR-064 §Decision 6 — bridge crash policy reservation ----------
+    //
+    // Field reservation only — `BridgeRestartPolicy` carries the
+    // `HardFail` variant today. Future restart variants ship in a
+    // future plan + ADR; reserving the field now means that
+    // extension is a schema addition (new variant) instead of a
+    // migration. Existing JSON without this key deserializes
+    // unchanged thanks to `#[serde(default)]`.
+    /// Bridge crash policy — see [`BridgeRestartPolicy`]. Defaults
+    /// to `HardFail` for existing JSON consumers. Unknown variant
+    /// names are rejected at deserialize time, so legacy
+    /// supervisors fail closed when handed configs that name
+    /// future restart variants they don't understand.
+    #[serde(default)]
+    pub bridge_restart_policy: BridgeRestartPolicy,
 }
 
 impl SupervisorConfig {
@@ -1794,6 +1840,7 @@ mod tests {
             signing_key_path: Some(keys.join("host-signer.ed25519")),
             plan: None,
             bundle: None,
+            bridge_restart_policy: BridgeRestartPolicy::HardFail,
         }
     }
 
@@ -1914,6 +1961,7 @@ mod tests {
             signing_key_path: None,
             plan: None,
             bundle: None,
+            bridge_restart_policy: BridgeRestartPolicy::HardFail,
         };
         let json = serde_json::to_string(&cfg_pre_w6a).unwrap();
         let parsed: SupervisorConfig =
@@ -1994,6 +2042,109 @@ mod tests {
         let parsed: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip");
         assert!(parsed.plan.is_some());
         assert!(parsed.bundle.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 113 §Task 14 / ADR-064 §Decision 6 — bridge_restart_policy
+    // field reservation. Today only `HardFail` exists; the tests pin
+    // the schema-extension contract so future restart variants can be
+    // added without breaking old configs and without silently
+    // accepting unknown variant names on old supervisors.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn supervisor_config_default_bridge_restart_policy_is_hard_fail() {
+        // Pre-Plan-113 JSON omits `bridge_restart_policy`; the
+        // `#[serde(default)]` annotation must promote that to
+        // `HardFail` so existing configs deserialize unchanged.
+        let json = r#"{
+            "krun": {
+                "name": "vm",
+                "kernel_path": "/k",
+                "rootfs_path": "/r",
+                "vcpus": 1,
+                "ram_mib": 256,
+                "kernel_cmdline": null,
+                "vsock_ports": [],
+                "extra_disks": [],
+                "console_output_path": null,
+                "vsock_socket_dir": null
+            },
+            "vm_state_dir": "/tmp/vms/vm",
+            "pid_file_name": null
+        }"#;
+        let parsed: SupervisorConfig =
+            serde_json::from_str(json).expect("pre-Plan-113 JSON must still parse");
+        assert_eq!(parsed.bridge_restart_policy, BridgeRestartPolicy::HardFail);
+    }
+
+    #[test]
+    fn supervisor_config_accepts_explicit_hard_fail_bridge_restart_policy() {
+        // New-style JSON naming the current variant explicitly must
+        // parse and round-trip to the same value.
+        let json = r#"{
+            "krun": {
+                "name": "vm",
+                "kernel_path": "/k",
+                "rootfs_path": "/r",
+                "vcpus": 1,
+                "ram_mib": 256,
+                "kernel_cmdline": null,
+                "vsock_ports": [],
+                "extra_disks": [],
+                "console_output_path": null,
+                "vsock_socket_dir": null
+            },
+            "vm_state_dir": "/tmp/vms/vm",
+            "pid_file_name": null,
+            "bridge_restart_policy": "hard_fail"
+        }"#;
+        let parsed: SupervisorConfig =
+            serde_json::from_str(json).expect("explicit hard_fail must parse");
+        assert_eq!(parsed.bridge_restart_policy, BridgeRestartPolicy::HardFail);
+    }
+
+    #[test]
+    fn supervisor_config_rejects_unknown_bridge_restart_policy_variant() {
+        // ADR-064 §Decision 6 — old supervisors handed a config that
+        // names a future variant they don't implement must fail
+        // closed at deserialize time. serde rejects unknown unit-
+        // variant names on `#[derive(Deserialize)]` enums by default,
+        // which is the schema-migration guarantee this test pins.
+        let json = r#"{
+            "krun": {
+                "name": "vm",
+                "kernel_path": "/k",
+                "rootfs_path": "/r",
+                "vcpus": 1,
+                "ram_mib": 256,
+                "kernel_cmdline": null,
+                "vsock_ports": [],
+                "extra_disks": [],
+                "console_output_path": null,
+                "vsock_socket_dir": null
+            },
+            "vm_state_dir": "/tmp/vms/vm",
+            "pid_file_name": null,
+            "bridge_restart_policy": "restart_with_budget"
+        }"#;
+        let res: Result<SupervisorConfig, _> = serde_json::from_str(json);
+        assert!(
+            res.is_err(),
+            "unknown bridge_restart_policy variant must be rejected"
+        );
+    }
+
+    #[test]
+    fn supervisor_config_round_trips_bridge_restart_policy_field() {
+        // The serde shape must round-trip — emit + reparse yields
+        // the same policy. Anchors the wire format so future
+        // refactors can't accidentally drop the field from output.
+        let cfg = well_formed_supervisor_config();
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(parsed.bridge_restart_policy, cfg.bridge_restart_policy);
+        assert_eq!(parsed.bridge_restart_policy, BridgeRestartPolicy::HardFail);
     }
 
     // ---------------------------------------------------------------
