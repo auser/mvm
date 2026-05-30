@@ -4203,7 +4203,6 @@ mod hash_verify_tests {
 mod builder_vm_bootstrap_tests {
     //! Plan 72 W5 — `find_builder_vm_flake` + `bootstrap_builder_vm_image`.
     use super::*;
-    use std::cell::Cell;
     use std::io::Write;
 
     #[test]
