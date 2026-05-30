@@ -3483,6 +3483,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-firecracker-bridge"
+version = "0.14.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "mvm-jailer-lite",
+ "mvm-plan",
+ "mvm-policy",
+ "mvm-supervisor",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mvm-guest"
 version = "0.14.0"
 dependencies = [
