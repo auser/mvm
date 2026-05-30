@@ -1853,7 +1853,14 @@ impl LibkrunPersistentHostVm {
             .add_virtio_fs("work", path_to_str(&self.workspace_root, "workspace_root")?)
             .add_virtio_fs("out", path_to_str(&job_dir, "job_dir")?)
             .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
-            .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
+            .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT)
+            // Plan 107 A3 — the workload-vsock nesting hop. The
+            // in-host-VM forwarder listens here; the outer host reaches
+            // a workload's Firecracker vsock via
+            // `<vm_state_dir>/vsock-21472.sock`. libkrun registers
+            // vsock ports at launch, so this must be added up front
+            // even though workloads start later (A4).
+            .add_vsock_port(mvm_guest::builder_agent::WORKLOAD_FORWARD_PORT);
 
         krun = apply_networking_mode(krun, &vm_state_dir)?;
 

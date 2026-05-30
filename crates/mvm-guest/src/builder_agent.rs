@@ -34,6 +34,17 @@ pub const BUILDER_AGENT_PORT: u32 = 21470;
 /// guest. The guest-side send code lands in W2 part 3.
 pub const BUILDER_DISPATCH_PORT: u32 = 21471;
 
+/// Plan 107 A3 — AF_VSOCK port the in-host-VM workload forwarder
+/// listens on (the nesting hop). Registered on the persistent host
+/// VM's libkrun vsock config alongside [`BUILDER_DISPATCH_PORT`]; the
+/// host opens `<vm_state_dir>/vsock-21472.sock` and the forwarder
+/// multiplexes per workload (see
+/// `mvm_host_vm_init::workload_proxy`). Must stay in lock-step with
+/// the guest's hardcoded `WORKLOAD_FORWARD_PORT` (the guest init
+/// deliberately doesn't depend on `mvm-guest`); the literal-pin tests
+/// on each side catch divergence.
+pub const WORKLOAD_FORWARD_PORT: u32 = 21472;
+
 /// Outgoing responses/log frames from the builder agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HostVmResponse {

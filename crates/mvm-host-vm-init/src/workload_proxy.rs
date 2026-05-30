@@ -202,6 +202,16 @@ mod tests {
     }
 
     #[test]
+    fn workload_forward_port_literal_is_21472() {
+        // The guest init deliberately doesn't depend on `mvm-guest`,
+        // so this literal must stay in lock-step with the host side
+        // (`mvm_guest::builder_agent::WORKLOAD_FORWARD_PORT`). If the
+        // host changes the port, this pin fails and points at the
+        // resync — same tactic as the dispatch-port pin.
+        assert_eq!(WORKLOAD_FORWARD_PORT, 21472);
+    }
+
+    #[test]
     fn handshake_round_trips_through_encode_and_read() {
         let bytes = encode_handshake("00000000-0000-0000-0000-000000000001", 5252);
         let mut cursor = io::Cursor::new(bytes);
