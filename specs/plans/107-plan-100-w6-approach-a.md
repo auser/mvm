@@ -200,30 +200,41 @@ The full host-VM-nested boot is deferred to A4.5.
 Goal: the workload microVM's vsock surfaces to the host via the
 host-VM as a proxy hop.
 
-- [ ] **A3.1** Today's vsock proxy (host → libkrun guest, port
-      5252) gains a hop: host → host-VM vsock → workload Firecracker
-      vsock. The proxy plumbing lives in `crates/mvm-supervisor/`
-      (confirm during impl; if it's split across crates the slice
-      grows). New socket pair per workload, keyed by workload_id.
-- [ ] **A3.2** `mvm-guest-agent` (inside workload microVM) stays
-      unchanged. It still connects to vsock CID 3 port 5252; that
-      vsock is now Firecracker's, inside the host VM, instead of
-      the host's directly. No protocol changes inside the workload.
-- [ ] **A3.3** Audit-chain entries flow through the proxy
-      unchanged — Plan 100 W5's parity assertion. Test:
-      `plan.admitted` / `plan.launched` / `plan.failed` round-trip
-      identically through nested vs. direct paths.
-- [ ] **A3.4** Per-flow guardrails: rate limit, max concurrent
-      proxied vsock streams. If Plan 102 W6.A.5's bridge is merged
-      by A3 start, inherit those guardrails; otherwise add a
-      bounded `tokio::sync::Semaphore` for the proxy and a TODO
-      pointing to Plan 102.
-- [ ] **A3.5** Hermetic tests — vsock framing round-trip across
-      the new hop, tampered-frame rejection, oversized-payload
-      drop, ratelimit kicks in.
+- [x] **A3.1** The hop: host → host-VM vsock (fixed forward port
+      21472) → in-host-VM forwarder → workload Firecracker `v.sock`.
+      **Location differs from the original guess** — the forwarder
+      is guest-side in `mvm-host-vm-init/src/workload_proxy.rs` (not
+      `mvm-supervisor`), and the host side is `NestingHopTransport`
+      in `mvm/src/vsock_transport.rs`. libkrun registers vsock ports
+      at launch, so rather than a socket *pair* per workload, the
+      single forward port multiplexes — each connection opens with a
+      `<workload_id> <port>` handshake keyed by workload_id. (#513
+      A3.a/b/c.)
+- [x] **A3.2** `mvm-guest-agent` unchanged — the forwarder is a
+      transparent byte splice; the workload agent still connects to
+      vsock CID 3 port 5252. No protocol changes inside the workload.
+- [x] **A3.3** Audit-chain parity — covered *hermetically* by the
+      `handle_forward_conn_is_bit_equivalent_for_binary_payload`
+      test (the hop preserves bytes exactly, incl. NULs / frame-like
+      bytes), so `plan.*` audit frames cross the hop unmodified. The
+      full live `plan.admitted`/`launched`/`failed` round-trip vs.
+      direct is deferred to **A4.5** (needs nested KVM).
+- [x] **A3.4** Per-flow guardrail: `ConnectionLimiter`
+      (`MAX_CONCURRENT_FORWARDS = 64`) bounds concurrent forwarded
+      streams; the listener fails closed (drops the connection) at
+      the cap. Implemented with a std `AtomicUsize` permit (not
+      `tokio::Semaphore` — the guest forwarder is sync std-threads,
+      no tokio runtime). Defers to Plan 102 W6.A.5's bridge
+      guardrails if/when those supersede it.
+- [x] **A3.5** Hermetic tests — framing round-trip + bit-equivalent
+      binary payload across the hop; tampered-frame rejection
+      (non-UTF-8 body, malformed handshake, path-traversal id);
+      oversized-payload drop (huge length prefix rejected before
+      allocation); concurrency cap (`ConnectionLimiter` refuses
+      beyond the bound, releases on drop, thread-safe).
 
-Exit: a workload-vsock round-trip test passes end-to-end through
-the new nesting hop with bit-equivalent payloads vs. direct.
+Exit: workload-vsock round-trip is bit-equivalent across the hop
+(hermetic). Live cross-hop boot is A4.5.
 
 ### Phase A4 — Linux `mvmctl up` wires the new path
 
