@@ -136,6 +136,13 @@ jobs:
       - name: Unique spec numbers
         run: cargo run -p xtask -- check-spec-numbers
 
+      # Plan 115 / ADR-064 — Rust manifest ⇔ Nix attrset parity.
+      # Adding or renaming a host binary requires updating both
+      # crates/mvm-cli/src/host_binaries/manifest.rs and
+      # nix/lib/mvm-host-binaries.nix in the same PR.
+      - name: host-binaries manifest parity (Plan 115 / ADR-064)
+        run: cargo run -p xtask -- check-mvm-host-binaries-sync
+
   test:
     name: Test
     runs-on: ubuntu-latest
