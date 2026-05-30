@@ -116,8 +116,8 @@ mod tests {
         let entries = parse_rust_manifest(&root).expect("parse rust manifest");
         assert_eq!(entries.len(), 2, "expected 2 entries, got {entries:?}");
         assert_eq!(
-            entries.get("mvm-builder-init").map(String::as_str),
-            Some("/sbin/mvm-builder-init")
+            entries.get("mvm-host-vm-init").map(String::as_str),
+            Some("/sbin/mvm-host-vm-init")
         );
         assert_eq!(
             entries.get("mvm-egress-proxy").map(String::as_str),
@@ -131,8 +131,8 @@ mod tests {
         let entries = parse_nix_attrset(&root).expect("parse nix attrset");
         assert_eq!(entries.len(), 2, "expected 2 entries, got {entries:?}");
         assert_eq!(
-            entries.get("mvm-builder-init").map(String::as_str),
-            Some("/sbin/mvm-builder-init")
+            entries.get("mvm-host-vm-init").map(String::as_str),
+            Some("/sbin/mvm-host-vm-init")
         );
         assert_eq!(
             entries.get("mvm-egress-proxy").map(String::as_str),

@@ -9,8 +9,8 @@
 # new uses of rustPlatform.buildRustPackage in mvm's flakes are
 # forbidden (see ADR-064 §Principle).
 {
-  mvm-builder-init = {
-    install_path = "/sbin/mvm-builder-init";
+  mvm-host-vm-init = {
+    install_path = "/sbin/mvm-host-vm-init";
     mode = "0755";
   };
   mvm-egress-proxy = {

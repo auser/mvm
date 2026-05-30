@@ -6,6 +6,6 @@ fn dispatch_populates_host_bin_dir_before_builder_call() {
     use mvm_cli::host_binaries::extract::ensure_extracted;
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = ensure_extracted(tmp.path()).unwrap();
-    assert!(dir.join("mvm-builder-init").exists());
+    assert!(dir.join("mvm-host-vm-init").exists());
     assert!(dir.join("mvm-egress-proxy").exists());
 }

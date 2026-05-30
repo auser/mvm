@@ -27,20 +27,18 @@ fn main() {
     let host_triple = std::env::var("HOST").unwrap();
     let native = host_triple.contains("linux") && host_triple.contains(strip_glibc(&pin.target));
 
-    for (name, cargo_pkg) in manifest.iter() {
+    for name in manifest.iter() {
         let out_file = bins_out.join(name);
         if native {
-            run_cargo_build(&workspace_root, cargo_pkg, &pin.target, &out_file);
+            run_cargo_build(&workspace_root, name, &pin.target, &out_file);
         } else {
-            run_cargo_zigbuild(&workspace_root, cargo_pkg, &pin.target, &out_file);
+            run_cargo_zigbuild(&workspace_root, name, &pin.target, &out_file);
         }
         let sha = sha256_hex(&out_file);
         entries.push((name.clone(), out_file.clone(), sha));
         println!(
             "cargo:rerun-if-changed={}",
-            workspace_root
-                .join(format!("crates/{cargo_pkg}/src"))
-                .display()
+            workspace_root.join(format!("crates/{name}/src")).display()
         );
     }
 
@@ -75,41 +73,20 @@ fn read_pinned_toolchain(root: &Path) -> Pin {
     }
 }
 
-/// Parse `name:` / `cargo_pkg:` field pairs from the Rust struct literals
-/// in `crates/mvm-cli/src/host_binaries/manifest.rs`.
+/// Parse `name:` fields from the Rust struct literals in
+/// `crates/mvm-cli/src/host_binaries/manifest.rs`.
 ///
-/// Returns a list of `(logical_name, cargo_package_name)` pairs in
-/// declaration order. `cargo_pkg` defaults to `name` when absent so
-/// that entries where the two are identical don't need the redundant field.
-fn read_rust_manifest(root: &Path) -> Vec<(String, String)> {
+/// Returns binary names in declaration order. Each name doubles as the
+/// cargo package name — the build script invokes `cargo build -p <name>`.
+fn read_rust_manifest(root: &Path) -> Vec<String> {
     let src =
         std::fs::read_to_string(root.join("crates/mvm-cli/src/host_binaries/manifest.rs")).unwrap();
-
     let mut out = Vec::new();
-    let mut current_name: Option<String> = None;
-    let mut current_cargo_pkg: Option<String> = None;
-
     for line in src.lines() {
-        // A `name:` line starts a new binary entry.
         if let Some(n) = extract_quoted_after(line, "name:") {
-            // Flush any previous entry that had name but no cargo_pkg yet.
-            if let Some(name) = current_name.take() {
-                let pkg = current_cargo_pkg.take().unwrap_or_else(|| name.clone());
-                out.push((name, pkg));
-            }
-            current_name = Some(n);
-            current_cargo_pkg = None;
-        }
-        if let Some(p) = extract_quoted_after(line, "cargo_pkg:") {
-            current_cargo_pkg = Some(p);
+            out.push(n);
         }
     }
-    // Flush the last entry.
-    if let Some(name) = current_name.take() {
-        let pkg = current_cargo_pkg.take().unwrap_or_else(|| name.clone());
-        out.push((name, pkg));
-    }
-
     out
 }
 
@@ -135,8 +112,6 @@ fn run_cargo_zigbuild(root: &Path, pkg: &str, target: &str, out: &Path) {
     // value propagates into the nested `cargo build` that cargo-zigbuild
     // spawns. Using the rustup cargo avoids that.
     let (cargo, rustc) = rustup_cargo_and_rustc(strip_glibc(target));
-    // Also clear RUSTUP_TOOLCHAIN if set, since it can override the rustc we pass.
-    // And clear RUSTC_WRAPPER which could redirect to a wrong rustc.
     let status = Command::new(&cargo)
         .args(["zigbuild", "--release", "--target", target, "-p", pkg])
         .env("RUSTC", &rustc)
@@ -151,7 +126,6 @@ fn run_cargo_zigbuild(root: &Path, pkg: &str, target: &str, out: &Path) {
              and `brew install zig` (or equivalent)",
         );
     assert!(status.success(), "cargo zigbuild failed for {pkg}");
-    // cargo-zigbuild strips the glibc suffix from the output directory name.
     let built = root
         .join("target")
         .join(strip_glibc(target))
@@ -194,20 +168,7 @@ fn run_cargo_build(root: &Path, pkg: &str, target: &str, out: &Path) {
 }
 
 /// Find a `(cargo, rustc)` pair that has `target` installed in its sysroot.
-///
-/// When a host has both Homebrew Rust and rustup, Homebrew cargo sets
-/// `RUSTC=rustc` (or similar) for build scripts. That rustc may not have the
-/// cross-compilation stdlib targets that rustup has. This function probes
-/// candidates in order and returns the first pair where `rustc` can locate
-/// the target's libdir.
-///
-/// Priority:
-/// 1. `$RUSTC` / `$CARGO` env vars if the rustc has the target.
-/// 2. `rustup which rustc` / `rustup which cargo` — the active toolchain.
-/// 3. Plain `"rustc"` / `"cargo"` fallback — will likely fail at cross-compile
-///    time with a clear "target not installed" message.
 fn rustup_cargo_and_rustc(target: &str) -> (String, String) {
-    // 1. Check the env vars first.
     let env_rustc = std::env::var("RUSTC").unwrap_or_default();
     let env_cargo = std::env::var("CARGO").unwrap_or_default();
     if !env_rustc.is_empty() && rustc_has_target(&env_rustc, target) {
@@ -221,7 +182,6 @@ fn rustup_cargo_and_rustc(target: &str) -> (String, String) {
         );
     }
 
-    // 2. Ask rustup. Try PATH and the canonical ~/.cargo/bin/ location.
     let home = std::env::var("HOME").unwrap_or_default();
     let rustup_candidates = vec!["rustup".to_string(), format!("{home}/.cargo/bin/rustup")];
     for rustup in &rustup_candidates {
@@ -239,7 +199,6 @@ fn rustup_cargo_and_rustc(target: &str) -> (String, String) {
         }
     }
 
-    // 3. Last resort.
     (
         if env_cargo.is_empty() {
             "cargo".to_string()
@@ -254,7 +213,6 @@ fn rustup_cargo_and_rustc(target: &str) -> (String, String) {
     )
 }
 
-/// Return true if the given `rustc` binary reports the target's libdir exists.
 fn rustc_has_target(rustc: &str, target: &str) -> bool {
     let out = Command::new(rustc)
         .args(["--target", target, "--print", "target-libdir"])
@@ -303,60 +261,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_rust_manifest_parses_cargo_pkg() {
-        // Test the parser against an inline snippet that mirrors the real
-        // manifest structure (name ≠ cargo_pkg for mvm-builder-init).
-        let fake_src = r#"
-            HostBinary {
-                name: "mvm-builder-init",
-                cargo_pkg: "mvm-host-vm-init",
-                install_path: "/sbin/mvm-builder-init",
-                mode: 0o755,
-            },
-            HostBinary {
-                name: "mvm-egress-proxy",
-                cargo_pkg: "mvm-egress-proxy",
-                install_path: "/sbin/mvm-egress-proxy",
-                mode: 0o755,
-            },
-        "#;
-
-        // Inline version of the parser logic (can't call read_rust_manifest
-        // from within build.rs tests without a real filesystem, so we
-        // exercise extract_quoted_after directly).
-        let mut out: Vec<(String, String)> = Vec::new();
-        let mut current_name: Option<String> = None;
-        let mut current_cargo_pkg: Option<String> = None;
-        for line in fake_src.lines() {
-            if let Some(n) = extract_quoted_after(line, "name:") {
-                if let Some(name) = current_name.take() {
-                    let pkg = current_cargo_pkg.take().unwrap_or_else(|| name.clone());
-                    out.push((name, pkg));
-                }
-                current_name = Some(n);
-                current_cargo_pkg = None;
-            }
-            if let Some(p) = extract_quoted_after(line, "cargo_pkg:") {
-                current_cargo_pkg = Some(p);
-            }
-        }
-        if let Some(name) = current_name.take() {
-            let pkg = current_cargo_pkg.take().unwrap_or_else(|| name.clone());
-            out.push((name, pkg));
-        }
-
-        assert_eq!(out.len(), 2);
-        assert_eq!(
-            out[0],
-            ("mvm-builder-init".into(), "mvm-host-vm-init".into())
-        );
-        assert_eq!(
-            out[1],
-            ("mvm-egress-proxy".into(), "mvm-egress-proxy".into())
-        );
-    }
-
-    #[test]
     fn strip_glibc_removes_version_suffix() {
         assert_eq!(
             strip_glibc("aarch64-unknown-linux-gnu.2.17"),
@@ -371,11 +275,7 @@ mod tests {
     #[test]
     fn extract_quoted_after_basic() {
         assert_eq!(
-            extract_quoted_after(r#"        name: "mvm-builder-init","#, "name:"),
-            Some("mvm-builder-init".to_string())
-        );
-        assert_eq!(
-            extract_quoted_after(r#"        cargo_pkg: "mvm-host-vm-init","#, "cargo_pkg:"),
+            extract_quoted_after(r#"        name: "mvm-host-vm-init","#, "name:"),
             Some("mvm-host-vm-init".to_string())
         );
         assert_eq!(extract_quoted_after("no key here", "name:"), None);
