@@ -114,6 +114,13 @@ exclude = [
     # Parallel role to mvm-libkrun/fuzz; same libfuzzer-sys linker
     # constraints apply.
     "crates/mvm-vz/fuzz",
+    # Plan 113 §Task 15 / ADR-064 — `BridgeConfigJson` JSON +
+    # `PasstHashesFile` TOML fuzz harnesses. Same libfuzzer-sys
+    # linker-flag constraints as the mvm-libkrun/fuzz crate; the
+    # CI gate at `.github/workflows/security.yml::fuzz` runs both
+    # targets on release-tag pushes + nightly cron + manual
+    # dispatch only (not on every PR — the lane is heavy).
+    "crates/mvm-firecracker-bridge/fuzz",
 ]
 resolver = "3"
 

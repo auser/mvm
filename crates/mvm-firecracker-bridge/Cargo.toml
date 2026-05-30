@@ -55,6 +55,16 @@ description = "Per-VM Firecracker bridge sidecar: passt hash verification + secc
 # call into `mvm-jailer-lite`, so the dep is not pulled at all on
 # non-Linux targets.
 
+# Plan 113 §Task 15 — explicit `[lib]` so the parser surface in
+# `src/lib.rs` + `src/parse.rs` is reachable for both the binary
+# (`src/main.rs` imports `mvm_firecracker_bridge::parse::*`) and the
+# `firecracker-bridge-fuzz` cargo-fuzz harness (`fuzz/fuzz_targets/`).
+# The bin entry below is unchanged; `cargo build -p mvm-firecracker-
+# bridge` still produces the same `mvm-firecracker-bridge` binary.
+[lib]
+name = "mvm_firecracker_bridge"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mvm-firecracker-bridge"
 path = "src/main.rs"

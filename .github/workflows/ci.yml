@@ -282,6 +282,79 @@ jobs:
         # or rename — the count guard turns that into a red lane.
         run: ./scripts/check-sealed-prod-allowlist.sh
 
+  # ── Lane: jailer-lite-property (Plan 113 §Task 9 + Task 15) ───────
+  # Runs the `#[ignore]`-gated seccomp + Landlock property tests in
+  # `crates/mvm-jailer-lite/tests/{seccomp_property,landlock_property}.rs`.
+  # Both tests are integration-test binaries gated behind
+  # `#![cfg(target_os = "linux")]` and `#[ignore = "..."]` so a
+  # plain `cargo test -p mvm-jailer-lite` is a no-op on Linux + a
+  # zero-binary on macOS / Windows. This lane drives them explicitly
+  # with `-- --ignored` on Ubuntu 22.04 (kernel ≥ 5.19, the minimum
+  # for Landlock ABI v2 best-effort installation; see
+  # `crates/mvm-jailer-lite/src/landlock.rs::install_landlock`).
+  #
+  # Runtime: a few seconds. PR-time, every push.
+  jailer-lite-property:
+    name: jailer-lite property tests (seccomp + Landlock) (Plan 113 §Task 9)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps (see `test` job for why)
+        # `lld` matches `.cargo/config.toml`'s linux-gnu link-arg
+        # override. mvm-jailer-lite itself doesn't link libcap-ng,
+        # but the workspace's `mvm-supervisor` transitive does on
+        # other crates the cache restores, so keep the apt set
+        # aligned with the `test` lane to maximise cache reuse.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev lld
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-jailer-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-jailer-
+
+      - name: Probe Landlock kernel support
+        # Plan 113 §Task 9 — the property tests assert ABI v2 best-
+        # effort installation. The Landlock sysfs node exposes the
+        # `abi_versions` file when the kernel ships the LSM; if it
+        # is missing (e.g. a stripped runner image), the lane skips
+        # rather than fails so we don't paper over genuine seccomp
+        # regressions with Landlock false-negatives.
+        run: |
+          set -euo pipefail
+          uname -r
+          if [ ! -d /sys/kernel/security/landlock ]; then
+            echo "::warning::Landlock sysfs node missing on this runner;"
+            echo "::warning::ABI v2 is best-effort, but the tests assume it."
+            echo "::warning::Skipping the property test invocation."
+            exit 0
+          fi
+          echo "Landlock ABI versions exposed:"
+          cat /sys/kernel/security/landlock/abi_versions 2>/dev/null || echo "(file missing)"
+
+      - name: Run seccomp + Landlock property tests
+        # `--ignored` runs only the tests gated by `#[ignore]` in the
+        # two test files (which is the property suite — the rest of
+        # `cargo test -p mvm-jailer-lite` covers the unit-test layer).
+        # `--nocapture` keeps the SIGSYS / EACCES diagnostics visible
+        # in the lane log so a regression surfaces with a readable
+        # cause instead of an opaque "test failed".
+        run: |
+          cargo test -p mvm-jailer-lite \
+            --test seccomp_property \
+            --test landlock_property \
+            -- --ignored --nocapture
+
   mcp-server-smoke:
     name: MCP server stdio roundtrip (plan 32 / Proposal A)
     runs-on: ubuntu-latest
