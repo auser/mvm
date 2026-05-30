@@ -424,6 +424,24 @@ pub enum LocalAuditKind {
     /// trip, destination-pin recheck, L4 reauth). Detail format:
     ///   `flow_id=<hex>,decision=<allow|deny>,rule=<rule-id>`
     FlowPolicyDecision,
+
+    // --- Plan 93 Phase 3: vendored-blob supply-chain fetch ---
+    //
+    // Emitted once per vendored bootstrap blob each time it is fetched
+    // or revalidated from cache, so every hash+signature trust
+    // decision in the no-prebuilt-download supply chain is auditable.
+    // Today the only such blob is the Plan 91 Alpine minirootfs; the
+    // kind is forward-compatible with any future pinned asset. Lands
+    // in the shared local audit log (not the chain-signed stream),
+    // matching the Stage 0 siblings above. Wire string is stable
+    // (`vendor_blob_fetched`) — log shippers / `mvmctl audit` filter
+    // on it.
+    //
+    /// A vendored bootstrap blob was downloaded and verified, or
+    /// re-verified on a cache hit. Detail format (space-separated
+    /// `key=value`, matching the Stage 0 kinds):
+    ///   `url=<url> sha256=<64hex> pgp=<verified|none|failed> bytes=<n> outcome=<fetched|cache_revalidated>`
+    VendorBlobFetched,
 }
 
 /// A single local audit log entry.
@@ -672,6 +690,45 @@ pub fn emit_to(path: &Path, kind: LocalAuditKind, vm_name: Option<&str>, detail:
         b = b.detail(d);
     }
     b.emit();
+}
+
+/// Return the most recent Stage 0 lifecycle event (`Stage0Boot`,
+/// `Stage0CachePromoted`, or `Stage0Failed`) in the default local
+/// audit log, or `None` if Stage 0 has never run. Plan 93 Phase 3 —
+/// `mvmctl doctor` uses this to answer "when did Stage 0 last run and
+/// how did it land?" without grep-ing the log.
+pub fn read_last_stage0_event() -> Option<LocalAuditEvent> {
+    read_last_stage0_event_in(Path::new(&default_audit_log()))
+}
+
+/// [`read_last_stage0_event`] against an explicit log path (tests
+/// inject a temp JSONL so they don't depend on `$HOME`). Reads only
+/// the live `audit.jsonl` (not the rotated `.1`) and caps the scan to
+/// the tail so `doctor` stays fast on a large log. Malformed lines are
+/// skipped rather than fatal — the log is observability, not a parser
+/// contract.
+pub fn read_last_stage0_event_in(path: &Path) -> Option<LocalAuditEvent> {
+    /// Bound the scan so a near-rotation-size log (10 MiB) doesn't make
+    /// `doctor` parse every line; the last Stage 0 event is always near
+    /// the tail in practice.
+    const MAX_TAIL_LINES: usize = 4096;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut lines: Vec<&str> = contents.lines().collect();
+    if lines.len() > MAX_TAIL_LINES {
+        lines = lines.split_off(lines.len() - MAX_TAIL_LINES);
+    }
+    lines
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<LocalAuditEvent>(line).ok())
+        .find(|ev| {
+            matches!(
+                ev.kind,
+                LocalAuditKind::Stage0Boot
+                    | LocalAuditKind::Stage0CachePromoted
+                    | LocalAuditKind::Stage0Failed
+            )
+        })
 }
 
 /// Audit event types for per-tenant audit logging.
@@ -1194,6 +1251,8 @@ mod tests {
             LocalAuditKind::FlowClosed,
             LocalAuditKind::FlowBytes,
             LocalAuditKind::FlowPolicyDecision,
+            // Plan 93 Phase 3 vendored-blob supply-chain fetch.
+            LocalAuditKind::VendorBlobFetched,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
@@ -1238,11 +1297,61 @@ mod tests {
             (LocalAuditKind::Stage0Boot, "stage0_boot"),
             (LocalAuditKind::Stage0CachePromoted, "stage0_cache_promoted"),
             (LocalAuditKind::Stage0Failed, "stage0_failed"),
+            // Plan 93 Phase 3 vendored-blob supply-chain fetch. Wire
+            // string is load-bearing: `mvmctl audit` + log shippers
+            // filter on `kind == "vendor_blob_fetched"`.
+            (LocalAuditKind::VendorBlobFetched, "vendor_blob_fetched"),
         ];
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
         }
+    }
+
+    #[test]
+    fn read_last_stage0_event_picks_the_last_stage0_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        // Interleave non-Stage0 events so the reader must filter.
+        emit_to(&path, LocalAuditKind::VmStart, Some("vm-a"), None);
+        emit_to(
+            &path,
+            LocalAuditKind::Stage0Boot,
+            None,
+            Some("seed=root-dir fingerprint_prefix=aaaaaaaa flavor=current"),
+        );
+        emit_to(&path, LocalAuditKind::VmStop, Some("vm-a"), None);
+        emit_to(
+            &path,
+            LocalAuditKind::Stage0CachePromoted,
+            None,
+            Some("cache=/x fingerprint_prefix=bbbbbbbb duration_ms=42"),
+        );
+        emit_to(&path, LocalAuditKind::CachePrune, None, Some("removed=0"));
+
+        let ev = read_last_stage0_event_in(&path).expect("a stage0 event");
+        // The promoted event is the most recent Stage 0 entry.
+        assert!(matches!(ev.kind, LocalAuditKind::Stage0CachePromoted));
+        assert_eq!(
+            ev.detail.as_deref(),
+            Some("cache=/x fingerprint_prefix=bbbbbbbb duration_ms=42")
+        );
+    }
+
+    #[test]
+    fn read_last_stage0_event_is_none_without_stage0_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        emit_to(&path, LocalAuditKind::VmStart, Some("vm-a"), None);
+        emit_to(&path, LocalAuditKind::CachePrune, None, Some("removed=0"));
+        assert!(read_last_stage0_event_in(&path).is_none());
+    }
+
+    #[test]
+    fn read_last_stage0_event_missing_log_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.jsonl");
+        assert!(read_last_stage0_event_in(&path).is_none());
     }
 
     #[test]

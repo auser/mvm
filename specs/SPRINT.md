@@ -2384,6 +2384,47 @@ Append §"Threats added" + §"Audit invariants under the agent-evolution explora
 - Touching Apple VZ Swift shims (ADR-056 / Plan 98 own that)
 - Renumbering existing claims or ADRs
 
+## Sprint 59 — fast + secure dev path (Plan 93 Phases 1–3)  🟡 in flight  [`plans/93-fast-secure-dev-path-followups.md`](plans/93-fast-secure-dev-path-followups.md)
+
+### Why this sprint
+Plan 93 Phase 0 (fingerprint correctness) shipped in PR #504; its dependency Plan 91 (Alpine Stage 0) is on `main`. This sprint lands the three remaining phases as a chain of small PRs, ordered so cheap/unblocked observability lands first (every later optimization is then *provable*), then the high-value daily-DX work, then the launch-latency levers (some gated on the unmerged Plan 92/95 slim kernel). Security is the binding constraint: no lever bypasses signed-`ExecutionPlan` admission (claim 8), Ed25519 vsock session auth / no-TSI-bypass (claim 10), the audit chain, or the no-prebuilt-download supply-chain invariants. Worktree: `worktree-plan-93-fast-secure-dev-path`.
+
+### Resolved design decision
+Phase 1 host cross-compile targets **`<arch>-unknown-linux-musl` static**, not glibc-gnu — a glibc binary needs a `/lib` loader a Nix rootfs lacks; musl-static is self-contained and matches `mvm-builder-init`'s existing pattern. This deletes the pinned-sysroot fetch and its supply-chain surface.
+
+### Workstream breakdown (PR chain)
+- [x] **PR-1 — bench harness** `mvmctl bench microvm-launch` (Phase 2 Lever 0; everything measurable hangs off it; libkrun-only in v1; must drive real plan admission). Measurement substrate landed + unit-tested; live libkrun probe is a tracked stub.
+- [x] **PR-2 — `LocalAuditKind::VendorBlobFetched`** (Phase 3; additive observability foundation).
+- [x] **PR-3 — `cache info` / `doctor` enrichment + Stage 0 progress** (Phase 3 observability). Deferred: doctor next-run HIT/MISS fingerprint + docs (Item 5).
+- [ ] ~~**PR-4 — dev-shell split** `dev-minimal`/`dev-compile`~~ **SUPERSEDED by [ADR-064](adrs/064-single-builder-dev-image.md)** (landed on `main` 2026-05-29): single `builder-vm` flake with `default`/`dev` attrs, not a dev-image split.
+- [ ] ~~**PR-5 — musl cross target**~~ **SUPERSEDED by ADR-064**: glibc via `cargo zigbuild`, not static musl.
+- [ ] ~~**PR-6 — `mvmctl dev compile` + per-VM binbridge bind-mount**~~ **SUPERSEDED by ADR-064**: Linux binaries embedded into `mvmctl` at its build time (`build.rs` + `include_bytes!`), extracted to `~/.cache/mvm/host-bins/` — no runtime bind-mount.
+- [ ] ~~**PR-7 — two-runner reproducibility CI lane**~~ folds into ADR-064's build-time cross-compile.
+- [ ] ~~**PR-8 — `/nix` warm-reuse contract**~~ re-scoped under ADR-064's single-flake model.
+- [ ] **Phase 1 re-plan** — implement [ADR-064](adrs/064-single-builder-dev-image.md) as the new Phase 1, coordinated with the `specs/prompts/93-phase-1-2-3-fast-secure-dev.md` track (do not race it).
+- [ ] **PR-9 — handshake pipelining + guest bind-first** (Phase 2 Lever 2; keep Ed25519 auth-before-trust).
+- [ ] **PR-10 — warm pool of supervisors** `--warm-pool-size N` default 0 (Phase 2 Lever 3; guests unbooted until admission; control UDS reuses `deny_unknown_fields` parser + new fuzz target).
+
+### Deferred (tracked in Plan 93 §deferred follow-ups)
+- [ ] Phase 2 Lever 1 kernel cmdline trim — gated on Plan 92/95 merge (plumbing + override allowlist land now).
+- [ ] Phase 2 Lever 4 VMM balloon — blocked on libkrun upstream balloon C API.
+- [ ] Vz + Firecracker/Linux coverage for the bind-mount and the launch bench.
+
+### Sprint 59 success criteria
+- [ ] `mvmctl bench microvm-launch` produces a versioned JSON report + regression-gates against a baseline.
+- [ ] Edit to a guest crate reaches the running dev shell in <10 s via `dev compile` with no VM rebuild ("no LONG dev cycles").
+- [ ] `dev up` boots `dev-minimal` by default; `dev up --compile` boots `dev-compile`.
+- [ ] Reproducibility CI lane is byte-identical across two `macos-14` runners.
+- [ ] PRs 9–10 show measured handshake / process-spawn deltas (sub-200 ms headline itself gated on Plan 92/95).
+- [ ] `doctor` / `cache info` explain Stage 0 hit/miss without grepping the audit log; `vendor_blob_fetched` audited.
+- [ ] No security regression: admission + Ed25519 auth + TSI refusal + control-socket frame rejection covered by negative-path tests; `cargo test --workspace` green; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### Non-goals (explicit)
+- `--prod` admission policy (lives in mvmd).
+- Host-side Nix store mirror / external build-cache providers.
+- Backward-compat shims (first version — hard cutover; stale caches blown away on upgrade).
+- Stage 0 architecture (Plan 91) and slim kernel (Plan 92/95) — depended on, not re-litigated.
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)

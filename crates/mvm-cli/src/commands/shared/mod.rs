@@ -17,7 +17,7 @@ mod vsock;
 pub(super) use build_mode::BuildModeFlags;
 pub(super) use drive::{env_vars_to_drive_file, ports_to_drive_file, read_dir_to_drive_files};
 pub(super) use event::PhaseEvent;
-pub(super) use format::human_bytes;
+pub(super) use format::{human_age_secs, human_bytes};
 pub(super) use hints::with_hints;
 pub(super) use parse::{
     VolumeSpec, clap_flake_ref, clap_port_spec, clap_vm_name, clap_volume_spec, parse_port_spec,
