@@ -36,7 +36,12 @@ fn main() {
         }
         let sha = sha256_hex(&out_file);
         entries.push((name.clone(), out_file.clone(), sha));
-        println!("cargo:rerun-if-changed=crates/{cargo_pkg}/src");
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace_root
+                .join(format!("crates/{cargo_pkg}/src"))
+                .display()
+        );
     }
 
     let embedded_rs = render_embedded_rs(&entries);
