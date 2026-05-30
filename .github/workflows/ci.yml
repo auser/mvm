@@ -345,34 +345,49 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-jailer-
 
       - name: Probe Landlock kernel support
-        # Plan 113 §Task 9 — the property tests assert ABI v2 best-
-        # effort installation. The Landlock sysfs node exposes the
-        # `abi_versions` file when the kernel ships the LSM; if it
-        # is missing (e.g. a stripped runner image), the lane skips
-        # rather than fails so we don't paper over genuine seccomp
-        # regressions with Landlock false-negatives.
+        id: landlock_probe
+        # Plan 113 §Task 9 — the Landlock property test asserts ABI v2
+        # best-effort *enforcement*. The Landlock sysfs node exposes
+        # `abi_versions` only when the kernel ships an active Landlock
+        # LSM. GitHub's stock ubuntu-24.04 runners boot a kernel with
+        # Landlock compiled but not in the active `lsm=` list, so the
+        # node is absent and `confine_self()` reports PartiallyEnforced
+        # (which the code correctly refuses). Record availability as a
+        # step output; the Landlock test step below gates on it so the
+        # lane *skips* (not fails) where the LSM can't enforce. seccomp
+        # has no such dependency and always runs, so genuine seccomp
+        # regressions still fail the lane.
         run: |
           set -euo pipefail
           uname -r
           if [ ! -d /sys/kernel/security/landlock ]; then
-            echo "::warning::Landlock sysfs node missing on this runner;"
-            echo "::warning::ABI v2 is best-effort, but the tests assume it."
-            echo "::warning::Skipping the property test invocation."
+            echo "::warning::Landlock LSM not active on this runner — skipping the Landlock property test (seccomp still runs)."
+            echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "Landlock ABI versions exposed:"
           cat /sys/kernel/security/landlock/abi_versions 2>/dev/null || echo "(file missing)"
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
-      - name: Run seccomp + Landlock property tests
-        # `--ignored` runs only the tests gated by `#[ignore]` in the
-        # two test files (which is the property suite — the rest of
-        # `cargo test -p mvm-jailer-lite` covers the unit-test layer).
-        # `--nocapture` keeps the SIGSYS / EACCES diagnostics visible
-        # in the lane log so a regression surfaces with a readable
-        # cause instead of an opaque "test failed".
+      - name: Run seccomp property tests
+        # seccomp confinement doesn't depend on Landlock, so this runs
+        # unconditionally — a real seccomp regression fails the lane
+        # even on runners whose kernel lacks an active Landlock LSM.
+        # `--ignored` runs the `#[ignore]`-gated property suite;
+        # `--nocapture` keeps SIGSYS diagnostics readable in the log.
         run: |
           cargo test -p mvm-jailer-lite \
             --test seccomp_property \
+            -- --ignored --nocapture
+
+      - name: Run Landlock property tests
+        # Only where the kernel can actually enforce Landlock (probe
+        # found the sysfs node). On stock GitHub runners this skips; it
+        # runs wherever the Landlock LSM is active (self-hosted /
+        # a runner image booted with `lsm=...,landlock`).
+        if: steps.landlock_probe.outputs.available == 'true'
+        run: |
+          cargo test -p mvm-jailer-lite \
             --test landlock_property \
             -- --ignored --nocapture
 
