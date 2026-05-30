@@ -103,10 +103,16 @@ dylib-load / codesign re-exec cost.
 
 - Pure substrate: unchanged, already covered.
 - **Live integration test** gated behind a `libkrun-live` feature (or
-  `MVM_LIBKRUN_LIVE=1`) so it runs only where libkrun boots (the
-  target host + a capable macOS CI runner). Asserts a single
-  `measure_once` returns finite, ordered spans
+  `MVM_LIBKRUN_LIVE=1`) so it runs only where libkrun boots. Asserts
+  a single `measure_once` returns finite, ordered spans
   (`start_to_pid <= total_ready`, all `> 0`).
+- **CI caveat (honest):** GitHub's hosted macOS runners generally do
+  **not** expose Hypervisor.framework nested virt for a libkrun
+  guest, so the live test + the committed baseline realistically run
+  **only on a dev host or a self-hosted macOS runner**, not stock CI.
+  The pure substrate stays CI-gated; the *live* lane is
+  host/self-hosted-gated. The plan does not claim stock-CI
+  regression-gating it cannot deliver.
 - Commit the first real run as the baseline JSON
   (`microvm-launch-latest.json`) so PR-10b has a regression baseline.
 
@@ -195,11 +201,18 @@ That reduces B-ii's residual risk to three items, each with a
 required mitigation that is part of PR-10b's core (not optional):
 
 1. **Replay** (capture an attach, replay to another idle standby) →
+   the **per-supervisor binding nonce is the primary defense here,
+   not defense-in-depth.** Each standby is a *fresh process* with a
+   *fresh* nonce ledger, so the plan's own nonce-replay store does
+   **not** stop a captured attach being redirected to a *different*
+   idle standby (the second standby's ledger has never seen the
+   nonce). What stops it: the base-config binding nonce (unique per
+   standby, spawned-in) must be echoed in the attach, so an attach
+   minted for standby A is rejected by standby B. Combined with
    **one-shot attach** (a standby accepts exactly one attach, then
-   boots or dies — no reject-and-wait loop) + **per-supervisor
-   binding nonce** (the base-config nonce must be echoed in the
-   attach, so a captured attach for standby A is invalid for standby
-   B) + the plan's own G4 window + nonce-replay store.
+   boots or dies — no reject-and-wait loop) and the plan's own G4
+   time window, cross-standby replay is closed. (The plan nonce-replay
+   store still guards single-standby replay and the non-pool path.)
 2. **DoS / pool exhaustion** → bounded pool size + per-connection
    attach timeout; abandoned connects do not wedge a slot.
 3. **Idle entitled-process exposure** → reaper TTL + liveness,
@@ -236,30 +249,69 @@ destination-bound/time-bound signed-credential machinery (claim 13 /
 ADR-049, `mvm-core/src/protocol/{broker,host_signer}.rs`) is the
 established pattern to reuse — no corner is painted.
 
-### mvm / mvmd boundary
+### mvm / mvmd boundary — what is actually reachable today
 
-mvmd is the orchestrator for building and launching microvms; the
-pool must be **reachable from mvmd**, which builds `ExecutionPlan`s
-programmatically against `mvm-core` (it does not shell out to
-`mvmctl`). Therefore:
+**Verified against `../mvmd` (2026-05-29).** mvmd is the orchestrator,
+but its runtime launches microvms via **Firecracker + jailer,
+directly, on Linux/KVM** (`crates/mvmd-runtime/src/security/jailer.rs`
+shells out to `/usr/bin/jailer --exec-file $(which firecracker)`;
+instances track `firecracker_pid`). mvmd **never references libkrun,
+`VmBackend`, or `VmStartConfig`** — it consumes mvm only through the
+`mvmctl::core` / `mvmctl::guest` / `mvmctl::runtime` *facade* (types,
+vsock, shell), not the launch seam. mvmd is also a *future, not
+well-defined* endeavor.
 
-- The pool-claim hangs off the **`VmBackend::start` / launch-config
-  seam**, not CLI arg-parsing. `warm_pool_size: u32` (default 0) is a
-  new field on **`VmStartConfig`**
-  (`mvm-core/src/protocol/vm_backend.rs:30`, alongside the existing
-  `tenant_id` / `plan_json` / `bundle_json`). `--warm-pool-size` is a
-  thin CLI wrapper onto it; mvmd sets the same field.
+Consequences for the warm pool:
+
+- The v1 libkrun standby pool is **not reachable from mvmd today**,
+  and adding a field to `VmStartConfig` does not change that — mvmd
+  doesn't go through that path. The libkrun pool's v1 beneficiary is
+  **local macOS `mvmctl up` / dev-loop latency**, which is a real
+  Phase 2 target, but it is *not* the fleet.
+- mvmd's real benefit (it launches at fleet scale — where warm pools
+  pay off most) requires a **Firecracker standby pool**, already a
+  deferred follow-up. v1 stays libkrun because libkrun is the only
+  backend that **boots and is bench-verifiable on the dev host**
+  (Firecracker needs `/dev/kvm`; it cannot be live-tested on macOS),
+  and because the risky, load-bearing part of the design is
+  backend-agnostic (see "Designed for the Firecracker port" below).
+
+So the seam is positioned, not delivered:
+
+- `warm_pool_size: u32` (default 0) is a new field on the
+  backend-agnostic **`VmStartConfig`**
+  (`mvm-core/src/protocol/vm_backend.rs:30`, alongside `tenant_id` /
+  `plan_json` / `bundle_json`) **specifically so a future Firecracker
+  standby reads the same field** — not because mvmd reads it today.
+  `--warm-pool-size` is a thin CLI wrapper onto it.
 - **Replenish-on-use** is the no-daemon maintainer: each launch tops
   the pool back to target after claiming a standby. A library-level
-  "ensure pool at target" entry point lets mvmd drive sizing
-  directly.
-- **mvm owns the mechanism + replenish; mvmd owns sizing policy**
-  (per-tenant pre-warm, autoscale) — orchestration territory per
-  `feedback_prod_gate_lives_in_mvmd`. The mvmd integration (setting
-  `warm_pool_size` per host, fleet-level pre-warming at the instance
-  layer) is **deferred and tracked in the mvmd repo's plan** + Plan
-  93 `§deferred follow-ups`; this PR ships no cross-repo wiring, only
-  the reachable seam.
+  "ensure pool at target" entry point is provided for a future
+  orchestrator to drive sizing.
+- **mvm owns the mechanism + replenish; sizing policy is
+  orchestration territory** (`feedback_prod_gate_lives_in_mvmd`).
+  Real mvmd reach is **gated on the Firecracker standby follow-up**,
+  tracked in Plan 93 `§deferred follow-ups` (and the mvmd repo when
+  it firms up). This PR ships no cross-repo wiring.
+
+### Designed for the Firecracker port
+
+The follow-up that actually serves mvmd is a Firecracker standby
+pool. To keep that port mechanical, PR-10b separates backend-agnostic
+from libkrun-specific pieces:
+
+- **Backend-agnostic (reused verbatim by Firecracker):** the
+  `warm_pool_size` config field, the `SupervisorAttachConfig` schema
+  + `deny_unknown_fields`, the security gate (supervisor re-verifies
+  signed plan + G4 window + nonce + binding nonce, one-shot),
+  replenish-on-use, the `~/.mvm/pool/<id>/` state-dir + reaper +
+  `cache prune` integration, and the bench-measured span model.
+- **libkrun-specific (re-implemented per backend):** the "build
+  `KrunContext` (kernel load) then block before `start_enter`"
+  blocking primitive. The Firecracker equivalent is "pre-spawn
+  firecracker/jailer up to the boot API call, block, then issue
+  `InstanceStart` on attach" — a different blocking point, same
+  protocol around it.
 
 ### Default-off
 
@@ -335,10 +387,17 @@ process-spawn delta, not the headline number.
 
 ### Deferred follow-ups (tracked in Plan 93 §deferred follow-ups)
 
-- [ ] mvmd sizing hookup: mvmd sets `warm_pool_size` per host +
-      fleet-level instance pre-warming — designed in the mvmd repo.
-- [ ] Vz / Firecracker / Apple-Container standby pools (different
-      process models).
+- [ ] **Firecracker standby pool — the mvmd-facing deliverable.**
+      mvmd launches Firecracker/jailer on Linux and does not consume
+      the libkrun seam; the Firecracker standby (pre-spawn to the
+      boot API call, block, `InstanceStart` on attach) reuses v1's
+      backend-agnostic attach schema + `warm_pool_size` + security
+      gate. This, not the libkrun v1, is what makes warm pools
+      reachable from the orchestrator.
+- [ ] mvmd sizing hookup: once a Firecracker standby exists, mvmd
+      sets `warm_pool_size` per host + fleet-level instance
+      pre-warming — designed in the mvmd repo when it firms up.
+- [ ] Vz / Apple-Container standby pools (different process models).
 - [ ] Optional decoupled attach credential via `host.secrets.v1`
       pattern, if attach validity must be shorter than plan validity.
 
@@ -353,6 +412,7 @@ process-spawn delta, not the headline number.
       without a valid signed + in-window + non-replayed + correctly
       bound plan; fuzz + negative-path tests cover it; `cargo test
       --workspace` green; clippy clean.
-- [ ] `warm_pool_size` is reachable and settable from the
-      `mvm-core` launch-config seam (mvmd-reachable), not only the
-      CLI.
+- [ ] `warm_pool_size` is settable from the backend-agnostic
+      `mvm-core` launch-config seam (not only the CLI), positioned so
+      the deferred Firecracker standby — the actual mvmd-facing
+      path — reads the same field unchanged.
