@@ -265,6 +265,7 @@ actually populate at runtime. Execution detail and field map live in
       the supervisor stdin pipe.
 - [ ] Live smoke per backend × network (libkrun+passt,
       libkrun+gvproxy, Vz+gvproxy) — pending Plan 112 PR merge.
+- [x] **NetworkProvider observer fan-out + Firecracker substrate (Plan 113, Path X)** — observer machinery added inside `mvm-supervisor::gateway_bridge` (not duplicated in mvm-core); existing `FlowEvent` + `FlowEventWire` + `signer_task` preserved; Vz drainer ships as new `mvm-vz-drainer` binary linking `mvm-supervisor`; Firecracker substrate ships as new `mvm-firecracker-bridge` binary under `mvm-jailer-lite` confinement (seccomp + Landlock). See [ADR-064](../adrs/064-network-provider-trait.md) and [Plan 113](113-network-provider-trait-firecracker-substrate.md).
 
 ### W6.B follow-ups (real flow extraction, next PR in this work stream)
 
