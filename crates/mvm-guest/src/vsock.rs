@@ -71,6 +71,31 @@ const CONNECT_RETRIES: u32 = 3;
 /// Delay between CONNECT handshake retries.
 const CONNECT_RETRY_DELAY_MS: u64 = 500;
 
+/// Base delay for the adaptive readiness-poll backoff (Plan 93 Phase 2
+/// Lever 2). The first poll after a failed attempt waits this long.
+const ADAPTIVE_BACKOFF_BASE_MS: u64 = 20;
+
+/// Cap for the adaptive readiness-poll backoff — the historical fixed
+/// poll interval. Backoff grows from [`ADAPTIVE_BACKOFF_BASE_MS`] up to
+/// this ceiling so a slow guest still polls at the old steady cadence.
+const ADAPTIVE_BACKOFF_CAP_MS: u64 = 500;
+
+/// Adaptive backoff delay for the `mvmctl up` readiness poll
+/// (Plan 93 Phase 2 Lever 2). `attempt` is 0-based: attempt 0 waits the
+/// base, each subsequent attempt doubles, capped at
+/// [`ADAPTIVE_BACKOFF_CAP_MS`]. This replaces a fixed 500 ms sleep that
+/// cost up to ~480 ms of dead time after a fast-binding guest was
+/// already reachable; the cap preserves the old steady-state cadence
+/// for a slow guest. Pure — the schedule is unit-tested. This changes
+/// *timing only*; it never reorders or skips the protocol/auth steps a
+/// caller performs between polls.
+pub fn adaptive_backoff(attempt: u32) -> Duration {
+    // Saturating shift so a large `attempt` can't overflow; it clamps
+    // to the cap well before the shift would wrap.
+    let scaled = ADAPTIVE_BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(16));
+    Duration::from_millis(scaled.min(ADAPTIVE_BACKOFF_CAP_MS))
+}
+
 // ============================================================================
 // Guest agent protocol (JSON over vsock)
 // ============================================================================
@@ -2401,6 +2426,26 @@ pub fn start_port_forward_on(stream: &mut UnixStream, guest_port: u16) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_backoff_grows_then_caps_and_is_never_zero() {
+        // Doubles from the 20ms base.
+        assert_eq!(adaptive_backoff(0), Duration::from_millis(20));
+        assert_eq!(adaptive_backoff(1), Duration::from_millis(40));
+        assert_eq!(adaptive_backoff(2), Duration::from_millis(80));
+        assert_eq!(adaptive_backoff(3), Duration::from_millis(160));
+        assert_eq!(adaptive_backoff(4), Duration::from_millis(320));
+        // Caps at the historical fixed interval and stays there.
+        assert_eq!(adaptive_backoff(5), Duration::from_millis(500));
+        assert_eq!(adaptive_backoff(6), Duration::from_millis(500));
+        // Large attempt counts can't overflow or drop to zero.
+        assert_eq!(adaptive_backoff(64), Duration::from_millis(500));
+        assert_eq!(adaptive_backoff(u32::MAX), Duration::from_millis(500));
+        // Never busy-spins.
+        for a in 0..40 {
+            assert!(adaptive_backoff(a) >= Duration::from_millis(ADAPTIVE_BACKOFF_BASE_MS));
+        }
+    }
 
     #[test]
     fn test_guest_request_roundtrip() {
