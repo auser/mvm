@@ -188,6 +188,7 @@ The spine is *believed* complete (fresh build → `overlay_aware: true` → admi
 - [ ] Linux / Firecracker parity for this same E2E (own plan; `/dev/kvm` test backend).
 - [ ] Encrypt build artifacts at rest + upgrade vsock frames to Noise (plan 122) — completes §4's *full* acceptance.
 - [ ] The downloaded `default-microvm` admit blocker (manifest-less image) — separate from this fresh-build path; blocks the bench baseline.
+- [ ] Builder/dev-VM agent ping (proves the guest agent is *universal* across VM types — ADR-066 §6 invariant) — depends on **plan 124** making `mvm-host-vm-init` fork `mvm-guest-agent`; this plan's E2E only pings the *workload* microVM's agent.
 
 ## Self-review
 
