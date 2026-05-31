@@ -31,6 +31,8 @@
 
 ## Task 1: Rename `ArtifactSidecar` → `ArtifactManifest`
 
+> **✅ LANDED 2026-05-31** (out-of-band, owner request). Renamed the *type* in the 3 code files that use it — `runtime_meta.rs`, `builder_vm.rs`, `dev_build.rs` — plus the two docs that name it; build + `admit_overlay_aware`/round-trip tests + clippy green; `SIDECAR_FILENAME` + `mvm-meta.json` unchanged. The earlier "6 files" count conflated the type with the `SIDECAR_FILENAME` *constant* (which stays in 3 other files). The steps below are the historical recipe.
+
 Mechanical type rename; the existing round-trip + admit tests in `builder_vm.rs` are the guard (they must stay green). The on-disk filename (`mvm-meta.json`) and the `SIDECAR_FILENAME` constant are **unchanged** (renaming the file would be a real migration; out of scope).
 
 **Files:** the 6 listed above. **Test:** the existing `crates/mvm-build/src/builder_vm.rs` `mod tests` (`admit_overlay_aware_*`, sidecar round-trip).
@@ -202,7 +204,7 @@ The gap analysis (`specs/research/embeddable-sandbox-sdk-dx-gap-analysis.md`) pu
 
 ## Acceptance (this plan is done when)
 
-- [ ] `ArtifactSidecar` → `ArtifactManifest` rename landed; `cargo test --workspace` + `cargo clippy --workspace -- -D warnings` green.
+- [x] `ArtifactSidecar` → `ArtifactManifest` rename landed (2026-05-31, 3 code files); build + affected tests (`mvm-build`/`mvm-base`) + clippy green.
 - [ ] `crates/mvm-cli/tests/compile_hello_app.rs` passes (decorator `app.py` lowers to `flake.nix` + `launch.json`); the stale `compile.rs` docstring is corrected.
 - [ ] `crates/mvm-cli/tests/core_demo_e2e.rs` exists, is `MVM_E2E_SMOKE`-gated, and is **green on a macOS/libkrun host** end-to-end (`dev up` → `compile` → `up` with the agent reachable).
 - [ ] The one-shot `Sandbox.exec(...)` returns stdout on a dev-tier sandbox and raises `SandboxDevOnly` in prod; the quickstart leads with it.
