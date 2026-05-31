@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stand up the remaining trait seams — `NetworkProvider` (provisioning + ingress/egress default-deny + DNS + audit, with the egress proxy 129 hangs on), `StorageProvider` (host-owned local/encrypted/content-addressed/snapshot volumes, consuming 122's crypto), and `FilesystemProvider` (pluggable mount sources — host/volume/tmpfs built-in, S3/Hetzner/NFS as feature-gated external impls) — and the warm-start substrate, honestly per-backend: full live-memory fast-resume on Firecracker, save/restore on Vz (macOS 26+), disk-snapshot only on libkrun. Creates the 17th crate, `mvm-network`.
+**Goal:** Stand up the remaining trait seams — `NetworkProvider` (provisioning + ingress/egress default-deny + DNS + audit, with the egress proxy 129 hangs on), `StorageProvider` (host-owned local/encrypted/content-addressed/snapshot volumes, consuming 122's crypto), and `MountProvider` (pluggable mount sources — host/volume/tmpfs built-in, S3/Hetzner/NFS as feature-gated external impls) — and the warm-start substrate, honestly per-backend: full live-memory fast-resume on Firecracker, save/restore on Vz (macOS 26+), disk-snapshot only on libkrun. Creates the 17th crate, `mvm-network`.
 
 **Architecture:** Three subsystems behind traits, per ADR-066 §1–2 and ADR-064. `mvm-network` (new) owns `NetworkProvider`; `mvm-storage` (kept) owns `StorageProvider` and calls 122's `mvm_core::crypto` for the encrypted impl; warm-start extends the `VmBackend` capability the trait already models (`backend.rs` has `pause`/`resume` + a capability flag, with `pause_resume_unsupported_on_{libkrun,apple_container,microvm_nix}` tests today). The pieces exist in scattered form (`mvm-backend/network.rs`, the firewall/proxy in the old `mvm-supervisor` → `mvm-hostd`, `instance_snapshot.rs`'s Firecracker `vmstate.bin`/`mem.bin` store); this plan consolidates them behind the seams and fills the gaps.
 
@@ -74,20 +74,20 @@ ADR-066 §5 — the encrypted volume impl lives here and calls 122's engine. Pla
 
 - [ ] **Step 1:** Failing tests — a content-addressed volume dedups identical content by digest; a snapshot-upper volume (COW over a read-only base) writes only the delta. Commit after green. (This is the storage half of the warm-start diff-snapshot in Phase C.)
 
-### Task B4: `FilesystemProvider` — pluggable mount sources
+### Task B4: `MountProvider` — pluggable mount sources
 
 The IR `MountSource` is a closed enum (`Volume`/`HostPath`/`Tmpfs`) — a new source means a core-enum edit. Add the seam so external sources (S3, Hetzner Volume, NFS) are "implement + register," and the cloud-SDK deps stay off the default build (dep budget). Lives in `mvm-storage` (no new crate).
 
-**Files:** `crates/mvm-storage/src/fs_provider.rs` (new); `crates/mvm-ir/src/workload.rs` (the `MountSource` enum ~line 418).
+**Files:** `crates/mvm-storage/src/mount_provider.rs` (new); `crates/mvm-ir/src/workload.rs` (the `MountSource` enum ~line 418).
 
-- [ ] **Step 1:** Failing test — a `FilesystemProvider` registry resolves `HostPath` → a host path and `Volume` → a block device (via `StorageProvider`); an unknown `External { provider }` returns a typed `UnknownFsProvider` (no silent default).
+- [ ] **Step 1:** Failing test — a `MountProvider` registry resolves `HostPath` → a host path and `Volume` → a block device (via `StorageProvider`); an unknown `External { provider }` returns a typed `UnknownFsProvider` (no silent default).
 - [ ] **Step 2:** Define the trait + registry:
   ```rust
   // Resolves a mount's *source* into something VmBackend can attach. The share
   // mechanism (virtiofs / virtio-blk) stays VmBackend's job; this is only "where
   // do the bytes come from". External sources register here without a core edit.
   pub enum Mountable { HostPath(PathBuf), BlockDev(PathBuf), Fuse(FuseHandle) }
-  pub trait FilesystemProvider: Send + Sync {
+  pub trait MountProvider: Send + Sync {
       fn kind(&self) -> &str;                          // "host_path" | "volume" | "s3" | "hetzner_volume" | ...
       fn resolve(&self, src: &MountSource) -> Result<Mountable>;
       fn release(&self, m: Mountable) -> Result<()>;
@@ -95,7 +95,7 @@ The IR `MountSource` is a closed enum (`Volume`/`HostPath`/`Tmpfs`) — a new so
   ```
   Built-ins: `HostPathFs`, `VolumeFs` (delegates to `StorageProvider`), `TmpfsFs`. VmBackend attaches the `Mountable` (virtiofs for a path, virtio-blk for a device).
 - [ ] **Step 3:** Extend the IR `MountSource` with an open `External { provider: String, config: serde_json::Value }` variant (keep the built-ins); the inner `config` is the provider's to validate. Serde round-trip + an unknown-provider rejection test.
-- [ ] **Step 4:** Ship an `ExampleExternalProvider` (the "implement + register" proof) + **feature-gated** `s3` / `hetzner-volume` stubs — the real impls (object-store / the Hetzner API) land behind features later so their deps stay off the default build. Test registration + the example resolve. Commit.
+- [ ] **Step 4: Build a real S3 `MountProvider`** (the one external impl), feature-gated `s3` via the lean `object_store` crate. `resolve` reads bucket + prefix from `MountSource::External { provider: "s3", config }`, syncs the prefix **read-only** to a local cache volume (reuse `StorageProvider`), and returns it as the `Mountable`. Failing test against `object_store`'s in-memory backend (no network): a seeded object lands in the mounted cache path; and `s3` off → `object_store` absent from the default `cargo tree`. Read-write / lazy-FUSE S3 + a Hetzner-Volume impl are follow-ups — the registry makes them drop-in. Commit.
 
 ## Phase C — warm-start (per-backend capability matrix)
 
@@ -130,7 +130,7 @@ The wireable macOS live-memory path. Coarser than UFFD (a full save/restore), bu
 
 - [ ] `mvm-network` exists (17th crate); `NetworkProvider` provisions gvproxy/passt/TAP behind the trait; ingress **and** egress default-deny; DNS + flow audit; the egress proxy carries the substitution + leak-scan seams (no-op until 129).
 - [ ] `StorageProvider` with `local` + `encrypted` (122-backed, both platforms) + content-addressed + snapshot-upper impls; encrypted on-disk bytes are ciphertext, guest sees plaintext.
-- [ ] `FilesystemProvider` resolves host/volume/tmpfs mounts; the IR's open `MountSource::External` + a registered `ExampleExternalProvider` prove external sources (S3/Hetzner/NFS) plug in without a core edit, feature-gated off the default build.
+- [ ] `MountProvider` resolves host/volume/tmpfs mounts; the IR's open `MountSource::External` + a **real feature-gated S3 impl** (`object_store`, read-only sync-to-cache) prove external sources plug in without a core edit; `s3` off → no `object_store` in the default tree.
 - [ ] Warm-start is a per-backend capability: **Firecracker** live-memory fast-resume (UFFD/NBD/hugepages, ~1s, VMGenID-reseeded), **Vz** save/restore (macOS 26+), **libkrun** disk-only — each surfaced by `doctor`, none silently degrading.
 - [ ] `cargo test --workspace` (host tiers) + the gated live-KVM/macOS lanes + clippy + fmt green.
 
