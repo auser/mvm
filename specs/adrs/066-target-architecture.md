@@ -55,7 +55,7 @@ The target is **17 architectural crates** (from 32), plus a bracketed-off `crate
 
 ### 2. FFI bindings live under `crates/deps/*-sys` (current + anticipated)
 
-All unsafe FFI bindings to named external libraries are minimal `-sys` crates grouped under `crates/deps/`. Each holds **only** the binding (bindgen/`extern` surface + a thin safe wrapper) — never selection, dispatch, or policy. The consuming role crate depends on it. This is the brief's "one honest exception" to role-based naming, kept physically demarcated so the FFI boundary (and its `bindgen`/`libclang` build cost) is isolated and auditable.
+Anything that **binds, vendors, or compiles** an external or C/C++ library is a minimal `-sys` crate grouped under `crates/deps/` — FFI bindings (bindgen / `extern`) **and** crates that build a vendored native library via `cc` / `cmake` / a `build.rs`. Each holds **only** the binding/build surface (+ a thin safe wrapper) — never selection, dispatch, or policy; the consuming role crate depends on it. This is the brief's "one honest exception" to role-based naming, kept physically demarcated so the whole extern/C boundary (and its `bindgen` / `libclang` / native-compile build cost) is isolated and auditable. **No architectural crate compiles or links a C/extern library directly** — it always goes through a `crates/deps/*-sys` crate.
 
 | `crates/deps/` crate | Binds | Consumed by | Status |
 |---|---|---|---|
