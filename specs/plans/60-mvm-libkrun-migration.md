@@ -8,7 +8,7 @@ The pivot in this iteration: **libkrun (libkrun-backed) becomes the builder and 
 
 ### Product positioning — the workloads we must serve
 
-mvm is a **safe execution environment for AI agents and developer code**, in the same product class as smolmachines.com, Modal sandboxes, and OpenAI Code Interpreter. The five workloads we must serve well:
+mvm is a **safe execution environment for AI agents and developer code**, in the same product class as other secure AI-agent sandboxes and hosted code-interpreters. The five workloads we must serve well:
 
 1. **Claude-Code-in-dangerous-mode**: a developer runs Claude Code (or another agent) inside a microVM where they don't have to approve every action — the VM itself is the security boundary. The host stays safe even when the agent does anything within the VM.
 2. **One-click "safe OpenClaw"** deployment template — hardened defaults, audit log, restricted egress.
