@@ -1,4 +1,4 @@
-# Plan 93 PR-10a — live `bench microvm-launch` probe Implementation Plan
+# Plan 119 — live `bench microvm-launch` probe Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
@@ -29,7 +29,7 @@ behind a `libkrun-live` cargo feature so stock CI skips it.
 
 ## Design spec
 
-`specs/plans/93-pr10-supervisor-standby-pool-and-live-bench.md`
+`specs/plans/118-supervisor-standby-pool-and-live-bench.md`
 (Part A). Read it first.
 
 ## File structure

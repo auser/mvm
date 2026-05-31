@@ -1,6 +1,6 @@
-# Plan 93 PR-10 — supervisor standby pool + live launch bench (design)
+# Plan 118 — supervisor standby pool + live launch bench (design)
 
-**Status:** design drafted 2026-05-29. Child of
+**Status:** design drafted 2026-05-29 (renumbered from the Plan 93 PR-10 draft). Child of
 [`93-fast-secure-dev-path-followups.md`](93-fast-secure-dev-path-followups.md)
 (Phase 2 Lever 0 + Lever 3) and Sprint 59
 (`worktree-plan-93-fast-secure-dev-path`). Sequenced **A → B**:

@@ -1,7 +1,7 @@
 //! Live boot orchestration for `mvmctl bench microvm-launch`. Kept
 //! out of `bench.rs` so the pure stats/schema substrate stays
-//! VM-free. See Plan 93 PR-10a
-//! (`specs/plans/93-pr10a-live-bench-probe-impl-plan.md`).
+//! VM-free. See Plan 119
+//! (`specs/plans/119-live-bench-probe-impl-plan.md`).
 
 use anyhow::{Context, Result};
 
