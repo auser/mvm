@@ -1,0 +1,474 @@
+# Plan 117 — mvm Cleanup & Rearchitecture Brief
+
+**Status**: Draft brief (planning input — not yet an execution plan)
+**Date**: 2026-05-30
+**Provisional number**: verify 117 is free against open PRs before committing (numbering has no CI uniqueness gate).
+
+## Context
+
+`mvm` grew through many AI-assisted sessions and now carries crate sprawl (~32 crates / ~247k LOC), duplicated subsystems (6 vsock framings, 4 config loaders, 3 signer templates), stubs, and 65 ADRs / 110+ plans with overlap — while holding a **14-claim, CI-enforced security posture** that must survive any cleanup. This brief is the *planning input* for a full cleanup-and-rearchitecture: it captures (A) findings from a grounding pass over the code, ADRs, plans, and in-flight worktrees; (B) the open decisions; and (C) a self-contained prompt to drive the rearchitecture session.
+
+The rearchitecture this brief feeds is a **complete refactor executed step-by-step**: **brainstorm → consolidate ADRs → write one architecture ADR → write one plan per workstream → execute them in sequence**, the **core demo first** as the tracer slice (hello-world → booting microVM via the persistent builder VM, on a clean spine, CI green), then every remaining subsystem until the whole project is rebuilt. Big-bang in scope, incremental in execution. This document is the starting context, not the execution plan.
+
+This brief has three parts:
+
+- **Part A — Findings**: what the initial rough prompt was missing, and the two places it collides with decisions already on `main`.
+- **Part B — Decisions to confirm**: four forks where intent changes the plan; each has a recommended default so Part C is runnable as-is.
+- **Part C — The prompt**: a self-contained prompt for the rearchitecture session. It assumes that session has `CLAUDE.md` + auto-memory but no memory of how this brief was produced.
+
+Grounding: the live workspace is **32 crates / ~247k LOC** (not the "7 + facade" `SPRINT.md` still claims), **65 ADRs**, **110+ plans**, **~20 active worktrees** (5 on Plan 104, 1 on Plan 115), the **14-claim** security model in `CLAUDE.md` / ADR-002, and the core-demo path through the builder VM. The current live sprint focus is the **Dependency Reduction Roadmap** (723 `Cargo.lock` packages) — this cleanup is its continuation.
+
+---
+
+## Part A — Findings
+
+The initial direction is sound. These are the gaps to fill before executing.
+
+### A1. Scope vs. the #1 goal are in tension — make it phased
+"Rearchitect the **entire** project" *and* "the #1 goal is the **core demo**" conflict in effort if read as "one shot." Resolved (Decision #1): a **complete refactor executed step-by-step** — decide architecture + collapse ADRs, then the core demo as the first tracer slice, then every remaining subsystem in sequence (one plan per session, CI green between). Big-bang in *scope*, incremental in *execution* — **all** workstreams ship, none are deferred; a literal single-commit rewrite is rejected (unreviewable, not resumable).
+
+### A2. ~20 in-flight worktrees will collide catastrophically — define sequencing
+Plan 104 (host-services broker hardening, **5** worktrees) and Plan 115 (single builder/dev image, 1 worktree) are mid-flight and touch the exact subsystems a rearchitecture rewrites (broker, signers, builder VM, embedded binaries). Memory says *check in-flight work first* and *always use worktrees*. The prompt must: enumerate `git worktree list` + `gh pr list` first; **let 104/115 land** (or rebase onto them); do the rearchitecture on a long-lived integration branch in its own worktree; never rewrite a file another worktree is actively changing.
+
+### A3. "Keep the same security guarantees" is unsafe unless you name them
+"Ruthless cleanup" + "keep the guarantees" will silently drop a claim unless the 14 are an explicit preservation checklist. The prompt embeds them as **hard invariants**, each tied to its CI gate, with the rule: *if a simplification would weaken any claim or remove its gate, stop and surface it.*
+
+### A4. The biggest landmine: "reduce crates" vs. crates that exist for **process isolation**
+Several small crates are small *on purpose* — they are separate **runtime processes** so a compromise in one can't read another's address space. The four-subprocess broker (ADR-061: broker / secrets-dispatcher / host-signer / audit-signer) backs **claims 12 & 13**; the audit-signer being the *sole* key holder + JSONL writer backs **claim 8**. Naively merging these to "cut crate count" destroys the guarantee. **Key insight: runtime process isolation ≠ build-time crate count.** You *can* reduce crates (multiple `[[bin]]` targets in one crate, a shared scaffold lib) while keeping the processes separate.
+
+### A5. Zig guest agent collides with ADR-063
+ADR-063 (2026-05-28): Rust is the non-negotiable default at the boundary; anything driving the audit chain or with a broad protocol surface **stays Rust**; "lean Rust v2" (drop `tokio`/`serde_json`/`rtnetlink` for `polling`/hand-rolled/`linux-raw-sys`) is the *mandated first move*; non-Rust needs an ADR + six CI-gate deliverables. The **guest agent does both forbidden things** (audit + broad surface), so a Zig agent is essentially off-limits *as written*. Zig's legitimate lane is the narrow `mvm-guest-netinit` shim, which Plan 109 is already A/B-testing. Decision needed (see B2).
+
+### A6. "Encrypt everything in-flight (vsock)" — closing a gap, not changing the model
+ADR-027's four-boundary table already prescribes: vsock = `AuthenticatedFrame` with **X25519 ephemeral session keys + HMAC** (forward secrecy); agent↔hostd UDS = mTLS; mvmd hop = iroh TLS (no double layer); volumes = LUKS2/APFS AES-XTS; snapshots = AES-256-GCM per-tenant DEK wrapped by tenant KEK. ADR-042 is the accepted substrate. The exploration found this is **designed but largely unbuilt** (`aes-gcm` is in the tree but unused; vsock is cleartext-JSON + Ed25519-signature = authenticity only). So the demand = **implement ADR-027 + ADR-042**. Boundary: encrypting against a *malicious host* (who owns the hypervisor and can read guest RAM) is **confidential computing** and is explicitly out-of-scope in ADR-002 — going there is a real posture change (see B4).
+
+### A7. Boot performance is a stated pillar with no targets or method
+Docs cite ~125 ms (Firecracker reference), busybox-as-PID-1, a sub-100 ms cold-start aspiration (ADR-048), warm pools (parked). The prompt must set an explicit **budget** (target < 200 ms, < 300 ms acceptable), name the levers (tiny kernel, busybox PID1, kernel-config slimming, squashfs vs ext4, snapshot/restore for warm start), and **require a benchmark harness** so "fast" is measured, not asserted. Baseline blocker to fix first: the `default-microvm` image can't boot the admitted path.
+
+### A8. Networking & storage trait parity is uneven
+The **VmBackend** trait is solid (8 impls). But **networking is not trait-abstracted** — `VmNetworkInfo` is a concrete struct; ADR-064's `NetworkProvider` is *proposed* and scoped to audit-observation, not provisioning. **Storage** has a `VolumeBackend` trait but only `LocalBackend` ships in-repo (encrypted/object backends live in mvmd). The "networking looks the same on every platform" + "programmable storage" goals are *real new abstraction work*: a `NetworkProvider` (provision + audit) and a `StorageProvider` with at least local + **encrypted** impls in-repo.
+
+### A9. Audit "centralized" vs. the mvmd boundary
+Today audit is **local chain-signed JSONL** per tenant (`~/.mvm/audit/<tenant>.jsonl`), verified by `verify_audit_chain`. "Centralized logging" is **mvmd** territory (aggregation), and `host.audit.v1` (ADR-062) is the workload→host hook. Keep the local chain-signed log as the source of truth in *this* repo; don't blur the cross-repo boundary (`--prod` gate lives in mvmd).
+
+### A10. Hooks already have an in-flight contract
+There's a `feat/mvm-hook-contract` worktree. Memory pins four hooks (`before_build` / `before_start` / `after_start` / `before_stop`), with addons carrying their own hooks merged at compile time. "Hooks for all events" is broader — decide the surface and *align with the in-flight contract* rather than inventing a parallel one.
+
+### A11. Secret substitution is mid-rescope
+ADR-049 → 059 → 061 → **062** churned: `host.secrets.v1` was **dropped** from v1, `host.audit.v1` added. "No microVM sees a secret; substitute on the way out" = the egress-time, **destination-bound signed credential** model (not raw secrets). Also parked: "egress secret detection/obfuscation is a core feature" — preserve as backlog, and don't paint it into a corner.
+
+### A12. ADR collapse worklist
+- **Builder VM evolution**: 013 → 046 → 057 → 065 are sequential refinements of one subsystem → collapse into one "Builder VM architecture" ADR (keep history).
+- **Broker**: 061 already supersedes 059's architecture; 062 rescopes. Collapse 049/059/061/062 → one "Host services broker" ADR with a superseded-history note.
+- **Entrypoints**: fold 010 + 011 into 007 as sub-sections.
+- **Leave separate** (orthogonal, not dup): 004/006/064 (egress policy / CA / network audit); 027/042 (encryption scope vs. mechanism); 002/048 (claims table vs. product positioning).
+
+### A13. Determinism / supply-chain invariants you must not regress
+Claim 7 (reproducible double-build), **source-checkout-never-downloads** (ADR-046), **host-Nix-never-used** (CLAUDE.md), no external build-cache providers. A rewrite that shells to host `nix` or downloads a prebuilt on the contributor path silently breaks the model.
+
+### A14. Lint/CI discipline is part of the posture
+ADR-033: `forbid(unsafe_code)` (except FFI crates), clippy deny-list, ~500-LOC file cap, builder-pattern mandate, **no `#[allow]` escapes**. Plus xtask lints: `check-no-display-on-secret-types`, `check-handler-adr-coverage`, `check-handler-policy-schema`, `audit-positional`, etc. A rewrite that drops these lints weakens security invisibly. Keep them green throughout.
+
+### A15. Inputs not reached during grounding
+The in-repo docs (`public/src/content/docs/**`) mirror the OSS docs and were read. **runmvm.com** and the **pitch deck** were not accessed (no fetch). The prompt instructs the rearchitecture session to pull both for positioning, and flags that the in-repo docs have drifted (e.g., `SPRINT.md` still says "7 crates").
+
+### A16. Additional requirements folded into Part C — and how each reconciles with the repo
+- **Traits as extension contracts** → reframed the trait seams as *the* stable, library-facing contract. Matches memory: "never lock into a single VMM — keep the backend trait."
+- **Snapshot/restore** → not new surface area: `VmBackend::capabilities()` already advertises `snapshots`/`pause_resume`, and the docs already promise distinct `running/paused/cold/restoring/stopped/destroyed` states. Made it a *required* trait capability + the substrate for warm-start and the parked warm-pool work; snapshot bytes encrypted per ADR-027.
+- **Boot budget (clarified)** → not a build-failing hard gate. "As fast as possible": **target < 200 ms, < 300 ms acceptable**, Firecracker + libkrun the focus. The #1 lever is a **tiny kernel** + clean external templates; snapshot/restore gives warm starts well under target. The bench harness *tracks/flags regressions* rather than failing on an absolute number (hosts differ). The Firecracker reference is ~125 ms.
+- **External Nix templates** → explicit rule: "no embedded Nix strings in Rust; external `.nix` files, each `nix flake check`-able." Serves the "looks human-written" + testability goals; a concrete cleanup target (grep for embedded-string sprawl).
+- **SDK: four authoring surfaces** → decorator / runtime / `mvm.toml` / **custom `flake.nix`**. The custom-flake path exists today (`mkGuest` + `mvmctl build --flake .`) but is easy to demote during a rewrite — flagged it as first-class.
+- **CLI ≤ 15 top-level, nested** → concrete UX constraint. Today's surface is well over that; consolidation = merge overlapping launch verbs (`start`/`up`/`run`→`run`) + **nest related subcommands under noun namespaces** (`vm`, `image`, `template`, `network`, `volume`, `deps`, `audit`, `cache`, `mcp`). Gave a concrete nested tree; tenant-deploy stays in mvmd.
+- **mvmd consumes mvm as library OR sidecar** → expanded "dual" → **triple consumption** (library / CLI / sidecar). The sidecar exposes the same engine over a config-switchable local-or-remote transport (built on the existing `mvm-mcp` surface), which is what lets the **`mvm-studio` Tauri app (`../mvm-studio`)** talk to mvm locally or remotely by changing only config. Reconciled with the `ShellEnvironment`/`BuildEnvironment` split and memory that *mvmd runs its own Firecracker+jailer path*. Security: a remote control-plane API is off-by-default, mTLS-authenticated, same-policy, same-audit-chain. The API seam must exist from day one; the remote sidecar itself is Phase 2+. This raises the bar on crate consolidation: public APIs must be ergonomic from another crate, not just `main()`.
+
+### A17. The guest agent is universal and image-source-agnostic (ADR-051) — make it explicit
+"All microVMs have a guest agent over vsock" is already the accepted design: ADR-051 ("Option B") attaches a verity-sealed, read-only **runtime overlay** carrying the agent + seccomp shim + SDK runtime to *every* microVM, so Nix-built, OCI-pulled, and bundle-installed images share **one** agent code path and `mkGuest` stops baking the agent in. This unification is a dedup win that fits the cleanup goal. Two distinct, currently-present concepts to keep straight: **bundles** (`mvm-plan::bundle`, `mvmctl bundle …` — mvm's native signed, content-addressed *output* distribution, claim 9) and **OCI images** (`mvm-oci`, `mvmctl image pull` / `run --image` — *external input*, provenance-audited, claim 14). The brief now states the universal-agent invariant (§1) and the three-input/one-boot-contract model (SDK section). ADR-051 is Proposed/tracked in Plan 74 — the session should verify how much of the overlay is wired today vs. still baked into `mkGuest`.
+
+### A18. Cross-cutting concerns the first draft didn't name
+Folded into Part C §3 as a checklist: version/compat matrix; the **claim → CI-gate → code-location map** (gates hardcode symbols/paths — a rename silently breaks them); the testing pyramid (unit / hermetic / live-KVM + fuzz); metering + observability + a perf/size budget dashboard (ADR-040; 723-package dep baseline); NetworkProvider must also own egress-policy enforcement + DNS, not just provisioning/audit; "programmable storage" spelled out (sealed app-deps / encrypted / content-addressed / snapshot upper layers); key-management lifecycle; cross-compile + embedded-binary build story (ADR-065); release/update path (ADR-046); on-disk state-migration posture; error taxonomy + no-silent-hang DX (ADR-053); builder/dev-VM lifecycle. None are blockers for Phase 1, but the architecture ADR should address each so they aren't rediscovered late.
+
+### A19. Archive & repo reset is now an explicit end-state (your follow-up)
+Added Part C §6.5: removed crates → `archive/crates/` (out of workspace), superseded plans → `archive/plans/`, collapsed ADRs marked superseded in place, `specs/SPRINT.md` reset (old sprint → `specs/backlog/`), and `CLAUDE.md` / memory / public-docs updated to the new shape. Reconciled the earlier "archive = git history" line to a **physical** `archive/` dir + git history. **Timing: last** — moving crates/plans mid-flight breaks the build and every worktree, so it runs only after Phase 1 and after 104/115 land. Not executed now (this is planning); the archive can run as a discrete step on request. **Per your follow-up: the entire existing plan corpus is archive/not-active** — only this brief + the new phased plan are live; old plans remain as research/history (don't physically move ones the 104/115 worktrees still reference until they land).
+
+### A20. Deeper security model, immutability, and other in-repo features (this turn)
+- **Immutability invariant** (your ask): upgrade = rebuild from the Nix template + replace; never mutate a running workload microVM; dev mode is the only exception (dev tier, must not leak to prod). Added to §1.
+- **All comms via the agent** (your ask): every host↔guest interaction is a typed, authenticated vsock request to the guest agent — no SSH, no side channel. Strengthened in §1; this single chokepoint is what makes guest activity monitorable + auditable.
+- **Lifecycle hooks** (your check): yes — `before_/after_` (`before_build`/`before_start`/`after_start`/`before_stop`) + per-addon hooks, in §3; now also noted that each hook execution is audited.
+- **Additional security topics** (§3c): blast-radius matrix ("if X falls, Y holds"); host-side subprocess sandboxing (seccomp/Landlock via `mvm-jailer-lite`); resource governance / DoS caps; backend security tiers (Docker = weak fallback, admission-visible); covert-channel discipline (DNS / broker / vsock); audit-cannot-be-bypassed (fail-closed, no payload bytes); freshness/replay + trusted time; mvm's own supply-chain signing / SLSA; compliance posture (SOC2/PCI/HIPAA); explicit out-of-scope list.
+- **Other features to preserve** (§3d): addon/integration model; function-call entrypoints + fd-3 dev control; in-guest worker pool; PTY console + port-forward; image catalog / named networks / templates; balloon memory; health checks; cross-platform / Windows-Tauri posture; CI execution policy; hosted-cloud invariants (local-first, no secrets at rest).
+- **Cross-cutting items from the prior turn** are already folded into Part C §3 as the architecture-ADR checklist (version/compat matrix, claim→gate→location map, testing pyramid, metering/observability, NetworkProvider scope, programmable-storage scope, key lifecycle, cross-compile/embedded binaries, release/update, state migration, error taxonomy, builder/dev VM lifecycle).
+
+### A21. Crypto borrow, full encryption + rotation, topology fix, SDK-centrality, "already decided" (this turn)
+- **Crypto "borrow"**: a top-tier secure-messaging project's *protocol* (Double Ratchet / X3DH) targets async multi-device messaging over untrusted servers — a different problem than mvm's session-scoped point-to-point channels, so adopting it wholesale would be cargo-culting. The right borrow is the **Noise Protocol Framework** (`snow`) for the handshake + the same **vetted primitives** (X25519/Ed25519/AES-GCM/ChaCha20-Poly1305/HKDF/HMAC). Encoded in §3 *without naming the external project* (repo-text taboo).
+- **All mounted dirs encrypted + rotation** (your ask): §3 mandates **envelope encryption** (per-volume DEK, per-tenant KEK in keystore/SE/TPM; dm-crypt/LUKS on Linux, AEAD blob on macOS). Auto-rotation is feasible and *not* excessive — re-wrap DEKs to rotate KEKs cheaply on a timer; rotate DEKs for free on the **rebuild cycle** (immutability makes every rebuild a re-key point).
+- **Audit hard stance** (your ask): on failure, fire a failure event if possible, then fail-closed; **dev mode** may bypass with a warning. §3 + §3c updated.
+- **Topology fix** (your clarification): `mvm-studio` runs **`mvmd`** (sidecar/library local; REST remote) — not `mvm` directly. The two production modes (local/remote) live at the studio↔mvmd boundary; `mvm` is a clean library/sidecar for `mvmd`. §3 "Consumption topology" rewritten.
+- **SDK is the central derivation engine** (your emphasis): the four authoring surfaces *and* the `mvmctl dev`/`build` loop all derive through the SDK to Nix + config — no second path. §3 SDK + §4 updated.
+- **`mvmctl dev <commands>`** drives the whole local build+run loop, all SDK-derived. §4 acceptance updated.
+- **Already-decided baseline** (your ask): new §0a lists settled decisions so the session builds on them rather than re-deciding.
+- **Fewer/cleaner ADRs + plans** (your ask): §6 targets ~20 canonical ADRs (from 65) + live-only plans.
+
+### A22. Generic role-based crate naming + the marketing deck (this turn)
+- **Crate naming principle** (your ask): every crate is named for its **role**, never an implementation — no `mvm-firecracker`; backends live behind the generic `VmBackend` trait inside `mvm-backend`, networking behind `NetworkProvider` in `mvm-network`, storage behind `StorageProvider` in `mvm-storage`. Adding a backend = a new impl, not a new crate. Honest exception: a minimal `-sys` FFI binding to a named external library (libkrun C ABI, Apple Vz/Swift), kept internal to `mvm-backend`. §3 crate-consolidation rewritten around this; some per-VM sidecars are genuinely backend-specific by process model and stay, but under generic family names.
+- **Marketing deck** (your ask): the Google presentation link/content isn't in the message — a Slides deck can't be opened without the actual URL (and Slides usually needs auth or a publish-to-web link). Once provided, derive the marketing goals into a positioning section. Meanwhile §0 now states the positioning the **in-repo docs** already assert as a starting point to reconcile against the deck.
+
+### A23. Documentation-as-actions + checkbox tracking (this turn)
+Added §2a **Execution roadmap** — checkbox-tracked stages that keep each session small: A decide/position, **B write ADRs**, **C write one bounded `specs/plans` doc per workstream**, D execute one plan per session, E archive/reset. Documentation (ADRs + plans) is its own deliverable so no single session both designs and builds everything — directly addressing the over-scope risk. Converted the action lists (§4 acceptance, §6 ADR worklist, §6.5 archive, §9 done) to `- [ ]` checkboxes per repo convention so progress is trackable; guardrails/principles stay as prose (they're constraints, not tasks).
+
+### A24. Marketing deck pulled — positioning + the confidential-compute gap (this turn)
+Fetched the seed deck (export/txt). Added **§0b Positioning & marketing goals**: the product sells *secure microVMs for AI-native workloads* — isolated/signed/policy-governed/audited/**sub-150 ms** — with the #1 differentiator being **"the boundary lives below the workload"** (policy/keys/egress in a separate address space = the process-isolation guardrail = the moat) and **"the audit trail is the product."** Most of the deck maps cleanly to existing claims/invariants (process isolation, hostile-workload posture, signed plans, substitution, immutability = "no silent mutation", metering = per-sandbox-second + egress + attestation).
+- **Biggest gap: confidential compute.** The deck sells a Confidential tier (SEV-SNP/TDX, attestation billing, Hosted Confidential GA Q1–Q2 2027) and lists Confidential Compute as core TAM — but ADR-002 puts malicious-host + hardware attestation **out of scope**. Reshaped **Decision #4** to "don't foreclose it" even if Phase 1 keeps it out of scope.
+- **Stale deck backend list:** names **Lima** (removed) + Incus/SEV-SNP/TDX (not yet impls). Scrub Lima; treat the rest as future `VmBackend` impls — validates the generic backend trait.
+- **Boot number:** deck commits to **sub-150 ms**; aligned the budget target to 150 ms (was 200), <300 ms the degraded floor — flagged 150-vs-200 for the owner.
+- **Audit = product:** elevated to moat status — exportable evidence packs (EU AI Act / NIST AI RMF / SOC2) are product-critical, not just claim 8.
+
+### A25. Clean-refactor archive (incl. docs), ingress parity, process-isolation map, backend extensibility, decisions resolved (this turn)
+- **Clean-refactor archive** (your ask): §6.5 now contains *everything* superseded under one top-level `archive/` — `crates/`, `plans/`, **`adrs/`** (moved, not in-place), **`docs/`** — leaving the live tree (crates, ~20 canonical ADRs, live plans, website docs) clean and matching. Added `archive/README.md` index.
+- **Ingress parity** (your ask): ingress is now **default-deny, policy-controlled, audited** at full parity with egress — in the audit/hooks/policy paragraph and the `NetworkProvider` scope (both inbound + outbound flows enforced + audited).
+- **Docs match functionality** (your ask): website docs update **in the same plan** that changes a CLI/behavior (not a final sweep), with a docs-vs-CLI parity check in CI where feasible; superseded docs → `archive/docs/`.
+- **Process-isolation guardrail addressed** (your ask): new **§3e Process-isolation map** — a table of the must-be-separate OS processes (workload / supervisor / audit-signer / host-signer / secrets-dispatcher / egress-ingress policy plane / per-VM sidecars), each with isolation rationale + backing claim, the "collapse crates, not processes" rule, and a **verification lint** (key symbols not linkable from the supervisor). The deck's #1 moat, made a verifiable contract.
+- **Confidential compute** (your #1): **DECIDED** — out of Phase 1, **future-supported**, design doesn't foreclose it. Decision #4 resolved.
+- **Boot target** (your "2. Yes"): **sub-150 ms confirmed.**
+- **New-backend extensibility** (your ask): adding a backend = trait impl + register, no leakage elsewhere; ship a generic **`ExampleBackend` stub** + an "adding a backend" doc + a lifecycle-sufficiency test. *(Lima/Incus status revised this session — see A26.)*
+
+### A26. Complete-refactor reframe, AGENTS.md, worktree cleanup + the rest of your answers (this turn)
+- **Scope (#1)** — **complete refactor executed step-by-step** (big-bang in scope, incremental in execution; core demo first; not a single-commit rewrite). Decisions 1–3 marked DECIDED; Stage-A boxes ticked.
+- **AGENTS.md** — added (a) "tick the plan checkboxes as you complete tasks; the plan is the source-of-truth progress board" (DoD item 6), and (b) a callout that this rewrite is the **single-branch exception**, with worktrees the standard for all work afterward.
+- **Single-branch rewrite + worktree cleanup (#12)** — new **Stage 0 pre-flight**: clean up *all* ~24 worktrees (merge-or-abandon each, incl. Plan 104 ×5 + Plan 115) so the rewrite starts from a clean `main`; then work on `cleanup-rearchitecture` with no worktrees. **Destructive — flagged; NOT executed (planning only); needs per-worktree confirmation.** Removed the old "let 104/115 land / don't move their files" caveats.
+- **Hooks (#4)** — `before_`/`after_` × **build / start / snapshot / stop / cleanup** (10), superseding the in-flight 4-hook contract (cleaned up).
+- **CLI (#5)** — `mvmctl dev` namespace + **prod-default** top-level `build`/`run`; no separate `prod` namespace; `--dev`/`--prod` flags.
+- **Encryption (#6/#7/#9)** — Noise **adopted** (decided); macOS at-rest = mvm-managed **AEAD envelope** (not FileVault), attestable; rotation = 90-day KEK + DEK-per-rebuild bound to the audit chain (attestable) — final cadence in the encryption plan.
+- **Sidecar protocol (#8)** — **REST + OpenAPI** (typed), one protocol local+remote; not MCP, not gRPC.
+- **ADRs (#10/#11)** — architecture ADR finalizes the crate count (bias: fewer); all four collapses approved + ~20 canonical.
+- **Lima/Incus (#13)** — ship a generic `ExampleBackend` stub only; Lima reframed from "forbidden" → "**dropped, re-addable via the trait**" (not in this rewrite); Incus also future-not-now. Supersedes A25's "Lima stays forbidden."
+- **Archive (#14)** — top-level `archive/`, explicitly **temporary** (deleted once the rewrite is stable; git history is permanent).
+- **Push (#15)** — keep local now; **recommend pushing once Stage B/C or Phase 1 lands** (backup + CI).
+- **Confidential compute (#16)** — defer; future goal, not day-1 (Decision #4).
+
+### A27. Isolation-dimensions coverage map + config-file-for-environment (this turn)
+- **Sandboxing dimensions** (your question): the classic triad is the floor. Added **§3f** — a 15-row coverage map (kernel, process, FS-access, FS-confidentiality, egress, ingress, memory, compute/DoS, device, secret, control-plane, audit, temporal/state, supply-chain, multi-tenant). The 3 named are shipped+gated for process + FS-access + egress; the two **live gaps the rewrite closes are at-rest encryption (FS confidentiality) + ingress parity**; memory-vs-malicious-host (CC) + hardware side-channels are the deferred frontier.
+- **Config file for environment** (#5 follow-up): yes — layered typed config (defaults < `~/.config/mvm/config.toml` < project `mvm.toml`/`.mvm/` < env < flags) with named dev/prod profiles. Nuance folded in: config selects mode/defaults, but the prod security *tier* is structural/build-time (`do_exec` compiled out — claim 4), never a config toggle.
+- **Confirmations:** #1 (complete refactor) ✅, #6 (mvm-managed AEAD — now marked **DECIDED**) ✅, #8 (REST+OpenAPI) ✅, #9 (rotation) ✅, #13 (ExampleBackend stub + Lima reframe; **microsandbox stays forbidden**) ✅, #15 (local now, push when work starts) ✅.
+
+---
+
+## Part B — Decisions to confirm (defaults chosen; flip any)
+
+1. **Scope/sequencing** — **✅ DECIDED:** a **complete refactor, executed step-by-step.** Every workstream is rewritten (nothing deferred) — *big-bang in scope* — but as a **sequence of one-plan-per-session steps with the core demo first** as the tracer slice, CI green between each — *incremental in execution*. A literal single-commit big-bang is explicitly **not** the method (unreviewable, can't stay CI-green, not resumable).
+2. **Zig guest agent vs ADR-063** — **✅ DECIDED:** honor ADR-063 — the agent is **lean-Rust-v2** now. **Zig is tracked as a future possibility** precisely because the agent must be *fully-defined, fast, and small* (where Zig shines): if lean-Rust-v2 misses the size/speed targets, the gated `netinit` A/B (Plan 109's six-deliverable bar) is the on-ramp. Not now; explicitly on the roadmap.
+3. **Session output/method** — **✅ DECIDED: plan-first.** Brainstorm → consolidate ADRs → write the architecture ADR + one plan per workstream → then execute them step-by-step (TDD, on the rewrite branch).
+4. **Encryption ambition / confidential compute** — **✅ DECIDED (owner):** implement the accepted layering (ADR-027 + ADR-042) now; **confidential compute / malicious-host is out of Phase 1 scope but explicitly supported in the future.** So `VmBackend` accommodates SEV-SNP/TDX as future impls, the encryption layering stays **extensible to guest-RAM confidentiality**, and the audit/attestation hooks leave room for the Confidential tier the deck sells (§0b). Don't build it now; don't foreclose it.
+
+*(Boot target also confirmed this turn: **sub-150 ms** — the deck's public number.)*
+
+---
+
+## Part C — The prompt (copy-paste into the rearchitecture session)
+
+> **You are running a cleanup-and-rearchitecture planning session for `mvm`** (the Rust microVM dev tool in this repo; multi-tenant orchestration lives in the separate `mvmd` repo — respect that boundary). This codebase grew through many AI sessions and carries stubs, duplication, and crate sprawl. Your job: produce a clean, simpler, human-looking architecture that **preserves every functional and security guarantee**, and then execute the first vertical slice. **Do not boil the ocean.** Read `CLAUDE.md` and recalled memories first — they encode hard-won constraints.
+>
+> ### 0. Orient before proposing anything
+> - `git worktree list`, `gh pr list --state open`, and read `specs/SPRINT.md`. This is a **single-branch rewrite**: as a **Stage 0 pre-flight (see §2a), clean up ALL existing worktrees** (merge-or-abandon each — incl. the ~5 Plan 104 + Plan 115) so the rewrite starts from a clean `main` with no competing worktrees. Then work on the **`cleanup-rearchitecture` branch** — no worktrees during the rewrite. Worktrees resume as the standard for all work *after* it lands (per `AGENTS.md`).
+> - Reality check the docs: the live workspace is ~32 crates / ~247k LOC (`SPRINT.md` is stale). The current sprint focus is the **Dependency Reduction Roadmap** — your cleanup continues it.
+> - **Existing `specs/plans/*` are archive / not-active** — reference + history, not a live backlog. The authoritative inputs are the **accepted ADRs**, this brief, and (once written) the new architecture ADR + phased plan. Don't pick up an old plan and start executing it.
+> - Positioning is now derived from the seed deck in **§0b** (and cross-checks `public/src/content/docs/**` + runmvm.com). The three product pillars are **UX/DX, security, boot performance**; the deck's headline is *secure microVMs for AI-native workloads — isolated, signed, policy-governed, audited, sub-150 ms*, with the boundary **below the workload** and **audit as the product**. Every decision serves a pillar without sacrificing another.
+>
+> ### 0a. Already decided — build on these, do NOT re-litigate
+> These are settled (accepted ADRs / shipped claims). Treat them as the baseline; spend design budget elsewhere:
+> - **Backends**: Firecracker (Linux KVM), libkrun (macOS 13-25), Vz (macOS 26+), Apple Container; Docker is a fallback tier — all behind `VmBackend` (ADR-013/031/056).
+> - **vsock-only** guest comms; **no SSH ever**; the guest agent is the sole control plane (ADR-002).
+> - The **14 security claims** + their CI gates (ADR-002 + claim docs).
+> - Signed, audited **ExecutionPlans** + chain-signed audit log (ADR-041).
+> - **Encryption layering** (ADR-027) + substrate (ADR-042) — *build* it, don't re-decide it.
+> - **Builder VM via libkrun**, persistent; source-checkout **never downloads**; host **Nix never used** (ADR-046).
+> - **Nix-built deterministic** images; busybox-as-PID-1; `mkGuest` (ADR-013).
+> - Sealed **app-deps** volumes (ADR-047, claim 11); **host-services broker** — binding-gated, no raw secrets (ADR-059/061/062, claims 12/13); **runtime overlay** for the universal agent (ADR-051).
+> - **Rust** is the default boundary language (ADR-063); SDK decorator parse is **static** (never runs user code on the host).
+> - **Immutability** (rebuild, not mutate) + dev-mode exception; **no backwards compat** (pre-1.0).
+> - Dead/forbidden — never reintroduce: microsandbox, smolvm, ur-seed, external build-cache providers. (**Lima is different**: a legitimate backend that was *dropped* — re-addable later via the `VmBackend` trait; just not in this rewrite.)
+>
+> ### 0b. Positioning & marketing goals (from the seed deck) — the architecture must serve these
+> The product is sold as **"secure microVM infrastructure for AI-native workloads"** — hardened microVMs for agents, code interpreters, and anything running model-generated code: *Isolated. Signed. Policy-governed. Audited. Sub-150 ms cold boot.* Mantra: **"Run the workload. Isolate the tenant. Enforce the policy. Audit the execution."** "If you're shipping an AI agent to production, it belongs on MVM." Each claim below is a **public promise** the rearchitecture must keep true:
+> - **"The boundary lives below the workload"** — the #1 differentiator: policy plane, egress filter, and key custody run in a **separate address space** from the tenant ("four trust zones; the workload runs in the one with no powers"). → This is the process-isolation guardrail (§1) + broker/signer subprocess model. It's not hygiene — it's the **moat**. Never collapse it.
+> - **"Assume the workload is adversarial"** → the blast-radius / hostile-workload posture (§3c) is the literal pitch.
+> - **"One contract, every backend"** — the same signed execution plan runs identically across backends. → `VmBackend` trait + signed `ExecutionPlan`. Validates the generic role-named backend crate.
+> - **"Audit-by-construction — the audit trail is the product, not a feature"** (moat: replacing mvm = replacing your audit substrate). → audit completeness + integrity + **exportable evidence packs** (EU AI Act / NIST AI RMF / SOC2) are product-critical, not just claim 8. The fail-closed stance (§3) serves this.
+> - **"Security without the latency tax" + sub-150 ms cold boot** → boot budget **target is sub-150 ms** (the public number). **"Egress mediation in-process, not a network hop"** → the egress filter runs inline / in the supervisor's address space, never a separate hop.
+> - **Deck's 7 invariants** (no raw execution, signed identity, no egress bypass, short-lived credentials, **no silent mutation**, no unmanaged hosts, full signature chain) → map to claims 8/12/13, default-deny egress (10), the immutability invariant ("no silent mutation"), and the signed audit chain. Keep the mapping explicit.
+> - **Business model = metering**: Hosted tier bills **per sandbox-second + egress + attestation**. → ADR-040 metering is load-bearing, not optional.
+>
+> **⚠ Biggest deck ↔ architecture gap — confidential compute.** The deck sells a **"Confidential tier"** (SEV-SNP / TDX backends, attestation billing, "Hosted Confidential" GA Q1–Q2 2027) and lists Confidential Compute as core TAM — but ADR-002 currently puts a **malicious host + hardware attestation OUT of scope**, and the encryption boundary (§3) defers it. The marketing **requires** the very threat-model expansion the architecture defers. This reshapes **Decision #4**: the likely-right answer is *"malicious-host out of scope for Phase 1, but the design must NOT foreclose the confidential-compute tier"* — `VmBackend` accommodates SEV-SNP/TDX, the encryption layering can extend to guest-RAM confidentiality, and "no unmanaged hosts" points at host attestation/enrolment. **Get the owner's call.**
+> - **Stale deck backend list:** the deck names **Lima** (removed 2026-05-14) and **Incus / SEV-SNP / TDX** (not yet impls). Action: scrub Lima from the deck; treat Incus + SEV-SNP/TDX as *future `VmBackend` impls*.
+>
+> ### 1. Non-negotiable invariants (if a cleanup would break one, STOP and surface it)
+> - **All 14 security claims in `CLAUDE.md`/ADR-002 stay true and stay CI-gated.** Treat them as a preservation checklist. Specifically don't regress: no-SSH-ever; vsock-only guest comms; `do_exec` absent in prod builds (claim 4 — preserve the dev/prod compile-time split); dm-verity verified boot (3); signed+audited `ExecutionPlan` (8); content-addressed bundles (9); default-deny egress (10); sealed app-deps volumes (11); broker binding-gated dispatch + no raw secret over the channel (12/13); OCI provenance in the audit chain (14).
+> - **Process isolation is a security property, not sprawl.** The audit-signer is the sole audit-key holder + JSONL writer; the broker subprocesses run in separate address spaces by design (ADR-061). **You may reduce *crate* count, but you must NOT merge these *processes*.** Reduce build units via multiple `[[bin]]` targets and a shared scaffold lib — keep the runtime processes distinct.
+> - **No secret ever enters a microVM.** Secrets are substituted at egress time as destination-bound, time-bound *signed credentials* (ADR-049/062 model), never raw bytes. Raw secret bytes never leave the supervisor's address space.
+> - **Universal guest agent over vsock — the sole control plane.** *Every* microVM — Nix-built, OCI-pulled, or bundle-installed — boots the guest agent reachable over vsock; that is how the host talks to the guest (no SSH, ever). The agent is **not baked per-image**: it ships on a verity-sealed, read-only **runtime overlay disk** (ADR-051 "Option B") attached at every start and mounted at `/mvm/runtime`, giving **one** agent code path across all image sources. `mkGuest` must not bake the agent into per-image closures; `/mvm` is a reserved guest path (reject OCI images that ship content there). The overlay is a first-class, versioned, verity-sealed artifact alongside kernel + rootfs.
+> - **All host↔guest communication goes through the guest agent over vsock — no other channel.** Console (PTY), exec (dev-only), file ops, workload run, status, hooks: each is a typed, authenticated vsock request to the agent. No SSH, no second daemon, no side socket into the guest. This single chokepoint is *what makes* every guest interaction monitorable, policy-gated, and auditable.
+> - **Immutable microVMs — upgrade = rebuild, never mutate.** To update or upgrade a workload microVM you **rebuild it from its Nix template and replace it**; you never modify a live running one (no in-place patching, no mutable prod rootfs). That is what makes every running VM exactly reproduce a signed, verity-sealed artifact. **The only exception is development mode** (dev VM / `dev shell`), where live modification is allowed because it is the dev tier — and dev mutability must never leak to prod (claim 4 / ADR-035 dev-never-reaches-prod).
+> - **Determinism & supply chain**: reproducible double-build (claim 7); a source checkout **never downloads** image artifacts and **never uses host `nix`** — every Nix eval runs inside a VM you launched; no external build-cache providers.
+> - **Code-quality gates stay on**: `forbid(unsafe_code)` outside FFI crates, the clippy deny-list, the ~500-LOC file cap, builder-pattern mandate, **no new `#[allow]` escapes**, and all xtask lints (`check-no-display-on-secret-types`, `check-handler-adr-coverage`, `audit-positional`, …). Keep `cargo fmt --all -- --check`, `cargo test --workspace`, and `cargo clippy --workspace -- -D warnings` green at every step.
+> - **No backwards compatibility** — this is pre-1.0. Hard-rename; delete shims, aliases, deprecation paths — never a compat layer. Removed crates and superseded plans are **physically archived** to a top-level `archive/` directory (out of the Cargo workspace, reference-only — they need not compile), in addition to git history; superseded ADRs are **moved** to `archive/adrs/` (only the canonical set stays live). See §6.5.
+> - **Boot performance budget**: workload microVMs start **as fast as possible** — **target sub-150 ms** (the deck's public number), **< 300 ms acceptable** on slower backends. A tracked budget measured by the benchmark harness (§3), not a build-failing gate. The primary lever is a **tiny kernel** + clean images. (The persistent builder/dev VM is exempt — its boot is amortized across a session.)
+>
+> ### 2. Working method
+> 1. **Brainstorm** the target architecture (use the brainstorming skill). Don't touch code yet.
+> 2. **Consolidate ADRs** (worklist in §6) and write **one new architecture ADR** that states the target crate graph, the trait seams, the encryption layering, and the preserved-claims mapping.
+> 3. **Write the new `specs/plans` — one bounded plan per workstream** (`specs/plans/<N>-…md`, checkbox task lists per repo convention; check open PRs + `main` for the next free number — numbering has no CI uniqueness gate). Documentation is the deliverable here; **no code yet.** Phase 1 = the core demo on a clean spine; Phases 2+ = one migration workstream each. **Steps 2–3 are documentation-only sessions** so design never overbloats an implementation session.
+> 4. **Execute one plan per session**, starting with Phase 1, test-first (TDD). Every function testable, **5–20 lines**; many-arg functions take a builder-pattern config struct (only when the struct is genuinely unique); use the inner pattern where it clarifies; all async is `Send + Sync`. Comments describe *what a function does and how it's used*, not narration; **never reference plan/ADR numbers in code**.
+> 5. Land each plan with CI green before starting the next.
+>
+> ### 2a. Execution roadmap (checkbox-tracked — keep each session's scope small)
+> **Documentation is its own deliverable: Stages B–C write ADRs and plans; Stage D writes code, one plan per session.** Tick boxes as you go — **this board is the resume point: if a session freezes, the last unchecked box (plus the per-plan checkboxes inside the Stage-C docs) is where to pick back up.** Every *actionable* item is tracked here; the continuous guardrails (§0a already-decided, §1 invariants) are constraints to honor on every box, not things to check off.
+>
+> **Stage 0 — Pre-flight: clean the slate** (single-branch rewrite; do FIRST)
+> - [ ] Inventory all worktrees (`git worktree list`, ~24 today) + open PRs; for **each** (incl. the ~5 Plan 104 + Plan 115 + others), decide **merge-to-main** (if done + valuable) or **abandon** (superseded by the rewrite). **Destructive — confirm per worktree; never blind-delete unmerged work.**
+> - [ ] Remove each worktree once it's merged or consciously abandoned; the rewrite then proceeds on the single `cleanup-rearchitecture` branch with no competing worktrees.
+>
+> **Stage A — Decide & position** (this brief is the input)
+> - [x] Decision 1 — **scope**: complete refactor, executed step-by-step (core demo first; not a single-commit big-bang).
+> - [x] Decision 2 — **Zig**: honor ADR-063 (lean-Rust agent now); Zig tracked as a future possibility.
+> - [x] Decision 3 — **method**: plan-first.
+> - [x] Decision 4 — **encryption / confidential compute** (implement layering now; CC out of Phase 1 but not foreclosed).
+> - [x] Pull the pitch deck; write **Positioning & marketing goals** (§0b).
+> - [x] Owner reconciled: boot target = **sub-150 ms** confirmed.
+> - [ ] Scrub Lima from the deck (deck-side, not repo).
+>
+> **Stage B — ADRs** (documentation only; no code)
+> - [ ] Write the **new architecture ADR** (target crate graph role-named + trait-fronted; trait seams; encryption + key lifecycle; consumption topology library/CLI/sidecar + local/remote; the **claim → CI-gate → code-location map**).
+> - [ ] Run the ADR consolidations + curation (granular boxes in §6).
+>
+> **Stage C — New `specs/plans`** (documentation only; one bounded plan per workstream, each with its own checkboxes)
+> - [ ] Phase 1 plan — **core demo** (hello-world → microVM via the persistent builder VM, SDK-derived, driven by `mvmctl dev`).
+> - [ ] Plan — crate consolidation (~32 → ~15–18; the `core::` dedups).
+> - [ ] Plan — encryption layering + key lifecycle (envelope, rotation, Noise/mTLS/TLS).
+> - [ ] Plan — `NetworkProvider` + `StorageProvider` traits + impls.
+> - [ ] Plan — guest agent (lean-Rust) + runtime overlay (universal agent).
+> - [ ] Plan — CLI surface (≤15 nested) + SDK as the derivation engine.
+> - [ ] Plan — sidecar API seam (versioned; off-by-default remote).
+> - [ ] Plan — metering/observability + boot/size benchmark harness.
+> - [ ] Plan — testing pyramid + fuzz parity + claim-gate migration.
+>
+> **Stage D — Execute** (one plan per session: TDD, dedicated branch, CI green, claim gates intact; re-verify the claim → gate map after each)
+> - [ ] Execute Phase 1 — **core demo** ← the #1 goal (acceptance boxes in §4).
+> - [ ] Execute — crate consolidation.
+> - [ ] Execute — encryption + key lifecycle.
+> - [ ] Execute — `NetworkProvider` + `StorageProvider`.
+> - [ ] Execute — guest agent (lean-Rust) + runtime overlay.
+> - [ ] Execute — CLI surface + SDK derivation engine.
+> - [ ] Execute — sidecar API seam.
+> - [ ] Execute — metering/observability + benchmark harness.
+> - [ ] Execute — testing pyramid + fuzz + claim-gate migration.
+> - [ ] Sweep stubs / dead code (§5).
+> - [ ] Update website docs to match (rides each plan; final parity check).
+>
+> **Stage E — Archive & reset** (final; after all workstreams complete — granular boxes in §6.5; worktrees were already cleared in Stage 0)
+> - [ ] Run the archive & repo reset (the `archive/` tree is temporary — deleted once the rewrite is validated).
+>
+> ### 3. Target architecture
+> *(This section is the design reference — the "what to build." Progress is tracked as checkboxes in §2a and inside each Stage-C per-workstream plan, not here.)*
+> **Crate consolidation — name by role, front with a trait, hide impls.** Every crate is named for the **capability/role** it provides, never for a specific implementation. There is no `mvm-firecracker`: there is a generic **`mvm-backend`** exposing the `VmBackend` trait with firecracker / libkrun / vz / apple-container / docker / mock as impls *inside*. Same for networking (**`mvm-network`** → `NetworkProvider` + passt/gvproxy/… impls) and storage (**`mvm-storage`** → `StorageProvider` + local/encrypted impls). Adding a backend = a new impl behind the trait, never a new architectural crate wired everywhere. **One honest exception**: an unsafe FFI binding to a *named* external library (libkrun's C ABI, Apple's Vz/Swift) may live in a minimal `-sys`-style internal crate the generic crate depends on — but it holds *only* the binding, never selection/dispatch/policy, and isn't part of the public architecture. From ~32 crates toward ~15–18:
+> - *Collapse (pure sprawl)*: `mvm-ir` → `mvm-sdk`; `mvm-plan` + `mvm-policy` → `mvm-core`; `mvm-base` (Lima-era) → `mvm` runtime; `mvm-runner` → `mvm-guest`; the tiny guest helper bins (`mvm-addon-dns`, `mvm-addon-vsock-bridge`, netinit) → one multi-bin guest-helpers crate; backend FFI bindings (`mvm-libkrun`, `mvm-vz`, `mvm-providers`) become minimal internal `-sys` deps of `mvm-backend`, not top-level concepts.
+> - *Generic, trait-fronted* (impls inside): **`mvm-backend`** (`VmBackend`), **`mvm-network`** (`NetworkProvider`), **`mvm-storage`** (`StorageProvider`).
+> - *Preserve as distinct processes* (collapse build units, keep runtime isolation): the signer/broker/dispatcher binaries, the per-VM supervisor/sidecar(s), the egress proxy, the guest agent. Name these by role too — select backend-specific behavior internally rather than baking a backend name into the crate **where avoidable** (some per-VM sidecars are genuinely backend-specific by process model; keep those under a generic family name).
+> - *Keep (role-named)*: `mvm-core`, `mvm` (runtime), `mvm-cli`, `mvm-supervisor`, `mvm-guest`, `mvm-build`, `mvm-sdk` (+ `mvm-sdk-macros` — proc-macro crates must be separate), `mvm-backend`, `mvm-network`, `mvm-storage`, `mvm-oci`.
+> - **`mvm-core` is the common crate.** Move shared utilities there and delete duplicates: **6 vsock/framing impls → one `core::framing`** (generic `FramedMessage<T>` + pluggable auth); **4 config/secret loaders → one `core::config_envelope`**; **scattered XDG/path helpers → one `core::paths`**; **3 signer-subprocess templates → one `core::subprocess` scaffold**.
+>
+> **Trait seams are the extension contract.** Every pluggable axis is a trait so future backends/networks/storage/SDK-languages plug in **without touching core** — and so `mvmd` can supply its own impls. Traits are `Send + Sync`, object-safe where dispatched at runtime, and their contracts are the stable library API (§ Consumption topology). Never lock to a single VMM.
+> - `VmBackend` (exists, solid) — keep; backends are impls, not the only path. Targets today: libkrun, Vz/Apple, Firecracker, containerd/docker (fallback tier), + a mock. **Future impls behind the same trait** (the deck's "one contract, every backend"), **none in this rewrite's scope**: **Incus**, the confidential-compute tier **SEV-SNP / TDX**, and **Lima** — which was *dropped* (heavily depended-on in v1, outgrown by libkrun/Vz/Apple), **not forbidden**; re-addable later via the trait like any backend. **The trait MUST expose snapshot/restore + pause/resume** (the `capabilities()` surface already advertises them) — first-class, not optional.
+>   - **Adding a backend must be trivial-by-design** — implement the trait + register it; **no backend-specific logic leaks elsewhere** (selection/dispatch/policy stay generic). Ship a minimal **stub/example backend** + a one-page "adding a backend" doc that proves the path, and a test (alongside `MockBackend`) asserting the trait is sufficient to drive the *whole* lifecycle (start → run → snapshot → restore → stop). Ship a generic **`ExampleBackend` stub** (not Lima, not Incus — neither is in the rewrite scope) as the demo + test fixture. This is the concrete check that "one contract, every backend" is real.
+> - `NetworkProvider` (new — ADR-064 is only audit-scoped today): provisioning **+ ingress/egress policy enforcement + audit** (full scope in the §3 checklist), so networking looks identical across platforms in code. Leaf providers per backend; fan-out observers for audit.
+> - `StorageProvider`/`VolumeBackend` (extend): "programmable storage" with at least **local + encrypted** impls *in this repo* (object-store stays mvmd).
+> - `ShellEnvironment` / `BuildEnvironment` (exists): the dev-vs-fleet build seam — preserve it; it is the contract `mvmd` extends for orchestrated builds (§ Consumption topology).
+>
+> **Snapshot / restore is a hard requirement, not a nice-to-have.** It backs three things at once: the explicit lifecycle states the product promises (`running / paused / cold / restoring / stopped / destroyed` — keep them distinct, never blur), warm-start to hit the boot-time target, and the parked warm-pool work. Snapshot bytes are encrypted at rest (per-snapshot DEK wrapped by tenant KEK — see Encryption). The lifecycle state machine lives behind the backend trait so every backend implements the same transitions or declares them unsupported via `capabilities()`.
+>
+> **Guest agent**: small, focused vsock surface. **Default to lean-Rust-v2** (drop `tokio`/`serde_json`/`rtnetlink` for `polling` + hand-rolled parsers + `linux-raw-sys`, per ADR-063 §2 — `mvm-egress-proxy` is the existing precedent). The agent drives the audit chain and has a broad surface, so **it stays Rust** (ADR-063 §3). Zig is permitted *only* for narrow ABI shims not in the audit chain (e.g. `netinit`), and only behind ADR-063's six CI-gate deliverables — pursue it as the gated spike, not a rewrite. *(If the project owner has decided to revisit ADR-063, write a new ADR superseding it before any Zig agent work.)*
+>
+> **Encryption** — implement the **already-accepted** layering (ADR-027 table + ADR-042 substrate); today it's designed but unbuilt. **All data encrypted at rest and in flight; every mounted directory/volume is encrypted at rest.**
+> - **At rest — every mounted dir/volume + snapshots + audit + keys.** Use **envelope encryption**: each volume/snapshot has a data key (DEK) that encrypts its bytes (AES-XTS via dm-crypt/LUKS2 on Linux block devices; a full-blob/per-file AEAD — AES-256-GCM or ChaCha20-Poly1305 — on macOS where LUKS isn't available, owned by the `StorageProvider` "encrypted" impl). Each DEK is **wrapped by a per-tenant KEK**; the KEK lives in the OS keystore / Secure Enclave / TPM. The guest sees plaintext (it's inside the trust boundary); host-side bytes are always ciphertext. **DECIDED: the mvm-managed AEAD envelope on *both* platforms** — *not* host FileVault/APFS — because the DEK model is portable, mvm-controlled, rotatable, and **attestable** (you can prove which DEK encrypted which content); FileVault is full-disk and gives none of that.
+> - **Key rotation — yes, automatable, and not excessive complexity.** KEK rotation = **re-wrap the DEKs** (cheap, no data re-encryption) → auto-rotate on a timer. DEK rotation = re-encrypt data (costly) → **ride the rebuild cycle**: microVMs are rebuilt, never mutated (§1), so every rebuild is a natural re-key point and DEK rotation is effectively free. Net: auto-rotate KEKs on a schedule; rotate DEKs on rebuild. Zeroize key material on drop. **Recommended:** 90-day KEK rotation (configurable); each per-volume DEK bound to the content hash + signed plan + audit chain so rotation is **attestable**. Final cadence in the encryption plan.
+> - **In flight.** **DECIDED: adopt the Noise Protocol Framework (`snow`)** for the vsock session and the local sidecar — mutual auth + forward secrecy, misuse-resistant, no hand-rolled key exchange. Use only **vetted primitives** (X25519, Ed25519, AES-256-GCM / ChaCha20-Poly1305, HKDF, HMAC-SHA256 via RustCrypto/dalek). agent↔hostd UDS = mTLS; the mvmd hop uses iroh TLS — **don't double-encrypt it**; HTTP/TCP egress + the remote REST surface = TLS.
+> - **Boundary.** This defends data-at-rest and process-to-process channels. It does **not** defend against a malicious host reading guest RAM (confidential computing) — out-of-scope per ADR-002 unless a new ADR expands the threat model.
+>
+> **SDK is the central derivation engine — the heart of the UX/DX.** *Every* path to a microVM derives **through the SDK**: the four authoring surfaces below **and** the `mvmctl dev` / `build` flow all lower through the SDK to Nix templates + config. There is no second derivation path. **Four authoring surfaces, one IR, one build path** — all lower to the same Workload IR and the same builder-VM Nix build:
+> 1. **Decorator** (`@mvm.app()`) — parsed **statically** via the AST; never import/run user code on the host.
+> 2. **Runtime / record mode** — imperative `Sandbox` calls recorded, then lowered to the same IR.
+> 3. **`mvm.toml` manifest** — declarative, no code.
+> 4. **Custom `flake.nix`** — power-user path; a hand-written flake using the `mkGuest` API builds directly with no SDK involvement (`mvmctl build --flake .`). This path must stay first-class, not second-class.
+>
+> Single user-facing Python surface: `mvm` only; the IR mvm-side/mvmd-side split stays internal. `--input name=value` for function args; `--dev`/`--prod` verb aliases.
+>
+> **Image sources & distribution — three inputs, one boot contract.** Independent of the authoring surface, a microVM's rootfs comes from one of: (a) **Nix-built** (all four SDK surfaces produce this); (b) **OCI-pulled** (`mvmctl image pull` / `run --image`; allow-listed `mvm-oci` unpacker, materialized to ext4 in the builder VM, provenance recorded — claim 14); (c) **bundle** (`mvmctl bundle export/fetch/install`; mvm's native signed, content-addressed distribution of an `ExecutionPlan` + artifacts — claim 9). **All three converge on the same boot contract**: rootfs (`/dev/vda`) + the verity-sealed runtime overlay → guest agent on vsock. Bundles are mvm's *output* distribution; OCI is *external input* — don't conflate them.
+>
+> **Audit / hooks / policy.** Local **chain-signed JSONL** is the source of truth here (aggregation/"centralized" = mvmd). **Everything is auditable and logged**: every launch, policy decision, secret grant, network flow, snapshot/restore, admission, hook, and guest op emits a chain-signed entry *before or atomically with* the action. **Hard stance: if audit fails, fire a failure event if at all possible, then fail-closed — never act un-audited. Development mode is the only path that may bypass (with a loud warning).** Audit carries **no payload/secret bytes** (claims 12/13). All guest access is monitored, policy-governed, and audited. **Ingress and egress have full parity**: both are **default-deny, policy-controlled, and audited** — every inbound connection, port-forward, and control-plane request is policy-gated and emits an audit entry exactly like an egress decision. **Lifecycle hooks** — `before_` *and* `after_` for **`build`, `start`, `snapshot`, `stop`, `cleanup`** (10 hooks total); **each hook execution is itself audited**; **addons carry their own hooks merged at compile time**. (This supersedes the 4-hook in-flight `mvm-hook-contract` worktree, which is cleaned up with the others — define the 10-hook surface fresh in the rewrite.)
+>
+> **Core image**: small and fast to rebuild — busybox-as-PID-1 (no systemd), a **small custom kernel** (libkrunfw config; aggressively slimmed — a tiny kernel is the precondition for the boot-time target). `mkGuest` API. Offer a squashfs (read-only) path alongside ext4. A microVM is **rebuilt, never mutated**; custom volumes carry config; the guest agent accepts trusted ops over vsock.
+>
+> **Nix must be clean, idiomatic, and externalized.** Nix lives in standalone `.nix` template files under `nix/` and is referenced by path. **Do not embed large Nix strings/heredocs in Rust.** The SDK composes external template files with small, typed parameter substitution — never by concatenating big Nix blobs in code. Each template file is independently `nix flake check`-able. This is both a cleanliness requirement (the "looks like a human wrote it" goal) and a testability one.
+>
+> **Boot performance — budget, not a hard gate.** Start workload microVMs **as fast as possible**: **target sub-150 ms** (the deck's public promise), **< 300 ms acceptable** on slower backends, with Firecracker and libkrun as the focus backends. The #1 lever is a **tiny kernel** (aggressive libkrunfw/Firecracker config slimming) plus busybox PID1, clean external Nix templates, and squashfs; **snapshot/restore gives warm starts well under target**. **Build a benchmark harness** that measures cold + warm boot per-backend and **flags regressions** — track it; don't fail the build on an absolute number (hosts differ). **First fix the baseline blocker**: the `default-microvm` image can't boot the admitted path today.
+>
+> **CLI surface — ruthlessly small, nested under namespaces.** Keep only a handful of top-level verbs (the hot path); **nest every related subcommand under a noun namespace** so the top level never overwhelms (≤ 15 top-level entries). Merge overlapping launch verbs (`start`/`up`/`run` → one `run`); security status already folded into `doctor`. Sketch:
+> - **Top-level (hot path)**: `init`, `dev` (→ `up` / `down` / `shell` / `status`), `build`, `run`, `doctor`.
+> - **`vm`** → `stop`, `console`, `list`, `status`, `logs`, `snapshot`, `restore`.
+> - **`image`** → `list`, `search`, `pull`, `build`.
+> - **`template`** → `create`, `build`, `list`.
+> - **`network`** → `create`, `list`, `remove`.
+> - **`volume`** → `create`, `list`, `remove`, `inspect`.
+> - **`deps`** → `inspect`, `audit`;  **`audit`** → `verify`, `show`;  **`cache`** → `info`, `prune`;  **`mcp`** → `serve`.
+>
+> Delete superfluous verbs; every surviving command earns its place. Tenant-deploy verbs stay in `mvmd`.
+>
+> **Dev/prod modes:** `mvmctl dev …` is the **dev-tier** loop (mutable; `exec`/`console` allowed). Top-level `build`/`run` **default to prod** (sealed, signed, dev verbs compiled out — claim 4); `--dev`/`--prod` select the mode where a verb supports both. **No separate `prod` namespace** — it would duplicate the verb set; prod is simply the default.
+>
+> **Config file for environment (your follow-up):** yes — a **layered, typed config** beats flag-soup. Resolution order: built-in defaults < user config (`~/.config/mvm/config.toml`) < project config (`mvm.toml` / `.mvm/`) < env vars < CLI flags; named profiles (`[env.dev]` / `[env.prod]`) let dev/prod *settings* live in the file. **Security nuance:** config selects mode + defaults, but the **prod security tier is structural/build-time, not a config toggle** — `do_exec` is compiled out of prod (claim 4); a config flag must never re-enable a dev verb in a prod image. Config picks the mode; it cannot weaken the tier.
+>
+> **Consumption topology — library / CLI / sidecar, with two production modes.** `mvm`'s engine lives in library crates behind the trait seams; everything else is a thin face over it:
+> - **CLI** — `mvmctl` is a thin shell over the library (humans + local dev: `mvmctl dev …`). No logic in the CLI layer.
+> - **Library** — `mvmd` links `mvm` in-process. The contract is **traits + `mvm-core` types** (`VmBackend`, `NetworkProvider`, `StorageProvider`, `BuildEnvironment`, `ExecutionPlan`/policy/IR) — *not* the macOS libkrun launch path (mvmd runs its own Firecracker + jailer launch on Linux).
+> - **Sidecar** — `mvm` can also run as a long-lived process exposing the engine over a **fully-typed REST API + OpenAPI schema** (codegen'd Rust + TS clients; versioned per ADR-043) — **not** MCP, **not** gRPC. The **same REST protocol** serves local (UDS/loopback) and remote, so a client switches local↔remote by config only.
+>
+> **Product topology (spans repos — two production modes):** the **`mvm-studio` Tauri app** runs **`mvmd`** as a **sidecar or library locally** and talks to it; for a **remote, cloud-hosted `mvmd`**, `mvm-studio` makes **REST** calls. So the two modes — **local** (studio → local mvmd → mvm) and **remote** (studio → REST → cloud mvmd → mvm) — live at the *studio↔mvmd* boundary. `mvm`'s job here is to be a clean library/sidecar for `mvmd`; the REST/remote surface is `mvmd`'s (respect the repo boundary — no REST or tenant-orchestration in this repo).
+>
+> Security for any out-of-process or remote control plane is non-negotiable: **off by default**, **mTLS/TLS-authenticated**, authorized by the **same policy**, **audited on the same chain** — it must never escalate privilege or bypass a claim. Build the library/CLI split cleanly now so the sidecar is a thin addition; the remote path is Phase 2+, but **the API seam exists from day one**. Design every public API to be ergonomic from another crate, not just from `main()`.
+>
+> **Cross-cutting concerns the architecture ADR must address (checklist — don't let these fall through the cracks):**
+> - **Version/compat matrix** — host `mvmctl` ↔ guest agent ↔ runtime overlay ↔ vsock protocol ↔ sidecar API. Versioned envelopes, `#[serde(deny_unknown_fields)]` fail-closed (ADR-043/053). A newer host talking to an older guest fails admission cleanly, never silently.
+> - **Claim → CI-gate → code-location map.** The gates hardcode symbols/paths (e.g. `prod-agent-no-exec` greps `mvm_guest_agent::do_exec`; `xtask check-handler-adr-coverage`). Any rename MUST update the gate in the same PR. The architecture ADR carries this mapping table so no claim silently loses its gate.
+> - **Testing pyramid** — pure unit (no I/O) / hermetic (`MockBackend`, ADR-045) / live-KVM (feature-gated CI lanes) + `cargo-fuzz` targets (vsock framing, supervisor config, OCI unpack, service-call). Rebuild all; don't drop a tier during the rewrite.
+> - **Metering & observability** — emit usage-metering events (ADR-040: vCPU/RAM/disk/egress/build-minutes; aggregation is mvmd's job); a structured logging/tracing strategy; a perf/size budget dashboard (boot, build cold/warm, image size, binary size, dep-count vs the 723-package baseline).
+> - **NetworkProvider scope** — provisioning (TAP / virtio-net via passt on Linux, gvproxy on macOS) **+** **both ingress and egress** policy enforcement (default-deny; L3 + L7 proxy, ADR-004/006) **+** DNS (addon-dns) **+** audit observation of every inbound and outbound flow, all behind the one trait.
+> - **Programmable storage scope** — the `StorageProvider`/volume lifecycle: sealed hash-tagged app-deps volumes (claim 11), encrypted volumes, content-addressed volumes, snapshot upper layers; local + encrypted impls in-repo.
+> - **Key-management lifecycle** — host-signer / audit-signer keys, tenant KEK, per-snapshot DEK, mTLS certs: generation, storage (OS keystore / Secure Enclave / TPM), rotation cadence (ADR-027), zeroize-on-drop. One key story, not per-subsystem reinvention.
+> - **Cross-compile & embedded binaries** — guest/host-vm Linux binaries (agent, builder-init, egress-proxy, overlay bins) cross-compiled aarch64/x86_64-linux and embedded in `mvmctl` (ADR-065/Plan 115; `build.rs` + cargo-zigbuild). End-users get prebuilts; only source-checkout contributors need zig.
+> - **Release & update path** — the two-artifact-layer model (ADR-046: end-user prebuilts vs contributor source-build); `mvmctl update`; hash-verified downloads (claim 6) — never on the source-checkout path.
+> - **On-disk state migration** — pre-1.0 posture: decide clean re-init vs. preserve `~/.mvm` (keys, audit chains, cached images, volumes); **never silently corrupt a chain-signed audit log**; document whatever you choose.
+> - **Error taxonomy & first-use DX** — typed errors with actionable messages + stable error codes; readiness/progress reporting with no silent hangs (ADR-053); `mvmctl doctor` as the one unified diagnostic.
+> - **Builder/dev VM lifecycle** — one persistent VM (dev VM = its interactive face), idle timeout + watchdog + orphan sweep (Plan 89), builder backend selection (libkrun vs Vz, Plan 98).
+> - **Docs match functionality** — website docs (`public/src/content/docs/**`) are updated **in the same plan that changes a CLI/behavior**, not only in a final sweep; the drift already in-repo (`SPRINT.md` "7 crates") is the cautionary tale. Add a docs-vs-CLI parity check to CI where feasible (e.g. generate the command reference from Clap). Superseded docs move to `archive/docs/` (§6.5).
+>
+> ### 3c. Security depth, blast radius & additional threats
+> The threat assumption is **the workload is hostile** (AI-generated or third-party code). Goals: incredible DX *with* the highest security, everything auditable, the smallest possible blast radius. Defense-in-depth so a compromise anywhere is contained:
+> - **Blast-radius matrix** — design so that *if X is compromised, Y still holds*, and name this matrix in the architecture ADR. A hostile workload can't escape the VM (microVM boundary + dm-verity + seccomp `standard` + `setpriv --no-new-privs`), can't read a secret (egress-time substitution; raw bytes never enter the guest), can't reach the network (default-deny egress), can't tamper the audit log (chain-signed, written by a *separate* signer process), can't reach another tenant (per-tenant dirs + per-tenant KEK), and can't reach a signer's key (separate address spaces). Process isolation (§1) is this principle applied to the host side.
+> - **Host-side sandboxing** — the guest isn't the only untrusted-input surface. Any host subprocess that parses guest / registry / network input (broker, OCI unpacker, per-VM bridges) runs **confined** — seccomp + Landlock on Linux via `mvm-jailer-lite`, the macOS sandbox equivalent — least-privilege uid, dropped caps. Keep the trusted supervisor small.
+> - **Resource governance / DoS** — workloads get CPU / memory (balloon) / PID / timeout ceilings; every wire parser has a pre-deserialize **frame-size cap** (Plan 89 `MAX_BUILDER_FRAME_BYTES`); broker + agent rate-limit. A workload must not exhaust or wedge the host or the shared persistent builder VM.
+> - **Backend security tiers** — backends are not equal: Firecracker / libkrun / Vz are true microVM isolation; Docker is a shared-kernel **fallback** tier. `BackendSecurityProfile` must be admission-visible so a prod workload never silently lands on a weaker tier.
+> - **Covert-channel discipline** — DNS, the broker channels, and the vsock control-plane are potential exfil paths (Cardoso gap analysis / Plan 111). Treat them as egress to be audited; the parked egress secret-detection feature plugs in at a `NetworkProvider` observer.
+> - **Audit cannot be bypassed or lost** — hard stance: on audit failure, emit a failure event if possible, then **fail-closed** (refuse to launch); only **dev mode** may bypass, with a loud warning. Pre-boot failures that can't yet be audited are a known gap to *surface*, not hide.
+> - **Freshness & replay** — signed plans carry a validity window + nonce replay-store; the sidecar API and broker need equivalent replay protection. Trusted time (`host.time.v1`) underpins validity — guard against clock manipulation.
+> - **Supply chain for mvm itself** — beyond app-deps (claim 11) and `cargo-deny` (claim 7): sign mvm's own released binaries + emit SLSA-style provenance; the sealed/signed builder image (ADR-005); reproducible double-build. The source-checkout path never downloads (ADR-046).
+> - **Compliance posture** — the encryption layering is also compliance-motivated (ADR-027: SOC2 / PCI / HIPAA, in-transit + at-rest). "No user secrets at rest" + precise metering are hosted-cloud invariants (ADR-032). Keep them true.
+> - **Out of scope — state plainly (ADR-002)** — a malicious host, hardware side-channels (Spectre/Meltdown), hardware-backed attestation, and multi-tenant *guests* (one guest = one workload). Don't let a cleanup quietly imply otherwise.
+>
+> ### 3d. Other features & decisions to preserve (found in-repo; don't lose them in the rewrite)
+> - **Addon / integration model** — local services a workload can reach (e.g. `addon-dns`, the TCP↔vsock `addon-vsock-bridge`), each with a manifest / lockfile / SBOM / verify and its own lifecycle hooks merged at compile time. Keep the addon contract first-class.
+> - **Function-call entrypoints** — the prod-safe `RunEntrypoint` invocation surface (ADR-007) + the dev-only fd-3 control channel / session attach (ADR-011); `f.remote(...)`-style calls. The dev-only exec path stays compiled out of prod (claim 4).
+> - **In-guest worker pool** — concurrent workload execution / warm processes inside the guest (distinct from the parked warm *VM* pool). A throughput/latency lever.
+> - **PTY-over-vsock console + port forwarding** — `mvm console` (dev tier) and `-p HOST:GUEST`, both over the agent/vsock chokepoint.
+> - **Image catalog, named networks, templates** — `image` catalog browse/fetch, `network` named networks, `template` reusable images. Keep as nested CLI namespaces.
+> - **Balloon / dynamic memory** — runtime memory reclaim (`balloon_set_target`); part of resource governance.
+> - **Health checks** — `mkGuest` service readiness; feeds the no-silent-hang readiness story (ADR-053).
+> - **Cross-platform posture** (ADR-031) — Linux + macOS native; Windows is Tauri / CLI best-effort. This is exactly where the **`mvm-studio` Tauri + sidecar** story pays off.
+> - **CI execution policy** (ADR-038) — push runs light CI; release tags run the full matrix (security audit, reproducibility, Windows). Preserve the split so the claim gates actually run.
+> - **Hosted-cloud invariants** (ADR-032) — no hosted-only code paths (everything works locally), precise metering, no user secrets at rest, compliance-ready. The local-first invariant protects the OSS/DX story.
+>
+> ### 3e. Process-isolation map (the moat — addressing the guardrail)
+> "The boundary lives below the workload" (§0b) is the #1 differentiator, so the separate-address-space boundaries are a **named, verifiable contract**, not an emergent property. Each row is a distinct **OS process** at runtime; the cleanup may merge their *crates / build-units* but **must not merge their processes**:
+> | Process (separate address space) | Why isolated | Backed by |
+> |---|---|---|
+> | Tenant workload (in-guest) | Zone C — "no powers", assumed adversarial | VM boundary + verity + seccomp + setpriv |
+> | Supervisor (host) | Small trusted TCB that admits + launches | claim 8 |
+> | Audit-signer | **Sole** holder of the audit key + **sole** JSONL writer | claim 8 |
+> | Host-signer | **Sole** holder of the `ExecutionPlan` signing key | claim 8 |
+> | Secrets dispatcher / broker | Raw secrets never leave its address space; binding-gated | claims 12/13 |
+> | Egress/ingress policy plane + proxy | Policy + key custody **outside the tenant**, in-process (not a network hop) | claim 10 + the moat |
+> | Per-VM sidecars (supervisor / drainer / bridge) | Per-VM blast-radius confinement | per-backend |
+>
+> **Consolidation rule:** reduce crates via multiple `[[bin]]` targets + a shared `core::subprocess` scaffold, but every row stays its **own process**. **Verification (make it a lint, not a hope):** an `xtask`/CI check asserts the boundaries — the audit-signing-key symbol must **not** be linkable from the supervisor binary; the secrets dispatcher's memory isn't reachable from handlers (claim 13's existing tests). This map belongs in the architecture ADR as part of the claim → gate → location mapping.
+>
+> ### 3f. Isolation dimensions — coverage map
+> The classic sandbox triad (process / network / filesystem) is the floor, not the ceiling. For a microVM running hostile code, the full set and where each stands:
+> | Dimension | Mechanism | Status |
+> |---|---|---|
+> | **Kernel** (own kernel, not the host's — the microVM foundation) | Firecracker / libkrun / Vz guest kernel; Docker fallback shares the kernel (weak tier) | ✅ shipped — makes the rest strong |
+> | **Process** | seccomp `standard`, `setpriv --no-new-privs --bounding-set`, per-service uid, `do_exec` absent in prod | ✅ shipped + CI-gated (claims 1/2/4) |
+> | **Filesystem — access** | no host-fs beyond explicit shares; dm-verity rootfs; RO `/etc`; sealed app-deps volumes | ✅ shipped (claims 1/3/11) |
+> | **Filesystem — confidentiality** | at-rest AEAD envelope on every mounted dir/volume | ⚠ **gap the rewrite closes** (designed, mostly unbuilt) |
+> | **Network — egress** | default-deny + L3/L7 proxy | ✅ shipped (claim 10) |
+> | **Network — ingress** | default-deny + policy + audit, parity with egress | ⚠ **gap the rewrite closes** (new) |
+> | **Memory** | hardware-virtualized VM boundary | ✅ guest→host; host→guest = confidential compute (**deferred**, §0b) |
+> | **Compute / resource (DoS)** | CPU/mem(balloon)/PID/timeout ceilings; frame-size caps; rate limits | ◑ partial — formalize in the rewrite (§3c) |
+> | **Device** | minimal virtio model; no GPU/VFIO passthrough | ✅ (Firecracker posture; passthrough deferred) |
+> | **Secret / credential** | egress-time substitution; raw secrets never enter the guest | ✅ shipped (claims 12/13) |
+> | **Control-plane** ("boundary below the workload") | policy/keys/egress in separate address spaces (§3e) | ✅ shipped — the moat |
+> | **Audit / tamper** | chain-signed log, separate signer process, fail-closed | ✅ shipped + rewrite hardening (claim 8) |
+> | **Temporal / state** | immutable rebuilds; ephemeral; no silent mutation | ✅ (immutability invariant) |
+> | **Supply-chain integrity** | verity + signed plans + content-addressed bundles + reproducible builds | ✅ shipped (claims 3/7/8/9) |
+> | **Multi-tenant** | one guest = one workload; per-tenant KEK/dirs on host | ✅ (ADR-002; host-side per-tenant keys) |
+>
+> **The 3 named dimensions are secured** (process + FS-access + egress shipped & gated). The two **live gaps the rewrite closes are at-rest encryption (FS confidentiality) and ingress parity (network)**; the deferred frontier is **memory-vs-malicious-host (confidential compute)** and **hardware side-channels** (out of scope — §0b / ADR-002).
+>
+> ### 4. THE #1 DELIVERABLE — the core demo
+> A persistent **builder VM** (non-interactive, single purpose: build microVMs) reached *through* the **dev VM** (its interactive sibling), taking a **hello-world app → a built, booting microVM**, fully on the dev path. This is Phase 1. Acceptance:
+> - [ ] `mvmctl dev up` boots a **persistent** builder VM (amortized boot across the session, not single-shot per build).
+> - [ ] A hello-world app (Python, decorator + runtime forms) compiles **via the SDK** to a Nix flake + `mvm.toml`, builds **inside** the builder VM (no host Nix), and produces kernel + rootfs.
+> - [ ] `mvmctl run` boots the microVM from those artifacts and the guest agent answers over vsock.
+> - [ ] **Local dev mode is `mvmctl dev <commands>`** (`up` / `down` / `shell` / `status` + the build loop) and drives the *whole* loop locally — build a microVM and run it — **all derived via the SDK**. This is the canonical DX and the thing to get right first.
+> - [ ] End-to-end on macOS (libkrun) **and** Linux (Firecracker) per the backend trait; CI green; the demo encrypts artifacts at rest and uses the upgraded (Noise) vsock frames.
+>
+> ### 5. Stubs & dead code
+> Sweep `todo!`/`unimplemented!`/`TODO`/`FIXME`/commented-out blocks (the audit found them concentrated in broker skeletons + balloon-runtime design notes). Delete dead code; finish or explicitly park stubs (parked → a checkbox in the relevant plan's `### deferred follow-ups`, per repo convention).
+>
+> ### 6. ADR + plan consolidation worklist
+> **Goal: far fewer, cleaner ADRs and plans** — a set a newcomer can read in an afternoon (rough target ~20 canonical ADRs, down from 65; `specs/plans` holds only *live* plans). Collapse the sequential-refinement clusters below; superseded ADRs (and the entire old plan corpus) are **moved to `archive/`** in §6.5, leaving only the canonical set live.
+> - [ ] Builder VM: collapse **013 + 046 + 057 + 065** → one ADR (history preserved).
+> - [ ] Broker: collapse **049 + 059 + 061 + 062** → one ADR (061 already supersedes 059's architecture; 062 rescopes).
+> - [ ] Entrypoints: fold **010 + 011** into **007**.
+> - [ ] Images & runtime overlay: collapse **039 + 050 + 051** (overlay composition + OCI verity + overlay disk) → one "image & runtime overlay" ADR (approved).
+> - [ ] Curate to ~20 canonical ADRs; move the rest to `archive/adrs/` (§6.5).
+> - *Leave separate (orthogonal, not a task):* 004/006/064; 027/042; 002/048.
+>
+> ### 6.5 Archive & repo reset (FINAL workstream — only after Phase 1 lands and in-flight plans 104/115 merge)
+> **Clean-refactor goal: the live tree contains ONLY new / canonical / matching content; everything superseded is *contained* under one top-level `archive/`.** **Timing: do this last** — moving crates/plans/docs while 104/115 (or any worktree) are mid-flight breaks the build and every worktree, so archive only superseded, landed work.
+> - [ ] **`archive/crates/`** — every removed crate moves here, **out of the Cargo workspace `members`** (reference-only; need not compile).
+> - [ ] **`archive/plans/`** — the **entire existing `specs/plans/*` corpus** is archive/not-active (the old roadmap); `specs/plans/` keeps only this brief + the new plan(s). Old plans stay as *research/history* (Plan 89 orphan-sweep, Plan 111 Cardoso), not a live backlog. **Caveat:** don't `mv` files the 104/115 worktrees still reference until they land/abandon.
+> - [ ] **`archive/adrs/`** — **move** every superseded ADR here (clean tree), leaving only the ~20 canonical ADRs in `specs/adrs`; keep an `archive/adrs/INDEX.md` so decision history stays findable.
+> - [ ] **`archive/docs/`** — any website doc that no longer matches the new functionality moves here; the **live `public/src/content/docs/**` is rewritten to match** (see "Docs match functionality" in §3). No stale docs in the live tree.
+> - [ ] **`specs/SPRINT.md`** — reset it: archive the completed sprint to `specs/backlog/<NN>-<name>.md` (repo convention) and write a fresh `SPRINT.md` reflecting the **real** crate count + goals; delete the stale "7 + facade" line + dependency-reduction baseline.
+> - [ ] **`CLAUDE.md` + auto-memory** — rewrite the architecture/crate map to the new shape; flag/refresh stale memories naming old crate paths.
+> - [ ] **`archive/README.md`** — one index explaining what's archived and why (git history is the deeper archive; `archive/` is the at-a-glance one).
+>
+> ### 7. Parked security research to PRESERVE (summarize the idea + the problem it solved; do not delete)
+> - **Egress secret detection/obfuscation** — inspect payload bytes at the gateway to catch secret exfiltration; `NetworkProvider` is the wrap surface; detection logic unbuilt.
+> - **Warm VM pools** — amortize cold-start; depends on snapshot/restore maturity.
+> - **ExecutionPlan resource limits** — `timeout_seconds`/`pid_limit` scaffolded but unpopulated.
+> - **In-guest volume encryption (inbound)** — encrypting RW volumes from within the guest; awaits guest-agent crypto maturity.
+> - **Cardoso gap analysis** (`specs/research/sandboxes-for-ai-cardoso-gap-analysis.md`, Plan 111) — public-posture audit; keep as positioning input.
+> - **Deferred backends** (Cloud Hypervisor / crosvm / rust-vmm internalization) — keep the decision records and their trigger conditions.
+> Keep these as a single backlog index so nothing is lost; don't let adjacent network/L7 work foreclose them.
+>
+> ### 8. Constraints & taboos
+> - **Never** name external inspiration projects in filenames, branches, worktrees, code, comments, commits, or any repo text. (And never reintroduce `microsandbox`, `smolvm`, or `ur-seed` — all dead/forbidden per memory.)
+> - **No plan/ADR numbers in code.**
+> - Respect the **mvmd** boundary: no `--prod` admission policy or tenant orchestration in this repo.
+> - Confirm any destructive or outward-facing step before taking it.
+>
+> ### 9. Definition of done
+> **Documentation phase (Stages A–C):**
+> - [ ] Four decisions resolved + positioning section written.
+> - [ ] New architecture ADR written; ADR consolidations done; ~20 canonical ADRs.
+> - [ ] One bounded `specs/plans` doc per workstream (each with its own checkboxes).
+>
+> **Per execution session (Stage D):**
+> - [ ] The session's plan implemented and **green** (`fmt --all`, `clippy -D warnings`, `test --workspace`); **all 14 claim gates intact**; claim → gate map re-verified.
+> - [ ] Phase 1 (core demo) is the first and most important of these.
+>
+> **Final state (Stage E — whole rearchitecture complete):**
+> - [ ] All §3d features verified still present (addons, entrypoints, worker pool, console/port-forward, catalog/networks/templates, balloon, health checks); §7 parked research preserved as a backlog index.
+> - [ ] `archive/` holds removed crates + the existing plan corpus; `specs/SPRINT.md` reset (old sprint → `specs/backlog/`); `CLAUDE.md`, auto-memory, and public docs match the new architecture (§6.5).
+
+---
+
+*The blockquoted Part C is the copy-paste artifact for the rearchitecture session; Parts A–B are its briefing.*

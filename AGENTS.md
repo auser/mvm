@@ -12,6 +12,8 @@ All Nix builds/evals, Firecracker operations, `mvmctl` runtime commands (anythin
 
 ## Worktree Workflow for Features
 
+> **Active exception — the cleanup rewrite.** The in-progress complete refactor (`specs/plans/117-cleanup-and-rearchitecture-brief.md`, branch `cleanup-rearchitecture`) runs on a **single long-lived branch, not worktrees**, and all stale worktrees are being cleaned up first so it starts from a clean state. The worktree workflow below is the standard for **all work after** the rewrite lands — and the rewrite's own plans instruct future sessions to return to it.
+
 Every feature, refactor, or non-trivial bug fix is developed in a git worktree — code edits and cargo invocations happen inside the worktree directory. Git operations (status, add, commit, stash, rebase, push, fetch, pull, hook execution) happen from the main `mvm/` checkout, with `-C` pointing at the worktree when needed. The main checkout is the single git operator; worktree directories are code+build sandboxes only.
 
 ### Never commit directly to `main`
@@ -135,6 +137,7 @@ No task is complete without tests. Every feature, bug fix, or refactor must incl
 3. **Zero clippy warnings/errors**: Run `cargo clippy --workspace -- -D warnings` and fix all findings before calling a feature done. Never suppress a clippy lint with `#[allow(...)]` — fix the underlying issue instead.
 4. **Compiling workspace**: Run `cargo check --workspace` (or full `cargo test`/`cargo build`) and fix any errors before you finish. Never leave the workspace in a non-compiling state.
 5. **Update sprint spec**: After completing any phase, task, or sub-task, update `specs/SPRINT.md` to reflect the current status. Check off completed items (`- [x]`), update phase status labels (e.g. `**Status: COMPLETE**`), and add any new test counts or notes. The sprint spec must always accurately reflect what has been implemented.
+6. **Tick the plan checkboxes**: as you complete each task or sub-task, check it off (`- [x]`) in the active plan under `specs/plans/<N>-*.md`. **The plan's checkboxes are the source of truth for progress** — a resumed or parallel session reads the last unchecked box to know exactly where to pick the work back up. Never mark a box done before its tests are green. Keep the plan and `specs/SPRINT.md` in sync.
 
 ## Test Expectations
 
