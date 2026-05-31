@@ -254,27 +254,29 @@ The owner pushed to verify before writing plans; four read-only explorations cor
 > - [x] Write the **new architecture ADR** → **ADR-066** (`specs/adrs/066-target-architecture.md`, 2026-05-31): 17-crate role-named graph + `crates/deps/*-sys` FFI; trait seams; encryption + key lifecycle; consumption topology **library + CLI** (mvmd is the sidecar — corrects the old "library/CLI/sidecar" line); separate role binaries + one supervising process; the **claim → CI-gate → code-location map**.
 > - [x] Run the ADR consolidations + curation → done 2026-05-31: 4 canonical ADRs (046/062/007/051) carry consolidation banners; curation classification recorded in **ADR-066 §"ADR consolidation"** (real 45 → ~25–30 canonical; physical archive + INDEX is Stage E §6.5).
 >
-> **Stage C — New `specs/plans`** (documentation only; one bounded plan per workstream, each with its own checkboxes)
-> - [ ] Phase 1 plan — **core demo** (hello-world → microVM via the persistent builder VM, SDK-derived, driven by `mvmctl dev`).
-> - [ ] Plan — crate consolidation (~32 → ~15–18; the `core::` dedups).
-> - [ ] Plan — encryption layering + key lifecycle (envelope, rotation, Noise/mTLS/TLS).
-> - [ ] Plan — `NetworkProvider` + `StorageProvider` traits + impls.
-> - [ ] Plan — guest agent (lean-Rust) + runtime overlay (universal agent).
-> - [ ] Plan — CLI surface (≤15 nested) + SDK as the derivation engine.
-> - [ ] Plan — sidecar API seam (versioned; off-by-default remote).
-> - [ ] Plan — metering/observability + boot/size benchmark harness.
-> - [ ] Plan — testing pyramid + fuzz parity + claim-gate migration.
+> **Stage C — New `specs/plans`** (documentation only; one bounded plan per workstream, each with its own checkboxes; numbered from **120** — 117 brief, 118/119 bench. **Scopes fully expanded 2026-05-31 with the §A29 verification findings.**)
+> - [ ] **120 — core demo (Phase 1):** hello-world → booting microVM via the persistent builder VM, **macOS libkrun spine**, SDK-derived via `mvmctl dev`. Includes the `ArtifactSidecar`→`ArtifactManifest` rename + the overlay-aware admit blocker fix; slim `mkGuest` build (`mkfs.ext4 -d` populate-at-format) + agent-via-overlay (ADR-051); an `MVM_E2E_SMOKE` boot→`ping` test. Linux/Firecracker parity is a follow-up (uses the Lima `/dev/kvm` test backend).
+> - [ ] **121 — crate consolidation (32 → 17) + `crates/deps/*-sys` + the `core::` dedups:** the renames (`ArtifactSidecar`→`ArtifactManifest`, `mvm-vm-sidecar`→`mvm-vm-host`, plan/policy/security → `mvm-core`, ir → sdk, base → runtime, runner → guest). **Carries the §8 rename-break gate-update checklist** (exact CI `-p` / test-filter / fuzz-`working-directory` strings) applied **same-commit**. Publishes the new `mvmctl` facade + `mvm-core` module map for **mvmd plan 51** (mvmd breakage accepted — facade need not survive unchanged). **Note: this delivers ~0 third-party-dep reduction (build-units only — see 126).**
+> - [ ] **122 — encryption + key lifecycle:** envelope DEK/KEK (mvm-managed AEAD both platforms), Noise vsock, mTLS/TLS, 90-day KEK rotation + DEK-per-rebuild. **+ snapshot-at-rest encryption + the VMGenID claim candidate** (resume must rotate VMGenID + reseed the guest PRNG; snapshot artifacts content-addressed + signed like bundles — the file CRC is integrity-only).
+> - [ ] **123 — `NetworkProvider` + `StorageProvider` + the warm-start substrate:** provisioning + **both ingress & egress** default-deny policy + DNS + audit (NetworkProvider); local + encrypted + content-addressed + **diff/layered snapshot** volumes (StorageProvider); the **UFFD + NBD-rootfs + hugepages fast-resume substrate** (~1 s resume) + the `doctor` probes (NBD module, HugeTLB); **named security-profile capability matrices** over the seams.
+> - [ ] **124 — guest agent (lean-Rust v2) + runtime overlay + the lean-agent dep cut:** universal verity-sealed agent overlay (ADR-051); **drop `tokio`→`polling`, `serde_json`→hand-rolled, `rtnetlink`→`linux-raw-sys` (~25–35 crates)**; a **spec-first / codegen'd host↔guest protocol** (SDK client + guest agent from one schema, no drift); **config-on-a-device init handoff** (read-only JSON config device, composes with dm-verity, before vsock).
+> - [ ] **125 — CLI surface (≤ 15 nested) + SDK as the derivation engine:** the `mvmctl` nested tree; the 4 authoring surfaces → 1 IR → 1 build; **`--secret NAME:host` terse broker binding**; **per-backend latency/capability tradeoff table surfaced by `doctor`**; named-profile UX.
+> - [ ] **126 — dependency reduction (the *real* dep wins; continues the Dependency Reduction Roadmap):** prune/relocate the optional heavy features — `sigstore` (~120–150, `manifest-verify` → mvmd or drop), `opendal` (~70, `template-registry-s3`), `pgp` (~80, release-sig → minisign), `aws-lc-rs`→`ring` (~6 + kills a C/cmake build); unify the `oci-client`/`reqwest` duplicate majors; **re-baseline the `cargo tree` methodology** (735 actual ≠ the brief's 723). *(Replaces the dropped "sidecar API seam" plan — the sidecar is mvmd's.)*
+> - [ ] **127 — metering/observability + boot/size benchmark harness:** ADR-040 metering events (aggregation is mvmd's); the **per-phase boot-latency methodology** (the measured macOS code-signing cold-start lever); the re-baselined dep-count + a perf/size budget dashboard.
+> - [ ] **128 — testing pyramid + fuzz parity + claim-gate migration + BUILD THE MISSING GATES:** fast-default (host unit + hermetic `MockBackend`) / gated-slow (live-KVM, E2E) tiers; fuzz re-homing (`mvm-firecracker-bridge`→`mvm-vm-host`, `mvm-vz`→`mvm-backend`, `mvm-libkrun`→`deps/libkrun-sys`); **build the currently-missing/broken gates — restore `scripts/check-prod-agent-no-exec.sh` (claim 4) and BUILD the claims 12/13 gates against the `host.audit.v1` reality (not the dropped `host.secrets.v1`)**; re-verify the §8 claim→gate map.
+> - [ ] **Cross-repo — mvmd API migration:** tracked in **`mvmd/specs/plans/51-mvm-v2-rewrite-api-migration.md`** (the verified mvmd↔mvm coupling + the per-change update tasks), worked in a **dedicated mvmd session** after 121 lands. mvmd breakage accepted (owner, 2026-05-31).
 >
 > **Stage D — Execute** (one plan per session: TDD, dedicated branch, CI green, claim gates intact; re-verify the claim → gate map after each)
-> - [ ] Execute Phase 1 — **core demo** ← the #1 goal (acceptance boxes in §4).
-> - [ ] Execute — crate consolidation.
-> - [ ] Execute — encryption + key lifecycle.
-> - [ ] Execute — `NetworkProvider` + `StorageProvider`.
-> - [ ] Execute — guest agent (lean-Rust) + runtime overlay.
-> - [ ] Execute — CLI surface + SDK derivation engine.
-> - [ ] Execute — sidecar API seam.
-> - [ ] Execute — metering/observability + benchmark harness.
-> - [ ] Execute — testing pyramid + fuzz + claim-gate migration.
+> - [ ] Execute **120** — **core demo** ← the #1 goal (acceptance boxes in §4).
+> - [ ] Execute **121** — crate consolidation (apply the §8 rename-break gate-update checklist same-commit; publish the facade/`mvm-core` map for mvmd plan 51).
+> - [ ] Execute **122** — encryption + key lifecycle (+ snapshot encryption + VMGenID rotation).
+> - [ ] Execute **123** — `NetworkProvider` + `StorageProvider` + the warm-start substrate (diff snapshots / UFFD / NBD / hugepages).
+> - [ ] Execute **124** — guest agent (lean-Rust v2) + runtime overlay + the lean-agent dep cut + spec-first protocol.
+> - [ ] Execute **125** — CLI surface (≤15 nested) + SDK derivation engine.
+> - [ ] Execute **126** — dependency reduction (prune `sigstore` / `opendal` / `pgp` / `aws-lc`→`ring`; re-baseline).
+> - [ ] Execute **127** — metering/observability + benchmark harness (per-phase boot methodology).
+> - [ ] Execute **128** — testing pyramid + fuzz parity + **build the missing claim-4 / 12 / 13 gates** + claim-gate migration.
+> - [ ] Cross-repo (separate mvmd session) — execute **mvmd plan 51** (API migration; after 121 lands).
 > - [ ] Sweep stubs / dead code (§5).
 > - [ ] Update website docs to match (rides each plan; final parity check).
 >
