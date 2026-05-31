@@ -180,7 +180,23 @@ A close analog (an embeddable AI-agent compute substrate) informed several choic
 
 ## ADR consolidation (this ADR's place in the set)
 
-ADR-066 is the architecture spine; it does not itself supersede the clusters. The Stage B consolidation (tracked in Plan 117 §6) folds each cluster into its canonical ADR and archives the rest, targeting ~20 canonical ADRs: builder VM → **046** (absorbing 013/057/065); broker → **062** (absorbing 049/059/061); entrypoints → **007** (absorbing 008/010/011); images & runtime overlay → **051** (absorbing 039/050). ADR-064's `NetworkProvider` is generalized here from audit-observation to full provisioning + policy. Dead/forbidden ADRs (e.g. ur-seed 054) move to `archive/adrs/`. Left separate (orthogonal): 004/006/064 (egress/CA/network audit), 027/042 (encryption scope vs mechanism), 002/048 (claims vs positioning).
+ADR-066 is the architecture spine; it does not itself supersede the clusters. The Stage B consolidation (Plan 117 §6) folds each sequential-refinement cluster into one **canonical** ADR (which now carries a consolidation banner) and records the curation here; the **physical** archive — moving superseded files to `archive/adrs/`, marking their status, and writing `archive/adrs/INDEX.md` — is the mechanical **Stage E** pass (§6.5), so the live tree isn't disrupted mid-rewrite.
+
+**Named cluster consolidations (canonical banners added 2026-05-31):**
+- Builder VM → **046** — absorbs 013 (Nix pivot), 057 (symmetric builder VM), 065 (single builder/dev image).
+- Broker → **062** — absorbs 049 (secret substitution), 059 (architecture), 061 (hardening).
+- Entrypoints → **007** — absorbs 008 + 010 (function-service-factories duplicate pair) + 011 (control protocol).
+- Images & runtime overlay → **051** — absorbs 039 (overlay composition), 050 (OCI verity).
+
+**Dead/forbidden → archive:** 054 (ur-seed — removed; never reintroduce).
+
+**Further consolidation candidates (recorded; executed in Stage E):** 005 (sealed builder image) → 046; 044 (audit-emit-macro) → 041; 060 (pid0-portability) → 063; 012 (provider-CLI-contract — superseded by §1/§4) → 066.
+
+**Flagged for owner review (arguably independent — not folded unilaterally):** 003 (local MCP server), 035 (feature-flag taxonomy), 052 (user-defined base-image registry), 056 (Vz backend). Each *could* fold but encodes a distinct decision; merging them just to hit a number risks losing nuance.
+
+**Left separate (orthogonal, never merge):** 004/006/064 (egress policy / name-constrained CA / network audit), 027/042 (encryption scope vs mechanism), 002/048 (claims table vs positioning), 014 (VmBackend trait — this ADR builds on it). ADR-064's `NetworkProvider` is generalized here from audit-observation to full provisioning + policy.
+
+**Honest count:** 45 ADRs today (not the brief's ~65 — that counted the public-docs mirror). The four named clusters (−11) + dead (−1) land **33 canonical**; the further candidates (−4) reach **~29**; the flagged set (−4) could reach **~25**. **~25–30 is the safe landing from the real 45**; the brief's "~20" was relative to the mis-counted baseline and would require merging genuinely-distinct decisions — out of scope without owner sign-off.
 
 ## Implementation sequencing (→ Stage C plans)
 

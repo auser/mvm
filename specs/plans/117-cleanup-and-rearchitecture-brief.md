@@ -245,7 +245,7 @@ Stage B's architecture ADR is written: **ADR-066** (`specs/adrs/066-target-archi
 >
 > **Stage B — ADRs** (documentation only; no code)
 > - [x] Write the **new architecture ADR** → **ADR-066** (`specs/adrs/066-target-architecture.md`, 2026-05-31): 17-crate role-named graph + `crates/deps/*-sys` FFI; trait seams; encryption + key lifecycle; consumption topology **library + CLI** (mvmd is the sidecar — corrects the old "library/CLI/sidecar" line); separate role binaries + one supervising process; the **claim → CI-gate → code-location map**.
-> - [ ] Run the ADR consolidations + curation (granular boxes in §6).
+> - [x] Run the ADR consolidations + curation → done 2026-05-31: 4 canonical ADRs (046/062/007/051) carry consolidation banners; curation classification recorded in **ADR-066 §"ADR consolidation"** (real 45 → ~25–30 canonical; physical archive + INDEX is Stage E §6.5).
 >
 > **Stage C — New `specs/plans`** (documentation only; one bounded plan per workstream, each with its own checkboxes)
 > - [ ] Phase 1 plan — **core demo** (hello-world → microVM via the persistent builder VM, SDK-derived, driven by `mvmctl dev`).
@@ -432,11 +432,11 @@ Stage B's architecture ADR is written: **ADR-066** (`specs/adrs/066-target-archi
 >
 > ### 6. ADR + plan consolidation worklist
 > **Goal: far fewer, cleaner ADRs and plans** — a set a newcomer can read in an afternoon (rough target ~20 canonical ADRs, down from 65; `specs/plans` holds only *live* plans). Collapse the sequential-refinement clusters below; superseded ADRs (and the entire old plan corpus) are **moved to `archive/`** in §6.5, leaving only the canonical set live.
-> - [ ] Builder VM: collapse **013 + 046 + 057 + 065** → one ADR (history preserved).
-> - [ ] Broker: collapse **049 + 059 + 061 + 062** → one ADR (061 already supersedes 059's architecture; 062 rescopes).
-> - [ ] Entrypoints: fold **010 + 011** into **007**.
-> - [ ] Images & runtime overlay: collapse **039 + 050 + 051** (overlay composition + OCI verity + overlay disk) → one "image & runtime overlay" ADR (approved).
-> - [ ] Curate to ~20 canonical ADRs; move the rest to `archive/adrs/` (§6.5).
+> - [x] Builder VM: collapse **013 + 057 + 065** → canonical **046** (banner added 2026-05-31; history preserved; superseded files archived in Stage E).
+> - [x] Broker: collapse **049 + 059 + 061** → canonical **062** (banner added 2026-05-31; archived in Stage E).
+> - [x] Entrypoints: fold **008 + 010 + 011** into canonical **007** (banner added 2026-05-31; the 008/010 dup pair + 011 archived in Stage E).
+> - [x] Images & runtime overlay: collapse **039 + 050** → canonical **051** (banner added 2026-05-31; archived in Stage E).
+> - [x] Curate canonical ADRs — classification recorded in **ADR-066 §"ADR consolidation"**: real 45 → **~25–30** canonical (the "~20" was vs a mis-counted 65 baseline). Physical move to `archive/adrs/` + INDEX = Stage E (§6.5).
 > - *Leave separate (orthogonal, not a task):* 004/006/064; 027/042; 002/048.
 >
 > ### 6.5 Archive & repo reset (FINAL workstream — only after Phase 1 lands and in-flight plans 104/115 merge)

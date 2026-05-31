@@ -5,6 +5,8 @@ date: 2026-05-04
 related: ADR-002 (microVM security posture); ADR-005 (sealed signed builder image); plan 41 (function-call entrypoints implementation)
 ---
 
+> **Consolidation (2026-05-31 — see [ADR-066](066-target-architecture.md) §"ADR consolidation"):** ADR-007 is the **canonical** function-entrypoints ADR. It **consolidates** ADR-008 + ADR-010 (function-service-factories — a duplicate-numbered pair) and ADR-011 (entrypoint control protocol); those are **superseded** and physically archived to `archive/adrs/` in Stage E. The dev-only fd-3 control channel stays compiled out of prod (claim 4).
+
 ## Status
 
 Proposed. Lays the substrate for `mvmforge`'s function-call SDKs
