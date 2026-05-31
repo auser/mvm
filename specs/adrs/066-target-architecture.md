@@ -45,11 +45,11 @@ The target is **17 architectural crates** (from 32), plus a bracketed-off `crate
 | `mvm-storage` | **`mvm-storage`** (keep) | `StorageProvider` + `local` + **`encrypted`** impls in-repo |
 | `mvm-addon-dns`, `mvm-addon-vsock-bridge` | → **`mvm-guest-helpers`** (`[[bin]]`s) | in-guest helper daemons |
 | `mvm-supervisor`, `mvm-broker`, `mvm-host-signer`, `mvm-audit-signer`, `mvm-jailer-lite` | → **`mvm-hostd`** | one crate, **four separate `[[bin]]`s** (see §3); jailer-lite is a module |
-| `mvm-libkrun-supervisor`, `mvm-vz-drainer`, `mvm-firecracker-bridge` | → **`mvm-vm-sidecar`** | one crate, cfg-gated per-backend `[[bin]]`s (one process per VM) |
+| `mvm-libkrun-supervisor`, `mvm-vz-drainer`, `mvm-firecracker-bridge` | → **`mvm-vm-host`** | one crate, cfg-gated per-backend `[[bin]]`s (one process per VM) |
 | `mvm-vz-supervisor` (Swift) | **`mvm-vz-supervisor`** (keep) | non-Rust; separate build, outside the cargo workspace |
 | `xtask` | **`xtask`** (keep) | workspace tooling + the claim-gate lints |
 
-**The 17 architectural crates:** `mvm-core`, `mvm-sdk`, `mvm-sdk-macros`, `mvm`, `mvm-build`, `mvm-guest`, `mvm-cli`, `mvm-mcp`, `mvm-oci`, `mvm-backend`, `mvm-network`, `mvm-storage`, `mvm-hostd`, `mvm-vm-sidecar`, `mvm-guest-helpers`, `mvm-vz-supervisor` (Swift), `xtask`. (+ the `crates/*/fuzz` crates, excluded from the workspace as today.)
+**The 17 architectural crates:** `mvm-core`, `mvm-sdk`, `mvm-sdk-macros`, `mvm`, `mvm-build`, `mvm-guest`, `mvm-cli`, `mvm-mcp`, `mvm-oci`, `mvm-backend`, `mvm-network`, `mvm-storage`, `mvm-hostd`, `mvm-vm-host`, `mvm-guest-helpers`, `mvm-vz-supervisor` (Swift), `xtask`. (+ the `crates/*/fuzz` crates, excluded from the workspace as today.)
 
 `mvm-core` is the common crate: the six vsock/framing impls collapse to one `core::framing` (`FramedMessage<T>` + pluggable auth); the four config/secret loaders to one `core::config_envelope`; scattered XDG/path helpers to one `core::paths`; the three signer-subprocess templates to one `core::subprocess` scaffold (keyless — see §3).
 
@@ -75,7 +75,7 @@ Only `libkrun-sys` exists today; the rest are anticipated homes. Adding any of t
 The host side is **separate role binaries, launched and supervised by a single process.** This keeps the strongest isolation guarantee *and* a single operational entry point.
 
 - **`mvm-hostd` is one crate with four separate `[[bin]]` targets** — `mvm-supervisor`, `mvm-broker`, `mvm-host-signer`, `mvm-audit-signer`. `cargo build` emits four distinct executables. They share a *keyless* library (framing, request routing, audit-chain **verification** which needs only public keys, config); each binary's key handling lives in a **bin-private** module, so signing/audit key code is never compiled into the broker or supervisor binary.
-- **`mvm-supervisor` is the single supervising process.** The host starts one process — the supervisor. It launches and supervises the others (spawn, health-monitor, restart per a declared policy, ordered shutdown) and spawns the per-VM `mvm-vm-sidecar` process at VM launch. One thing to start; it brings up and tears down the rest.
+- **`mvm-supervisor` is the single supervising process.** The host starts one process — the supervisor. It launches and supervises the others (spawn, health-monitor, restart per a declared policy, ordered shutdown) and spawns the per-VM `mvm-vm-host` process at VM launch. One thing to start; it brings up and tears down the rest.
 - **The four host roles stay four separate processes** — this is the moat (four trust zones):
 
 | process (separate address space) | holds | if a hostile workload breaks it |
@@ -84,7 +84,7 @@ The host side is **separate role binaries, launched and supervised by a single p
 | `mvm-host-signer` | the ExecutionPlan signing key only | can't touch the audit key or the guest |
 | `mvm-audit-signer` | the audit key + is the **sole** log writer | can't forge plans; sole-writer = tamper-evident (claim 8) |
 | `mvm-supervisor` | admission/launch + lifecycle | a tiny TCB; untrusted parsing lives in `broker`, not here |
-| per-VM `mvm-vm-sidecar` | per-VM blast-radius confinement (VMM takeover / audit substrate) | one VM's compromise can't reach another's |
+| per-VM `mvm-vm-host` | per-VM blast-radius confinement (VMM takeover / audit substrate) | one VM's compromise can't reach another's |
 
 - **Per-role OS confinement (jailer).** Each spawned role applies `mvm-jailer-lite` confinement (`seccompiler` + `landlock` on Linux; `sandbox-exec` on macOS) **before** loading its key or touching untrusted input. The `broker` process is filesystem- and syscall-confined so it cannot `open()` the signing or audit key files even under compromise — defense-in-depth on top of the separate-binary guarantee. (ADR-064 §5 established `mvm-jailer-lite`; it folds into `mvm-hostd` as a module.)
 - **Verification is a lint, not a hope.** An `xtask` check asserts the audit-signing-key and plan-signing-key symbols are **not linkable** from the supervisor or broker binaries. Because the roles are *separate binaries*, this is a clean binary-symbol check — the strongest available form of the claim-8 "sole holder" guarantee. (A multicall single binary was considered and **rejected** — see Alternatives.)
@@ -165,7 +165,7 @@ Version/compat matrix (host `mvmctl` ↔ guest agent ↔ runtime overlay ↔ vso
 
 A close analog (an embeddable AI-agent compute substrate) informed several choices; the *patterns* are adopted, no external project is named in this repo.
 
-**Borrowed:** a subprocess-per-VMM model wrapped by a per-process jailer (validates §3 and the existing `mvm-vm-sidecar` + `mvm-jailer-lite`); a single-`RwLock` runtime-state model + lock-free `AtomicU64` metrics (clean concurrency → feeds metering); lazy initialization (handle returns instantly, heavy work on first use → boot-DX); a centralized error enum + `Result` alias (→ the §9 error taxonomy); a pluggable-VMM / network-backend / volume-factory trait set with "implement + register" extensibility (validates `VmBackend` / `NetworkProvider` / `StorageProvider` + the `ExampleBackend` stub); a `-sys` `deps/` directory for FFI (§2); a shared crate for cross-cutting types (= `mvm-core`); the embeddable-library / "no daemon in the core" philosophy (validates §4: `mvm` = library + CLI, `mvmd` = the daemon). A second-pass deep read adds: a **modules-over-crates** discipline (lean analogs carry whole subsystems as modules of one crate — §1); a **per-phase boot-latency methodology** plus the measured **macOS per-page code-signing cold-start penalty** and its warm-inode / cache-prewarm levers (§7); a **richer jailer** (cgroup v2 + AppArmor on top of seccomp + Landlock → §9 resource governance); an egress **CA** for name-constrained TLS (validates ADR-006); and the per-crate context-file + `docs/investigations/` conventions (§9).
+**Borrowed:** a subprocess-per-VMM model wrapped by a per-process jailer (validates §3 and the existing `mvm-vm-host` + `mvm-jailer-lite`); a single-`RwLock` runtime-state model + lock-free `AtomicU64` metrics (clean concurrency → feeds metering); lazy initialization (handle returns instantly, heavy work on first use → boot-DX); a centralized error enum + `Result` alias (→ the §9 error taxonomy); a pluggable-VMM / network-backend / volume-factory trait set with "implement + register" extensibility (validates `VmBackend` / `NetworkProvider` / `StorageProvider` + the `ExampleBackend` stub); a `-sys` `deps/` directory for FFI (§2); a shared crate for cross-cutting types (= `mvm-core`); the embeddable-library / "no daemon in the core" philosophy (validates §4: `mvm` = library + CLI, `mvmd` = the daemon). A second-pass deep read adds: a **modules-over-crates** discipline (lean analogs carry whole subsystems as modules of one crate — §1); a **per-phase boot-latency methodology** plus the measured **macOS per-page code-signing cold-start penalty** and its warm-inode / cache-prewarm levers (§7); a **richer jailer** (cgroup v2 + AppArmor on top of seccomp + Landlock → §9 resource governance); an egress **CA** for name-constrained TLS (validates ADR-006); and the per-crate context-file + `docs/investigations/` conventions (§9).
 
 **Diverged on purpose:** host↔guest transport stays the **lean vsock framing + Noise**, not gRPC/tonic (ADR-063 drops `tokio`/`serde_json` from the agent; gRPC would re-bloat it). The rootfs stays **Nix-deterministic** with OCI as import-only (`mvm-oci`), not an OCI/libcontainer-centric guest. And runtime state stays **file-based + chain-signed JSONL**, not a SQLite-backed mutable store — a mutable DB would weaken the tamper-evident audit log that *is* the product.
 
@@ -196,7 +196,7 @@ A close analog (an embeddable AI-agent compute substrate) informed several choic
 - A large, mechanical migration: every crate rename ripples to consumers (including mvmd, a separate repo) and to the CI claim-gates. §8 is the safety net; gate updates must be same-commit.
 - `mvm-network` is net-new and the biggest single lift (pulls scattered egress/DNS/audit/provisioning together).
 - `mvm-core` dep-purity must be guarded (no async/runtime deps may enter while folding plan/policy/security in).
-- Linux-only `[[bin]]`s now in `mvm-build` and `mvm-vm-sidecar` must stay inert cfg-stubs on macOS/Windows.
+- Linux-only `[[bin]]`s now in `mvm-build` and `mvm-vm-host` must stay inert cfg-stubs on macOS/Windows.
 
 ### Neutral
 - Crate *count* drops 32 → 17 (+ `crates/deps/*-sys`); host *binary* count is one supervising process tree + the Swift Vz supervisor + the embedded guest/builder binaries.
