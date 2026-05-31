@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove the #1 deliverable end-to-end on macOS (libkrun): `mvmctl dev up` boots the persistent builder VM → `mvmctl compile examples/python/hello-app/app.py` lowers the decorator app to a flake → `mvmctl up --flake <dir>` builds it **inside** the builder VM and boots the microVM → the guest agent answers `Ping` over vsock. Lock that spine behind a CI-gated E2E test so the rest of the rewrite has a regression guard, land the `ArtifactSidecar` → `ArtifactManifest` rename along the way, and ship the one-call live-exec ergonomic (`mvm.Box(image).start().exec()`, dev-tier) as the DX headline (Task 5; full surface in 125).
+**Goal:** Prove the #1 deliverable end-to-end on macOS (libkrun): `mvmctl dev up` boots the persistent builder VM → `mvmctl compile examples/python/hello-app/app.py` lowers the decorator app to a flake → `mvmctl up --flake <dir>` builds it **inside** the builder VM and boots the microVM → the guest agent answers `Ping` over vsock. Lock that spine behind a CI-gated E2E test so the rest of the rewrite has a regression guard, land the `ArtifactSidecar` → `ArtifactManifest` rename along the way, and ship the one-call live-exec ergonomic on the existing `Sandbox` (`Sandbox.create(image).exec(...)`, dev-tier) as the DX headline (Task 5; full surface in 125).
 
 **Architecture:** The whole spine already exists and is verified present — only the regression guard and one rename are missing. The verbs are real: `Dev` (`commands/env/dev.rs`), `Compile` (`commands/build/compile.rs`, "Compile Workload IR into build artifacts"), `Up` (`commands/vm/up.rs`, "Build and run a VM"). The decorator `.py` path is wired (`compile.rs:181` matches `parse_python(&bytes, &path)` — its module docstring claiming "Phase 4 not landed" is stale). `up` already calls `wait_for_guest_agent(&vm, 30)` (`up.rs:1366`, which pings the agent over vsock) and prints `Waiting for guest agent...` → `Guest agent not reachable.` on failure (`up.rs:1364`,`:1385`), so **`up` exiting 0 without that failure line IS the boot→ping proof** — no new status verb needed. A *fresh* dev build already emits `overlay_aware: true` (`crates/mvm-base/src/runtime_meta.rs:303`), so `admit_overlay_aware` (`crates/mvm-build/src/builder_vm.rs:800`) **admits** it — the documented `default-microvm` admit blocker is the *downloaded, manifest-less* default image (blocks the bench baseline), **not** this fresh-build path.
 
@@ -175,34 +175,37 @@ The spine is *believed* complete (fresh build → `overlay_aware: true` → admi
 - [ ] **Step 4: Repeat** until `MVM_E2E_SMOKE=1 cargo test -p mvm-cli --test core_demo_e2e` is green on a macOS/libkrun host. Each fix is its own red→green→commit cycle.
 - [ ] **Step 5: Tick the §4 acceptance boxes** in `specs/plans/117-cleanup-and-rearchitecture-brief.md` for the criteria this proves (`dev up` persistent builder; hello-app compiles + builds in-VM; `up` boots + agent answers vsock; the loop driven by `mvmctl dev`/`compile`/`up`). Leave the cross-platform + encrypted-at-rest + Noise boxes for their plans.
 
-## Task 5: the one-call live-exec ergonomic (the DX headline)
+## Task 5: the one-call live-exec ergonomic — `Sandbox` (the DX headline)
 
-The gap analysis (`specs/research/embeddable-sandbox-sdk-dx-gap-analysis.md`) put the parity gap in one place: the imperative "boot a box, exec against it" experience. Ship the minimal version here so the headline DX exists from the first demo; the full surface (typed helpers, async, Node) is plan 125. **Dev-tier only** — it execs through the `dev-shell` agent; prod has no `do_exec` (claim 4), so `Box` refuses outside dev.
+The gap analysis (`specs/research/embeddable-sandbox-sdk-dx-gap-analysis.md`) put the parity gap in one place: the imperative "boot a sandbox, exec against it" experience. mvm **already has the class** — `sdks/python/mvm/_sandbox.py` (`Sandbox.create(...)`, `sb.commands.start(...)`) with two modes (record → prod plan, live → dev) and the dev-tier guard `SandboxDevOnly` already in place. This task adds the dead-simple one-shot ergonomic on top and makes it the demo headline. **Extend `Sandbox`; do not add a new class** (and never name it `Box` — that's a competitor's term). Typed helpers / async / Node are plan 125.
 
-**Files:** Create `sdks/python/mvm/box.py`; test `sdks/python/tests/test_box.py` (gated like the E2E — it boots a real VM).
+**Files:** `sdks/python/mvm/_sandbox.py` (add the one-shot `exec`); test `sdks/python/tests/test_sandbox_exec.py` (gated — it boots a real VM).
 
 - [ ] **Step 1: Write the failing test.**
   ```python
-  # Dev-tier imperative sandbox: boot, exec, done. Prod refuses interactive exec
-  # (claim 4), so Box raises if the resolved tier isn't dev.
-  from mvm import Box
+  # Live-mode Sandbox is dev-tier (SandboxDevOnly guards prod). exec() is a
+  # one-shot convenience over commands.start: run argv, collect stdout + exit.
+  from mvm import Sandbox
 
-  def test_box_exec_returns_stdout():
-      with Box(image="python:slim") as box:      # boots a dev-tier microVM
-          r = box.exec("python", "-c", "print(2+2)")
+  def test_sandbox_exec_returns_stdout():
+      sb = Sandbox.create(image="python:slim")     # boots a dev-tier microVM
+      try:
+          r = sb.exec("python", "-c", "print(2+2)")
           assert r.exit_code == 0
           assert r.stdout.strip() == "4"
+      finally:
+          sb.shutdown()
   ```
-- [ ] **Step 2: Implement `Box` over the existing substrate.** `start()` boots the dev-tier microVM (builder/dev image); `exec(*argv, timeout=None, cwd=None, env=None)` dispatches over the guest-agent exec RPC and returns `ExecResult { exit_code, stdout, stderr }`; `__enter__`/`__exit__` manage lifecycle (add `__aenter__`/`__aexit__` in 125). On a prod-tier resolution, raise a typed `BoxTierError` rather than degrade — no silent fallback (ADR-053).
+- [ ] **Step 2: Add `Sandbox.exec(*argv, timeout=None, cwd=None, env=None) -> ExecResult`** as a one-shot over the existing `commands.start` (start → wait → collect stdout/stderr/exit). Keep the existing `SandboxDevOnly` refusal for prod-tier — no silent fallback (ADR-053). Reuse the `_live_sandbox` one-process invariant already in `_sandbox.py`.
 - [ ] **Step 3: Run gated** (`MVM_E2E_SMOKE=1`) on a libkrun host → PASS; ungated → skip. Commit.
-- [ ] **Step 4: Make it the demo headline** — the README / `mvmctl` quickstart leads with this five-line example, not the build/derive path.
+- [ ] **Step 4: Lead the quickstart with it** — README / `mvmctl` quickstart shows the five-line `Sandbox` example, not the build/derive path.
 
 ## Acceptance (this plan is done when)
 
 - [ ] `ArtifactSidecar` → `ArtifactManifest` rename landed; `cargo test --workspace` + `cargo clippy --workspace -- -D warnings` green.
 - [ ] `crates/mvm-cli/tests/compile_hello_app.rs` passes (decorator `app.py` lowers to `flake.nix` + `launch.json`); the stale `compile.rs` docstring is corrected.
 - [ ] `crates/mvm-cli/tests/core_demo_e2e.rs` exists, is `MVM_E2E_SMOKE`-gated, and is **green on a macOS/libkrun host** end-to-end (`dev up` → `compile` → `up` with the agent reachable).
-- [ ] The one-call ergonomic `mvm.Box(image).start().exec()` returns stdout on a dev-tier box and raises `BoxTierError` in prod; the quickstart leads with it.
+- [ ] The one-shot `Sandbox.exec(...)` returns stdout on a dev-tier sandbox and raises `SandboxDevOnly` in prod; the quickstart leads with it.
 - [ ] The proven §4 acceptance boxes are ticked in the brief.
 
 ### deferred follow-ups

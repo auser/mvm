@@ -55,7 +55,7 @@ The reference SDK's own threat model excludes the malicious host and stops at "f
 
 All DX, and it concentrates in one place: **the imperative "boot a box and exec against it" experience.** Our surface is build/derive-oriented (decorator → IR → Nix build → headless workload). Theirs is "give me a running box right now and let me run commands in it." These aren't in conflict — the imperative surface is a thin ergonomic layer over the same substrate, scoped to the **dev tier**:
 
-1. **Live-exec API** (125, demoed in 120): a one-call box object — boot the builder/dev VM or a dev-tier microVM, `exec(cmd) -> {stdout, stderr, exit}`, `copy_in/out`, ports. Async + sync.
+1. **Live-exec API** (125, demoed in 120): the one-call **`Sandbox`** ergonomic. mvm already has the class (`sdks/python/mvm/_sandbox.py`) and it's already dual-mode — **live = dev, record = prod**, with `SandboxDevOnly` guarding the boundary — so this is polish (`Sandbox.create(image=…)`, a one-shot `exec(cmd) -> {stdout, stderr, exit}`, `copy_in/out`, ports, async+sync), not a new class. The dual-mode `Sandbox` is itself a differentiator: the reference SDK's boxes are live-only, so it has no prod-lowering path.
 2. **Typed helpers** (125): a code-runner (`run(code)`, `install_package`) and image+port presets for browser/desktop automation. Small wrappers, big perceived surface.
 3. **Snapshot/branch/clone UX** (123): expose the warm-start substrate as checkpoint/branch/clone — and we go past disk-only to live-memory resume.
 4. **Boot number** (127): measure cold/warm per backend and publish it; don't cede the "fastest" framing by silence.
