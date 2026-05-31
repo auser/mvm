@@ -281,7 +281,7 @@ The owner pushed to verify before writing plans; four read-only explorations cor
 > - [ ] Update website docs to match (rides each plan; final parity check).
 >
 > **Stage E — Archive & reset** (final; after all workstreams complete — granular boxes in §6.5; worktrees were already cleared in Stage 0)
-> - [ ] Run the archive & repo reset (the `archive/` tree is temporary — deleted once the rewrite is validated).
+> - [ ] Run the archive & repo reset: **completely archive the entire old plan corpus** (all of `specs/plans/1–119` → `archive/plans/`, leaving `specs/plans/` holding only the new Stage C plans 120–128 + this brief 117 until the rewrite validates, then it archives too) **and** every superseded ADR → `archive/adrs/`; **renumber the ~25–30 canonical ADRs (and the live plans) to a clean sequential set** (owner-authorized 2026-05-31 — the old numbers are all archived, so there is no live reference to preserve). The `archive/` tree is temporary (deleted once the rewrite is validated; git history is the permanent archive).
 >
 > ### 3. Target architecture
 > *(This section is the design reference — the "what to build." Progress is tracked as checkboxes in §2a and inside each Stage-C per-workstream plan, not here.)*
@@ -445,13 +445,13 @@ The owner pushed to verify before writing plans; four read-only explorations cor
 > - [x] Broker: collapse **049 + 059 + 061** → canonical **062** (banner added 2026-05-31; archived in Stage E).
 > - [x] Entrypoints: fold **008 + 010 + 011** into canonical **007** (banner added 2026-05-31; the 008/010 dup pair + 011 archived in Stage E).
 > - [x] Images & runtime overlay: collapse **039 + 050** → canonical **051** (banner added 2026-05-31; archived in Stage E).
-> - [x] Curate canonical ADRs — classification recorded in **ADR-066 §"ADR consolidation"**: real 45 → **~25–30** canonical (the "~20" was vs a mis-counted 65 baseline). Physical move to `archive/adrs/` + INDEX = Stage E (§6.5).
+> - [x] Curate canonical ADRs — classification recorded in **ADR-066 §"ADR consolidation"**: real 45 → **~25–30** canonical (the "~20" was vs a mis-counted 65 baseline). Physical move to `archive/adrs/` + INDEX = Stage E (§6.5). **Renumbering freedom (owner, 2026-05-31):** since *all* old plans + superseded ADRs are archived, Stage E **may renumber the canonical ADRs (and the live plans) to a clean sequential set** rather than preserving the sparse 002/004/007/046/… numbers — this supersedes the earlier "preserve the canonical number" (model 2) choice.
 > - *Leave separate (orthogonal, not a task):* 004/006/064; 027/042; 002/048.
 >
 > ### 6.5 Archive & repo reset (FINAL workstream — only after Phase 1 lands and in-flight plans 104/115 merge)
 > **Clean-refactor goal: the live tree contains ONLY new / canonical / matching content; everything superseded is *contained* under one top-level `archive/`.** **Timing: do this last** — moving crates/plans/docs while 104/115 (or any worktree) are mid-flight breaks the build and every worktree, so archive only superseded, landed work.
 > - [ ] **`archive/crates/`** — every removed crate moves here, **out of the Cargo workspace `members`** (reference-only; need not compile).
-> - [ ] **`archive/plans/`** — the **entire existing `specs/plans/*` corpus** is archive/not-active (the old roadmap); `specs/plans/` keeps only this brief + the new plan(s). Old plans stay as *research/history* (Plan 89 orphan-sweep, Plan 111 Cardoso), not a live backlog. **Caveat:** don't `mv` files the 104/115 worktrees still reference until they land/abandon.
+> - [ ] **`archive/plans/` — COMPLETELY archive the entire old plan corpus.** Every existing `specs/plans/*` doc (all of `1–119`, including the bench docs 118/119 once their work is folded) moves to `archive/plans/`; `specs/plans/` keeps **only** the new Stage C plans (120–128) + this brief (117, until the rewrite validates). Old plans remain as *research/history* (e.g. Plan 89 orphan-sweep, Plan 111 Cardoso), never a live backlog. *(The earlier 104/115-worktree caveat is moot — those worktrees were abandoned in Stage 0.)* Optionally renumber the surviving live plans to a clean `001…00N` sequence (see §6 renumbering freedom).
 > - [ ] **`archive/adrs/`** — **move** every superseded ADR here (clean tree), leaving only the ~20 canonical ADRs in `specs/adrs`; keep an `archive/adrs/INDEX.md` so decision history stays findable.
 > - [ ] **`archive/docs/`** — any website doc that no longer matches the new functionality moves here; the **live `public/src/content/docs/**` is rewritten to match** (see "Docs match functionality" in §3). No stale docs in the live tree.
 > - [ ] **`specs/SPRINT.md`** — reset it: archive the completed sprint to `specs/backlog/<NN>-<name>.md` (repo convention) and write a fresh `SPRINT.md` reflecting the **real** crate count + goals; delete the stale "7 + facade" line + dependency-reduction baseline.
