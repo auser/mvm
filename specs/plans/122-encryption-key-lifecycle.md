@@ -10,7 +10,7 @@
 
 **Prereq:** plan 121 folds `mvm-security` into `mvm-core`. This plan works in that post-121 module; it writes `mvm_core::crypto::*` for the new code (121 B3 settles whether the fold lands as `mvm_core::security` or `mvm_core::crypto` — use whichever it picked).
 
-**Boundary:** the `encrypted` volume `StorageProvider` impl → plan 123 (calls this engine). Egress TLS + the mvmd-hop transport → mvmd. The secret broker (claim 13, no raw secret over the channel) already shipped in Plan 104 and is unaffected.
+**Boundary:** the `encrypted` volume `StorageProvider` impl → plan 123 (calls this engine). Egress TLS + the mvmd-hop transport → mvmd. The **no-raw-secrets-to-guest** invariant (ADR-066 §5) is a separate workstream — ADR-062 dropped the old `host.secrets.v1` substitution, so it must be re-designed and built on its own (the brief's secrets plan + its ADR). This plan's channel carries opaque handles, never raw secret bytes; Task A0 only adds the seam that a future untrusted-boundary channel would encrypt over.
 
 ---
 
@@ -22,7 +22,7 @@ ADR-066 §5 specified Noise (`snow`) on the vsock channel and mTLS on the agent�
 - The frames are already Ed25519-authenticated (`AuthenticatedFrame`, `SessionHello`/`Ack` in `mvm-core/src/policy/security.rs:38`). Authenticity is the property that matters here — it stops a compromised guest from forging host messages, and vice versa. Keep it.
 - Confidentiality belongs on channels that cross an untrusted boundary. Those are egress and the mvmd hop, which already use TLS / iroh.
 
-So this plan keeps authenticated cleartext framing and adds no `snow`. If a future channel does cross an untrusted boundary inside mvm, add Noise then, scoped to that channel. **This reverses an approved ADR decision — veto if you want Noise kept, and I'll restore it.** ADR-066 §5 needs a one-paragraph edit to match (tracked in Task E).
+So this plan keeps authenticated cleartext framing and adds no `snow`. If a future channel does cross an untrusted boundary inside mvm, add Noise then, scoped to that channel. **This reverses an approved ADR decision — veto if you want Noise kept, and I'll restore it.** ADR-066 §1 (pluggable encryption stage) + §5 (authenticated cleartext on host-local channels) are already reconciled to this; the pluggable seam is built in Task A0.
 
 ---
 
@@ -45,6 +45,25 @@ Gaps this plan fills: macOS volume-at-rest, 90-day rotation timer, per-rebuild D
 ---
 
 ## Phase A — one AEAD, both platforms
+
+### Task A0: pluggable channel layering (the encryption seam)
+
+`core::framing` (built in plan 121 B4) frames `FramedMessage<T>` with a pluggable auth stage. Add a second pluggable stage — an optional encryption transform — so a Noise/AEAD layer can wrap an untrusted-boundary channel later without touching callers. Ship the identity (no-op) transform only; nothing is encrypted on a host-local channel today (see the design note).
+
+**Files:** `crates/mvm-core/src/framing.rs`.
+
+- [ ] **Step 1:** Failing test — a frame round-trips through `Identity` unchanged, and through a stub transform it returns equal after `encode`→`decode`.
+  ```rust
+  // Applied to the serialized frame body after the Ed25519 auth step. Identity
+  // ships today; a Noise/AEAD impl is the future drop-in for a channel that
+  // crosses an untrusted boundary (none today — see the design note).
+  trait Transform {
+      fn encode(&self, body: &[u8]) -> Vec<u8>;
+      fn decode(&self, wire: &[u8]) -> Result<Vec<u8>, FramingError>;
+  }
+  ```
+- [ ] **Step 2:** Implement `Identity` (returns its input) and thread the transform through `FramedMessage` encode/decode after auth. The default channel uses `Identity`.
+- [ ] **Step 3:** Tests green; commit. No new dep — the seam is structure, not crypto.
 
 ### Task A1: collapse the AEAD call sites into `mvm_core::crypto::aead`
 
