@@ -68,6 +68,8 @@ Anything that **binds, vendors, or compiles** an external or C/C++ library is a 
 
 Only `libkrun-sys` exists today; the rest are anticipated homes. Adding any of them is a new `crates/deps/<name>-sys` + a trait impl in the consuming crate — nothing else moves. This reserves the structure so the FFI surface never sprawls back into the architectural crates.
 
+**Near-term candidates vs. a deliberate exclusion.** `libkrun-sys` is already core. **`libgvproxy-sys` is the highest-value add** — gvproxy is one of the three required macOS Homebrew deps (`slp/krun/gvproxy`), spawned today as an external binary; vendoring it (Go built as a `c-shared` lib) removes a `brew install` and pins it deterministically. `e2fsprogs-sys` is lower-priority — `mkfs.ext4 -d` rootfs assembly already runs under the nix-pinned `e2fsprogs` in the builder VM, so vendor it only if ext4 work moves outside a nix env. **`bubblewrap` is deliberately NOT vendored: ADR-064 evaluated and rejected `bwrap`** for the direct `seccompiler` + `landlock` jailer (smaller, no external host binary, more configurable) — do not add a `bubblewrap-sys`.
+
 ### 3. Host process model — separate role binaries, one supervising process
 
 The host side is **separate role binaries, launched and supervised by a single process.** This keeps the strongest isolation guarantee *and* a single operational entry point.
