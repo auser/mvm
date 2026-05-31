@@ -34,7 +34,7 @@ The reference SDK wins on **developer ergonomics**. mvm wins decisively on the *
 | Copy files in/out | `copy_in`/`copy_out` | guest-agent fs RPC | expose ergonomically → 125 |
 | Port forwarding | host:guest TCP/UDP | `MVM_PORTS` via vsock | parity |
 | Disk snapshot / branch / clone | yes (QCOW2 COW) | warm-start substrate planned | match the UX **and exceed** (live memory) → 123 |
-| Live pause/resume (memory) | **no** | planned: diff/layered + UFFD restore | **our differentiator** → 123 |
+| Live pause/resume (memory) | **no** | planned (123): **Firecracker** live-memory (UFFD); **Vz** save/restore (macOS 26+); **libkrun** disk-only | differentiator where the backend supports it |
 | Secrets (no value in guest) | placeholder + MITM-CA swap | `SecretRef` model; egress substitution decided | parity in spirit; **we exceed**: signed, destination-bound, audited → 129 |
 | Egress policy | opt-in allow-list, **default-allow** | **default-deny** (claim 10) | **we lead** |
 | Signed + audited execution | **no** | claim 8 | **we lead** |
@@ -57,7 +57,7 @@ All DX, and it concentrates in one place: **the imperative "boot a box and exec 
 
 1. **Live-exec API** (125, demoed in 120): the one-call **`Sandbox`** ergonomic. mvm already has the class (`sdks/python/mvm/_sandbox.py`) and it's already dual-mode — **live = dev, record = prod**, with `SandboxDevOnly` guarding the boundary — so this is polish (`Sandbox.create(image=…)`, a one-shot `exec(cmd) -> {stdout, stderr, exit}`, `copy_in/out`, ports, async+sync), not a new class. The dual-mode `Sandbox` is itself a differentiator: the reference SDK's boxes are live-only, so it has no prod-lowering path.
 2. **Typed helpers** (125): a code-runner (`run(code)`, `install_package`) and image+port presets for browser/desktop automation. Small wrappers, big perceived surface.
-3. **Snapshot/branch/clone UX** (123): expose the warm-start substrate as checkpoint/branch/clone — and we go past disk-only to live-memory resume.
+3. **Snapshot/branch/clone UX** (123): expose the warm-start substrate as checkpoint/branch/clone — past disk-only to live-memory resume on Firecracker + Vz (macOS 26+); libkrun stays disk-only (capability check 2026-05-31).
 4. **Boot number** (127): measure cold/warm per backend and publish it; don't cede the "fastest" framing by silence.
 
 ## The one real design call: live exec vs the security spine
@@ -68,7 +68,7 @@ Their `box.exec(arbitrary command)` is live arbitrary execution. Our prod guest 
 
 - **125 (CLI + SDK):** the live-exec imperative surface + typed helpers + async/sync + Node parity. Largest parity gap; highest DX leverage.
 - **120 (core demo):** show the one-call ergonomic so the "look how easy" moment exists from day one.
-- **123 (storage + warm-start):** snapshot/branch/clone UX, and live-memory resume as the thing they don't have.
+- **123 (storage + warm-start):** snapshot/branch/clone UX, and live-memory resume (Firecracker + Vz) as the thing they don't have.
 - **129 (secrets):** match the placeholder-on-egress model, exceed it with signed/destination-bound/audited substitution instead of a trusted MITM CA.
 - **127 (bench):** publish the boot number.
 - **Positioning (docs, 116-era):** lead with the security spine; present DX parity as the floor, not the pitch.
