@@ -1,0 +1,45 @@
+name: Core-demo E2E (libkrun)
+
+# Plan 120 Task 3 — the real boot→ping spine (dev up -> compile -> up ->
+# guest agent answers over vsock). It needs libkrun + a working builder VM,
+# which GitHub-hosted runners can't provide (no nested virt on hosted macOS,
+# no KVM on hosted Linux). So this is a MANUAL, opt-in lane that targets a
+# self-hosted macOS/Apple-Silicon runner with the Homebrew `slp/krun` trio
+# installed. Until such a runner is registered, the authoritative proof is
+# the local run documented in contributing/development.md; the ungated
+# compile+skip of this same test runs on every push in ci.yml's `e2e` lane.
+on:
+  workflow_dispatch:
+    inputs:
+      run_boot:
+        description: "Run the real libkrun boot (requires a self-hosted macOS/libkrun runner)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: core-demo-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-demo-libkrun:
+    name: dev → compile → up → vsock ping (libkrun)
+    # Opt-in only: schedules solely when the operator ticks run_boot AND a
+    # runner with these labels exists, so it never hangs queued on a normal
+    # dispatch.
+    if: ${{ inputs.run_boot }}
+    runs-on: [self-hosted, macOS, ARM64, libkrun]
+    env:
+      CARGO_TERM_COLOR: always
+      # State isolation (ADR-002 / AGENTS.md): demo audit/nonce/key state
+      # lands in a throwaway dir, never the runner's real ~/.mvm.
+      MVM_DATA_DIR: ${{ github.workspace }}/.mvm-test
+      MVM_E2E_SMOKE: "1"
+      MVM_BUILDER_BACKEND: libkrun
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Core-demo boot→ping
+        run: cargo test -p mvm-cli --test core_demo_e2e -- --nocapture

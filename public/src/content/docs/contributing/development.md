@@ -61,6 +61,26 @@ just ci
 - CLI binary tests go in root `tests/cli.rs`
 - Use `#[serde(default)]` when adding fields to structs used in test fixtures
 
+### Gated end-to-end tests (`MVM_E2E_SMOKE`)
+
+Tests that boot a real microVM (they need libkrun + a working builder VM and
+run for minutes) are gated on `MVM_E2E_SMOKE=1` and skip by default, so a plain
+`cargo test` stays fast and green. The core-demo spine guard lives in
+`crates/mvm-cli/tests/core_demo_e2e.rs` (`dev up` → `compile` → `up` →
+guest-agent vsock ping). Run it locally on a macOS/libkrun host under state
+isolation (keeps demo audit/nonce/key state out of your real `~/.mvm`):
+
+```bash
+MVM_DATA_DIR="$PWD/.mvm-test" MVM_E2E_SMOKE=1 \
+  cargo test -p mvm-cli --test core_demo_e2e -- --nocapture
+```
+
+The test forces libkrun (`--hypervisor libkrun` + `MVM_BUILDER_BACKEND=libkrun`)
+because auto-detect on a macOS-26 host picks Vz/apple-container. CI runs this
+target **ungated** on every push (it compiles + skip-passes in the `e2e` lane);
+the real boot runs only via the manual `Core-demo E2E (libkrun)` workflow on a
+self-hosted macOS/libkrun runner (hosted runners have no nested virt).
+
 ## Linting and Formatting
 
 ```bash
