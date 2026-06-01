@@ -1,21 +1,22 @@
-//! `mvmctl compile` — Workload IR to staged build artifacts.
+//! `mvmctl compile` — Workload entry to staged build artifacts.
 //!
-//! v1 surface accepts a pre-rendered IR JSON (via `--from-ir <path>`
-//! or `-` for stdin) and renders `flake.nix`, `launch.json`, and the
-//! bundled source tree into `--out <dir>`. Output ending in `.tar.gz`
-//! or `.tgz` is written as a deterministic archive instead.
+//! Lowers a Workload to `flake.nix`, `launch.json`, and the bundled
+//! source tree under `--out <dir>` (or a deterministic `.tar.gz` /
+//! `.tgz` archive). The entry is one of:
 //!
-//! Decorator-script entry (parse `app.py` / `app.ts` to derive the
-//! IR) lands with Phase 4 of the SDK port; runtime record-mode (parse
-//! a `Sandbox`-shaped script) lands with Phase 7. v1 only handles the
-//! IR-JSON path so the compile pipeline has an end-to-end smoke test
-//! independent of the parser.
+//! - a `.py` / `.ts` **decorator** script — parsed *statically* (via
+//!   `parse_python` / `parse_typescript`, AST only; the host never
+//!   imports or executes the script) into the Workload IR;
+//! - a pre-rendered **IR JSON** (`--from-ir <path>`, a `.json`
+//!   positional, or `-` for stdin);
+//! - a runtime **recording** (`--from-recording <path>`), or a
+//!   `Sandbox`-shaped script with no `@mvm.app` (auto-executed in
+//!   record mode — Phase 7e).
 //!
-//! Flag shapes follow the approved plan:
+//! Flag shapes:
 //!
-//! - `<entry>` — positional. A `.json` path, `-` for stdin, or a
-//!   `.py` / `.ts` script (rejected with a `not-yet-implemented`
-//!   pointer to Phase 4/7 until those land).
+//! - `<entry>` — positional. A `.py`/`.ts` script, a `.json` IR path,
+//!   or `-` for stdin.
 //! - `--from-ir <path>` — explicit IR-JSON path (alternative to the
 //!   positional).
 //! - `--out <path>` — output directory (or `.tar.gz`/`.tgz` archive).
