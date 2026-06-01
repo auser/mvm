@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (`mvm-cli`, `mvm-build`, `mvm-base`, `mvm-security`, `mvm`, `mvm-guest`), the `mvm-sdk` compile path (`parse_python` → `Workload` → `compile`), libkrun (macOS), vsock (`GUEST_CID=3`, `GuestRequest::Ping`). Gated E2E via `MVM_E2E_SMOKE=1` (the existing convention from `crates/mvm-cli/tests/dev_up_smoke.rs`).
 
-**Out of scope / deferred follow-ups** (tracked in `### deferred follow-ups`): the slim `mkfs.ext4 -d` build off the `microvm.nix` substrate (build-layer work, plan 126/121); Linux/Firecracker parity (own plan, `/dev/kvm` test backend); encryption-at-rest + Noise vsock (plan 122); the downloaded-`default-microvm` admit blocker (separate — it blocks bench, not this demo).
+**Out of scope / deferred follow-ups** (tracked in `### deferred follow-ups`): the slim `mkfs.ext4 -d` build off the `microvm.nix` substrate (build-layer work, **plan 131**); Linux/Firecracker parity (own plan, `/dev/kvm` test backend); encryption-at-rest + Noise vsock (plan 122); the downloaded-`default-microvm` admit blocker (separate — it blocks bench, not this demo).
 
 ---
 
@@ -212,7 +212,7 @@ The gap analysis (`specs/research/embeddable-sandbox-sdk-dx-gap-analysis.md`) pu
 
 ### deferred follow-ups
 
-- [ ] Slim `mkGuest` build via `mkfs.ext4 -d` populate-at-format, off the heavy `microvm.nix` substrate (build-layer work — plan 121/126).
+- [ ] Slim `mkGuest` build via `mkfs.ext4 -d` populate-at-format, off the heavy `microvm.nix` substrate (build-layer work — **plan 131**).
 - [ ] Linux / Firecracker parity for this same E2E (own plan; `/dev/kvm` test backend).
 - [ ] Encrypt build artifacts at rest + upgrade vsock frames to Noise (plan 122) — completes §4's *full* acceptance.
 - [ ] The downloaded `default-microvm` admit blocker (manifest-less image) — separate from this fresh-build path; blocks the bench baseline.

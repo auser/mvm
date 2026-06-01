@@ -1,4 +1,4 @@
-# Plan 121 — Crate consolidation (32 → 16, +`crates/deps/*-sys`)
+# Plan 121 — Crate consolidation (32 → 16; `mvm-network` makes 17 in 123) + `crates/deps/*-sys`
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -132,9 +132,9 @@ ADR-066 §6: the IR is the SDK's lowering target; one crate. 99 refs / 35 files;
 
 **Files:** `crates/mvm-security/src/*` → `crates/mvm-core/src/security/`; same pattern.
 
-- [ ] **Step 1:** `git mv crates/mvm-security/src crates/mvm-core/src/security`; `git rm -r crates/mvm-security`; `pub mod security;` in `mvm-core/src/lib.rs`. (Beware a name clash with the existing `mvm-core` signing/`policy::security` — namespace the crypto module distinctly, e.g. `pub mod security;` for the crypto and keep `policy::security` as the session-policy type; if they collide, rename the crypto module `pub mod crypto;` and sed `mvm_security::` → `mvm_core::crypto::` instead.)
+- [ ] **Step 1:** **Decision: fold it as `mvm_core::crypto`** (settle the name *here* — plans 122/123/127 already reference `mvm_core::crypto::*` as fact). Keep the existing `policy::security` as the distinct session-policy type, which sidesteps the name clash. `git mv crates/mvm-security/src crates/mvm-core/src/crypto`; `git rm -r crates/mvm-security`; `pub mod crypto;` in `mvm-core/src/lib.rs`.
 - [ ] **Step 2:** Merge deps (RustCrypto/`zeroize`/`ed25519-dalek` — **no async**); drop `mvm-security` from the 4 dependents + root.
-- [ ] **Step 3:** `git grep -l 'mvm_security::' -- crates/ | xargs sed -i '' 's/mvm_security::/mvm_core::security::/g'` (or `::crypto::` per Step 1); fix `mvm-core` self-refs to `crate::`.
+- [ ] **Step 3:** `git grep -l 'mvm_security::' -- crates/ | xargs sed -i '' 's/mvm_security::/mvm_core::crypto::/g'`; fix `mvm-core` self-refs to `crate::`.
 - [ ] **Step 4:** `cargo build --workspace && cargo test --workspace -q` → green; async-in-core check OK; **`cargo run -p xtask -- check-no-display-on-secret-types`** still passes (the host-signer redacted-Debug guard now covers the moved code).
 - [ ] **Step 5:** Commit: `git commit -m "refactor(core): fold mvm-security into mvm-core (pure crypto; no async in core)"`.
 
