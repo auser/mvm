@@ -110,8 +110,8 @@ Ordered by external-credibility impact.
    already lists Cloud Hypervisor as Tier-1 peer for VFIO / GPU
    passthrough; the posture is allowed. No backend currently ships
    VFIO. *Workstream D — deferred, no current GPU dependency.*
-4. **No published cold-start number.** E2B, Modal, Daytona, Vercel
-   Sandbox all publish one. Plan 74 names this work. *Workstream E*
+4. **No published cold-start number.** The cloud sandbox-runtime
+   category publishes one. Plan 74 names this work. *Workstream E*
    in Plan 111.
 5. **Workload-shape taxonomy missing from README positioning.**
    Cardoso's devbox / code-interpreter / tool-calling / RL split is

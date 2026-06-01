@@ -5,6 +5,8 @@
 - **Owner:** MVM Project
 - **Related:** [ADR-002 microvm security posture](002-microvm-security-posture.md), [ADR-049 secret substitution mechanism](049-secret-substitution-mechanism.md) (superseded), [ADR-059 host services broker](059-host-services-broker.md), [ADR-061 host services broker hardening](061-host-services-broker-hardening.md), [Plan 104 host services broker](../plans/104-host-services-broker.md), [threat model 02 host services broker](../threat-models/02-host-services-broker.md)
 
+> **Consolidation (2026-05-31 — see [ADR-066](066-target-architecture.md) §"ADR consolidation"):** ADR-062 is the **canonical** host-services-broker ADR. It **consolidates** ADR-049 (secret substitution — dropped from v1), ADR-059 (broker architecture), and ADR-061 (broker hardening); those are **superseded** and physically archived to `archive/adrs/` in Stage E. Per ADR-066 §3 the broker / host-signer / audit-signer / supervisor remain four separate processes built from the one `mvm-hostd` crate.
+
 ## Context
 
 [ADR-049](049-secret-substitution-mechanism.md) committed mvm to a vsock side-channel for runtime secret substitution. [ADR-059](059-host-services-broker.md) generalised that into the host services broker with `host.secrets.v1` as the forcing function. [ADR-061](061-host-services-broker-hardening.md) hardened the design with a four-subprocess architecture, where the dedicated `mvm-secrets-dispatcher` subprocess was the primary justification for the L1 TCB-minimization split.

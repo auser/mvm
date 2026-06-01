@@ -97,8 +97,8 @@ still enforces its own contract.
 
 The "matryoshka" framing comes from the 2026 microVM ecosystem
 discourse (notably <https://emirb.github.io/blog/microvm-2026/>).
-It is the same pattern used by Fly.io Sprites, AWS Lambda's
-SnapStart, Vercel Sandbox, and Kata Containers. The mvm
+It is the same pattern used by other production microVM and
+hardened-isolation platforms. The mvm
 adaptation is that L5 is enforced *inside* the guest by uid/seccomp
 (plan 26), so even a guest-kernel compromise (L3 fall) doesn't grant
 arbitrary access to other in-guest services.
@@ -387,8 +387,8 @@ uid because of a use case we didn't foresee):
   posture document are folded into the table above.
 - The "matryoshka" framing draws on the 2026 microVM ecosystem
   discourse (e.g. <https://emirb.github.io/blog/microvm-2026/>);
-  the same defense-in-depth pattern is used by Fly.io Sprites,
-  AWS Lambda SnapStart, Vercel Sandbox, and Kata Containers.
+  the same defense-in-depth pattern is used across the
+  production microVM / hardened-isolation ecosystem.
 
 ## Appendix: Cardoso minimum-viable-policy checklist
 

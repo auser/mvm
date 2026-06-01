@@ -3,6 +3,7 @@ import { Features } from "./Features";
 import { Architecture } from "./Architecture";
 import { CodeExample } from "./CodeExample";
 import { CTABanner } from "./CTABanner";
+import { Footer } from "./Footer";
 
 export function Landing() {
   return (
@@ -12,6 +13,7 @@ export function Landing() {
       <Architecture />
       <CodeExample />
       <CTABanner />
+      <Footer />
     </div>
   );
 }

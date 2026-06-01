@@ -5,6 +5,8 @@ date: 2026-05-13
 related: ADR-013 (libkrun + libkrun pivot); ADR-002 (security posture); plan 57 (libkrun spike); plan 60 (libkrun migration); plan 72 (this ADR's implementation)
 ---
 
+> **Consolidation (2026-05-31 — see [ADR-066](066-target-architecture.md) §"ADR consolidation"):** ADR-046 is the **canonical** builder-VM architecture ADR. It **consolidates** ADR-013 (libkrun microVM Nix pivot), ADR-057 (symmetric builder VM), and ADR-065 (single builder/dev image + embedded host binaries); those are **superseded** and physically archived to `archive/adrs/` in Stage E. Current state reflects ADR-065's single `builder-vm` flake with `default`/`dev` attrs.
+
 ## Status
 
 Proposed. Implementation sequenced in `specs/plans/72-builder-vm-via-libkrun.md`. This ADR replaces the **builder VM** half of ADR-013, leaving the runtime backend selection unchanged.

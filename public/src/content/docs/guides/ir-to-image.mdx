@@ -265,7 +265,7 @@ What it provides:
 - **Hardening** — `setpriv --no-new-privs` (W2.3), seccomp `standard` (W2.4), per-service uids (W2.1), read-only `/etc` overlay (W2.2), dm-verity verified boot (W3)
 - **Drive mounting** — `/mnt/config`, `/mnt/secrets`, `/mnt/data`
 
-It outputs `rootfs.ext4` + `vmlinux`, and writes a `passthru.mvm` attribute set that the host reads as `mvm-meta.json` next to the artifact. Fields include `name`, `accessible`, `sealed`, `entrypointKind`, `init_system`, `expected_boot_ms`, `agent_binary`, `rootless_entrypoint`, `vmlinux_present`. The runtime path consumes the sidecar via `mvm_build::builder_vm::ArtifactSidecar`.
+It outputs `rootfs.ext4` + `vmlinux`, and writes a `passthru.mvm` attribute set that the host reads as `mvm-meta.json` next to the artifact. Fields include `name`, `accessible`, `sealed`, `entrypointKind`, `init_system`, `expected_boot_ms`, `agent_binary`, `rootless_entrypoint`, `vmlinux_present`. The runtime path consumes the sidecar via `mvm_build::builder_vm::ArtifactManifest`.
 
 The full mkGuest parameter list is documented in [Writing Nix Flakes](/guides/nix-flakes/).
 
@@ -653,7 +653,7 @@ Typical output:
 }
 ```
 
-The same metadata is written next to the rootfs on the host as `mvm-meta.json`, consumed at runtime by `mvm_build::builder_vm::ArtifactSidecar`. If `mvm-meta.json` and `passthru.mvm` ever diverge, the host-side artifact is wrong.
+The same metadata is written next to the rootfs on the host as `mvm-meta.json`, consumed at runtime by `mvm_build::builder_vm::ArtifactManifest`. If `mvm-meta.json` and `passthru.mvm` ever diverge, the host-side artifact is wrong.
 
 To inspect the rootfs itself:
 

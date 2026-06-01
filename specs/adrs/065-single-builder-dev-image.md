@@ -195,9 +195,9 @@ Alternatives considered:
   `/mvm-bins` via virtio-fs, and `MVM_HOST_BIN_DIR=/mvm-bins` in env.
   Output: builder-VM image artifacts (`vmlinux` + `rootfs.ext4` +
   cmdline.txt + manifest.json). The flake never compiles Rust.
-  Rootfs assembly uses `mkfs.ext4 -d <staged-dir>` (pattern borrowed
-  from pve-microvm — see §References) so the final image is built
-  from a populated directory tree in one step.
+  Rootfs assembly uses `mkfs.ext4 -d <staged-dir>` (a populate-at-
+  format pattern) so the final image is built from a populated
+  directory tree in one step.
 - **Builder VM (the produced image)** — one image, two attrs as
   defined in §Decision.
 
@@ -408,9 +408,9 @@ headless, no step 10.
 (Not part of this spec — flagged so the implementation plan doesn't
 paint future work into corners.)
 
-- **OCI-base userland.** `pve-microvm`'s `build-exo-template.sh`
-  pulls a Debian OCI image as the rootfs base, customises in chroot,
-  and `mkfs.ext4 -d`'s the result. We already have `mvm-oci` in the
+- **OCI-base userland.** An external reference design pulls a Debian
+  OCI image as the rootfs base, customises it in a chroot, and
+  `mkfs.ext4 -d`'s the result. We already have `mvm-oci` in the
   repo (claim 10) for the end-user workload path. Using the same
   pattern for the *builder/dev VM rootfs* — Debian/Alpine base + mvm
   binaries on top, no nixpkgs busybox/iptables/etc. — would drain
@@ -537,10 +537,9 @@ change. Specifically:
 - `crates/mvm-sdk/src/compile/flake.rs` and ADR-0007 — the end-user
   flake generation path, which adopts the same embedded-binary
   contract in a future spec.
-- [rcarmo/pve-microvm/tools](https://github.com/rcarmo/pve-microvm/tree/main/tools)
-  — `build-exo-template.sh` (the `mkfs.ext4 -d <staged-dir>` rootfs
-  assembly pattern we lift) and the direct-kernel-boot precedent we
-  already follow.
+- An external microVM reference project's build tooling — the
+  `mkfs.ext4 -d <staged-dir>` rootfs assembly pattern we lift, and the
+  direct-kernel-boot precedent we already follow.
 - NixOS/nixpkgs PR #525067 — the upstream `fetchCrate` fix
   (static.crates.io) that motivated this redesign. The overlay was
   considered as a workaround and explicitly rejected in favor of

@@ -197,7 +197,7 @@ pub const SIDECAR_FILENAME: &str = "mvm-meta.json";
 /// into this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ArtifactSidecar {
+pub struct ArtifactManifest {
     /// Name from `mkGuest { name = …; }`.
     pub name: String,
     /// Whether `mvmctl console` may attach. Drives the W6.2 gate.
@@ -235,7 +235,7 @@ pub struct ArtifactSidecar {
     pub overlay_aware: bool,
 }
 
-impl ArtifactSidecar {
+impl ArtifactManifest {
     /// Path the sidecar lives at, given a directory containing the
     /// rootfs. Single source of truth for both writers and readers.
     pub fn path_in(dir: &Path) -> PathBuf {
@@ -725,7 +725,7 @@ fn shell_quote(input: &str) -> String {
 /// - Flake doesn't surface `passthru.mvm` (older mkGuest, third-
 ///   party flakes): query returns non-zero → log warning
 /// - `nix` not on PATH: query errors → log warning
-/// - JSON shape doesn't match `ArtifactSidecar` (drift between
+/// - JSON shape doesn't match `ArtifactManifest` (drift between
 ///   mkGuest and our wire type): parse error → log warning
 /// - Disk write fails: log warning
 ///
@@ -760,11 +760,11 @@ pub fn emit_sidecar_via_passthru_query(
             return;
         }
     };
-    let sidecar: ArtifactSidecar = match serde_json::from_str(json.trim()) {
+    let sidecar: ArtifactManifest = match serde_json::from_str(json.trim()) {
         Ok(s) => s,
         Err(e) => {
             env.log_warn(&format!(
-                "sidecar: passthru.mvm shape doesn't match ArtifactSidecar (mkGuest drift?): {e}"
+                "sidecar: passthru.mvm shape doesn't match ArtifactManifest (mkGuest drift?): {e}"
             ));
             return;
         }
@@ -792,13 +792,13 @@ pub fn emit_sidecar_via_passthru_query(
 ///   to land. mkGuest's `/init` would either fail or silently
 ///   degrade to the baked-in agent path.
 /// - **Sidecar malformed** → propagate. Same posture as
-///   [`ArtifactSidecar::read_from_dir`].
+///   [`ArtifactManifest::read_from_dir`].
 ///
 /// The error message is wordy on purpose: an operator hitting this
 /// gate needs the recovery path (rebuild with current mkGuest, or
 /// drop the cached template) in one glance.
 pub fn admit_overlay_aware(rootfs_dir: &Path) -> Result<(), anyhow::Error> {
-    let sidecar = ArtifactSidecar::read_from_dir(rootfs_dir)?;
+    let sidecar = ArtifactManifest::read_from_dir(rootfs_dir)?;
     match sidecar {
         None => Err(anyhow::anyhow!(
             "refusing to start VM: rootfs at {} has no `mvm-meta.json` sidecar. \
@@ -897,8 +897,8 @@ mod tests {
         assert!(msg.contains("libkrun builder") && msg.contains("does not use host Nix"));
     }
 
-    fn fixture_sidecar() -> ArtifactSidecar {
-        ArtifactSidecar {
+    fn fixture_sidecar() -> ArtifactManifest {
+        ArtifactManifest {
             name: "test-vm".to_string(),
             accessible: true,
             sealed: false,
@@ -918,7 +918,7 @@ mod tests {
         let sidecar = fixture_sidecar();
         let path = sidecar.write_to_dir(tmp.path()).expect("write");
         assert_eq!(path, tmp.path().join(SIDECAR_FILENAME));
-        let read = ArtifactSidecar::read_from_dir(tmp.path())
+        let read = ArtifactManifest::read_from_dir(tmp.path())
             .expect("read")
             .expect("present");
         assert_eq!(read, sidecar);
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn sidecar_read_missing_returns_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let result = ArtifactSidecar::read_from_dir(tmp.path()).expect("ok");
+        let result = ArtifactManifest::read_from_dir(tmp.path()).expect("ok");
         assert!(result.is_none());
     }
 
@@ -936,7 +936,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join(SIDECAR_FILENAME), "{not valid json")
             .expect("write malformed");
-        let result = ArtifactSidecar::read_from_dir(tmp.path());
+        let result = ArtifactManifest::read_from_dir(tmp.path());
         assert!(result.is_err(), "malformed sidecar should error");
     }
 
@@ -950,7 +950,7 @@ mod tests {
         fixture_sidecar().write_to_dir(tmp.path()).expect("write");
         let body = std::fs::read_to_string(tmp.path().join(SIDECAR_FILENAME)).expect("read raw");
         assert!(body.contains("\"overlayAware\""), "got: {body}");
-        let read = ArtifactSidecar::read_from_dir(tmp.path())
+        let read = ArtifactManifest::read_from_dir(tmp.path())
             .expect("read")
             .expect("present");
         assert!(read.is_overlay_aware());
@@ -975,7 +975,7 @@ mod tests {
             "hypervisor": "libkrun"
         }"#;
         std::fs::write(tmp.path().join(SIDECAR_FILENAME), legacy_json).expect("write legacy");
-        let read = ArtifactSidecar::read_from_dir(tmp.path())
+        let read = ArtifactManifest::read_from_dir(tmp.path())
             .expect("legacy must parse")
             .expect("present");
         assert!(

@@ -1,0 +1,165 @@
+# Plan 129 — Secrets subsystem (egress substitution)
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Implement ADR-067 — a raw secret value never enters the guest — in **two tiers**: (1) **declared** secrets are substituted on egress (the workload routes a secret-bearing request through a host substitution endpoint with an opaque placeholder; the host injects (bearer) or signs (SigV4/HMAC) and makes the real TLS; values come from a pluggable resolver — local OS keyring or `mvmd` — with a software-first keyholder, hardware-sealed when present); (2) **undeclared** secrets/PII are caught by the egress detector — **no declaration required** — and redacted/blocked/audited (Phase E). Together they cover "specified *and* predicted." Restores claims 12 + 13.
+
+**Architecture:** Builds on what exists. `mvm-ir`'s `SecretRef` already carries a reference, never bytes; `mvm-core`'s `KeyProvider` (`keystore.rs`) is the local resolver; `mvm-hostd`'s separate signer processes + the keyless `core::subprocess` scaffold are the keyholder substrate; the claim-10 default-deny egress proxy (`NetworkProvider`, ADR-064 / plan 123) is where substitution and leak-detection hang. This plan adds the auth-type metadata, the resolver trait, the keyholder, the substitution endpoint + placeholder protocol, leak-detection, and audit.
+
+**Tech Stack:** `mvm-ir` (→ `mvm-sdk::ir` post-121), `mvm-core` (`keystore.rs`, `core::subprocess`), `mvm-hostd`, `mvm-sdk` (the SDK client + `runtime_substitution.rs` repurposed), the egress proxy in `mvm-network` (123). Existing crypto deps only (`ed25519-dalek`, `aes-gcm`, `keyring`, `zeroize`); no new deps.
+
+**Prereqs / sequencing:**
+- **ADR-067** is the design.
+- **121** for the post-fold homes (`mvm-core`, `mvm-hostd`, `mvm-sdk::ir`).
+- **123** for the egress proxy. **Phases A–C (IR, resolver, keyholder, CLI) are 123-independent and can land first; Phases D–E (substitution endpoint, leak-detection) attach to 123's proxy** and execute after it. Write the proxy in 123 with the substitution + scan seams this plan needs.
+- **128** owns the claim-12/13 CI gate; this plan delivers the behavior it asserts.
+
+---
+
+## Phase A — IR contract (123-independent)
+
+### Task A1: `SecretRef` gains `auth_type` + `allowed_hosts`
+
+ADR-067 §4. The reference must say *how* the secret is used (so the keyholder picks signer vs injector) and *where* it may go (binding — claim 12). Still no bytes.
+
+**Files:** `crates/mvm-ir/src/workload.rs` (the `SecretRef` struct ~line 393); `crates/mvm-ir/src/validate.rs`.
+
+- [ ] **Step 1: Failing serde test** — a `SecretRef` round-trips with the new fields and rejects an unknown auth-type.
+  ```rust
+  #[test]
+  fn secret_ref_carries_auth_type_and_hosts_never_bytes() {
+      let r: SecretRef = serde_json::from_str(
+          r#"{"name":"openai","auth_type":"bearer","allowed_hosts":["api.openai.com"]}"#).unwrap();
+      assert_eq!(r.auth_type, AuthType::Bearer);
+      assert_eq!(r.allowed_hosts, ["api.openai.com"]);
+      // deny_unknown_fields keeps a stray "value" out — no bytes in the IR.
+      assert!(serde_json::from_str::<SecretRef>(r#"{"name":"x","value":"sk-..."}"#).is_err());
+  }
+  ```
+- [ ] **Step 2:** Add `auth_type: AuthType` (`#[serde] enum { Sigv4, Hmac, Bearer, Basic }`) and `allowed_hosts: Vec<String>` to `SecretRef`; keep `#[serde(deny_unknown_fields)]` so a literal value can't sneak in. `allowed_hosts` supports `*.` wildcards (a `host_matches(pattern, host)` helper with a unit test for the wildcard edge cases).
+- [ ] **Step 3: Commit.**
+
+### Task A2: lift the `SecretsNotImplemented` gate
+
+`validate.rs:649` currently rejects every `SecretRef` env value. With resolution landing, replace the hard reject with real validation (name non-empty, at least one allowed host, auth-type valid).
+
+- [ ] **Step 1:** Failing test — a well-formed `SecretRef` validates; an empty `allowed_hosts` is rejected with a *new* code `SecretWithoutBinding` (an unbound secret is a claim-12 violation, not "not implemented").
+- [ ] **Step 2:** Replace the `SecretsNotImplemented` arm with the binding check; drop the now-dead `SecretsNotImplemented` code (and its `error_codes.rs` entry) — no back-compat (first version).
+- [ ] **Step 3: Commit.**
+
+## Phase B — resolver + CLI (123-independent)
+
+### Task B1: the `SecretResolver` trait + `Local` impl
+
+ADR-067 §2. One trait, value source swappable. `Local` is the existing `KeyProvider` (OS keyring).
+
+**Files:** `crates/mvm-core/src/secret/resolver.rs` (new); reuse `keystore.rs`'s `KeyProvider`.
+
+- [ ] **Step 1:** Failing test — `LocalResolver` resolves a `SecretRef` whose value was set in the OS keyring (use the in-memory/file `KeyProvider` backend in test), and returns the value in a `SecretBox` (zeroize on drop).
+  ```rust
+  #[test]
+  fn local_resolver_returns_zeroizing_value_for_a_known_ref() {
+      let store = KeyProvider::file_backed(tmp());          // existing backend
+      store.set("openai", b"sk-live-xxx").unwrap();
+      let r = LocalResolver::new(store);
+      let secret = r.resolve(&secret_ref("openai", AuthType::Bearer, &["api.openai.com"])).unwrap();
+      assert_eq!(secret.expose(), b"sk-live-xxx"); // SecretBox<Vec<u8>>, zeroized on drop
+  }
+  ```
+- [ ] **Step 2:** Define `trait SecretResolver { fn resolve(&self, r: &SecretRef) -> Result<SecretBox<Vec<u8>>, ResolveError>; }`; implement `LocalResolver` over `KeyProvider`. The `mvmd` resolver is a separate mvmd plan; leave a `// resolver: mvmd impl lives in mvmd` note, not a stub.
+- [ ] **Step 3: Commit.**
+
+### Task B2: `mvmctl secret set` (the standalone-mvm DX)
+
+ADR-067 §2 — the local define path so the demo needs no `mvmd`.
+
+**Files:** `crates/mvm-cli/src/commands/secret.rs` (new); wire into `commands/mod.rs`.
+
+- [ ] **Step 1:** Failing CLI test — `mvmctl secret set openai --host api.openai.com --type bearer` (value from stdin or `--value-stdin`, never argv — it would hit the process table) stores it, and `mvmctl secret ls` shows the name + hosts + type, **never the value**.
+- [ ] **Step 2:** Implement over `LocalResolver`/`KeyProvider`; the value is read from stdin and zeroized; `ls` redacts. A `set` for a `--type sigv4` secret stores the signing key for the signer (Phase C).
+- [ ] **Step 3: Commit.**
+
+## Phase C — keyholder (123-independent)
+
+### Task C1: the signer (signing-based: SigV4, HMAC)
+
+ADR-067 §3 gold path. The signer takes a canonical request + a `SecretRef`, returns a signature; the key never leaves it. Hardware-sealed when a Secure Enclave/TPM is present, else a jailed software signer — **same interface**.
+
+**Files:** `crates/mvm-hostd/src/secret_signer/` (new module + a `[[bin]]` per the §3 separate-process model); reuse `core::subprocess`.
+
+- [ ] **Step 1:** Failing test — given a SigV4 canonical request and a stored signing key, the signer returns a signature that verifies, and the key bytes never appear in the returned struct or the signer's public surface (assert the response type has no key field; `check-no-display-on-secret-types` covers Debug).
+- [ ] **Step 2:** Implement SigV4 + HMAC signing (existing `hmac`/`sha2`); key loaded via the resolver into the signer's confined memory (software path) or referenced by handle (hardware path — `keyring` → Secure Enclave on macOS). Zeroize after. Run under the jailer (ADR-066 §3).
+- [ ] **Step 3:** Hardware-optional test — with no Secure Enclave, the software path runs and zeroizes (assert the key is wiped post-sign); with a sealed handle present, signing uses it. No hardware required for the suite to pass.
+- [ ] **Step 4: Commit.**
+
+### Task C2: the injector (bearer / basic)
+
+ADR-067 §3 fallback. The raw value must hit the wire, so confine it: decrypt only inside the injector, inject into the request, zeroize. Honest — not "never seen", but minimal + audited.
+
+**Files:** `crates/mvm-hostd/src/secret_injector/` (new).
+
+- [ ] **Step 1:** Failing test — the injector replaces a placeholder in a request header with the resolved value and zeroizes its copy; on a destination not in `allowed_hosts` it refuses (returns `DestinationNotBound`, claim 12) and never decrypts.
+- [ ] **Step 2:** Implement: check `allowed_hosts` *before* resolving (no decrypt for an unbound destination), inject, zeroize. Encrypted at rest via 122's DEK/KEK.
+- [ ] **Step 3: Commit.**
+
+## Phase D — substitution endpoint + SDK routing (needs 123's proxy)
+
+### Task D1: the host substitution endpoint on the egress path
+
+ADR-067 §1. The workload routes a secret-bearing request to a host endpoint (host-local hop) carrying an opaque placeholder; the endpoint binds-checks, calls the signer/injector, makes the real TLS, streams back.
+
+**Files:** the egress proxy in `mvm-network` (123) — add the substitution stage; `crates/mvm-sdk` client routing.
+
+- [ ] **Step 1:** Failing integration test — a request to an `allowed_hosts` destination carrying a placeholder comes back substituted (the destination, a mock, sees the real credential; the guest-side capture never does). A request to a non-allowed host has the placeholder **dropped** (mock sees the placeholder, not a secret) and an audit entry emitted.
+- [ ] **Step 2:** Placeholder = an opaque, per-session, single-use token minted at admission and mapped to a `SecretRef` (not the secret name — a leaked token reveals nothing and can't be replayed). The endpoint resolves token → `SecretRef` → signer/injector. Wire it as a stage in 123's proxy.
+- [ ] **Step 3:** SDK routing — the `mvm-sdk` HTTP client (and a documented `HTTP_PROXY`-style escape for non-SDK clients) sends secret-bearing requests to the endpoint with the placeholder. `Sandbox` exposes `mvm.secret("openai")` returning the placeholder token.
+- [ ] **Step 4: Commit.**
+
+## Phase E — leak-detection + audit (needs 123's proxy)
+
+### Task E1: proxy leak-scan — declared secrets **and** predicted PII
+
+ADR-067 §1 backstop, **expanded (owner, 2026-05-31):** the scan catches not just a declared placeholder/known-secret but **predicted PII and secret-shaped values** the workload may emit (it can't leak a *substituted* value — it never held one — but it can still emit an SSN, a card number, an email, or a high-entropy token it generated or got out-of-band). Detect → act (block | redact | audit-only, per the destination's profile) → audit.
+
+**Detectors (dep-conscious — no ML/NLP on the hot path):**
+- *declared:* the workload's `SecretRef` values + the minted opaque placeholders (already present).
+- *secret-shaped:* regex + Shannon entropy for API-key/token/JWT patterns — the `secretscan` ruleset, or build on the existing `regex` dep with a curated gitleaks-style rule set.
+- *PII:* a **Presidio-aligned regex layer** (SSN, card + **Luhn check**, email, phone, IBAN) — the `pii-vault` regex tier is the reference. **No Candle/NER on the default path;** the heavier ML detectors (`pii` NER, `velka` ensemble) are an **off-by-default feature**.
+
+**Files:** the egress proxy scan stage in `mvm-network` (123 A3); `crates/mvm-core/src/redact/` (the detector ruleset — reused by 127 D1's no-secret-in-spans check so one ruleset governs both surfaces).
+
+- [ ] **Step 1:** Failing tests — a placeholder in non-substitution egress is dropped + audited (`secret.placeholder_dropped`); a high-entropy token or a PII match (SSN/card/email) fires the destination's action (`secret.pii_detected`); the **Luhn check** rejects a non-card 16-digit number (no false positive on order IDs); clean traffic passes.
+- [ ] **Step 2:** Implement the scan as an ordered detector set over a **bounded window** (`RegexSet` + entropy, not full-body buffering — line rate). The ruleset lives in `core::redact`. Per-destination action from the named profile (125 E4).
+- [ ] **Step 3: Commit.** *(The full predictive PII/secret **detection + obfuscation** is a core feature in its own right — it may warrant its own ADR/brainstorm; this task lands the regex+entropy baseline + the seam for the feature-gated heavier detectors.)*
+
+### Task E2: audit (claim 13 lineage)
+
+**Files:** the chain-signed audit emitter (`mvm-hostd` / `audit_chain`).
+
+- [ ] **Step 1:** Failing tests — every substitution emits `secret.substituted { name, destination, auth_type }`; the audit chain **carries no secret bytes** (assert no entry contains the value); `verify_audit_chain` passes; a tampered entry fails.
+- [ ] **Step 2:** Emit the entries; reuse the claim-8 chain. Commit.
+
+## Phase F — the claim-12/13 gate (with 128)
+
+- [ ] **Step 1:** Coordinate with plan 128 to build the CI leak-gate asserting: (a) no code path writes a secret value toward the guest, (b) substitution fires only for bound destinations, (c) the audit chain carries no secret bytes. These are the claim-12/13 tests ADR-067 names; 128 wires them into `ci.yml`.
+
+## Acceptance
+
+- [ ] `SecretRef` carries `auth_type` + `allowed_hosts`, never bytes; the `SecretsNotImplemented` gate is gone, replaced by binding validation.
+- [ ] `SecretResolver` with a `Local` (OS keyring) impl; `mvmctl secret set`/`ls` work standalone (no `mvmd`), value never on argv, `ls` redacts.
+- [ ] Signer signs SigV4/HMAC without the key leaving it (hardware-sealed when present, software else); injector confines bearer values, refusing unbound destinations before decrypt. **No hardware required to pass the suite.**
+- [ ] (post-123) substitution endpoint swaps a placeholder for the real credential only to bound destinations; non-bound placeholders dropped + audited; leak-scan catches side-channel placeholders.
+- [ ] Audit emits substitution/drop entries with **no secret bytes**; `verify_audit_chain` green.
+- [ ] Claims 12/13 gate (128) green. `cargo test --workspace` + clippy + fmt green; **no new dependency**.
+
+### deferred follow-ups
+
+- [ ] The **mvmd** `SecretResolver` impl + the tenant secret store + rotation → a separate mvmd plan (same trait; production source).
+- [ ] OAuth client-assertion / JWT as additional signing auth-types (extend the signer).
+
+## Self-review
+
+- **Spec coverage (ADR-067):** mechanism C (D1), pluggable resolver (B1), software-first keyholder (C1/C2), IR contract + placeholder + audit (A/D/E), no-hardware (C1 §3), claims 12/13 (F). The mvmd resolver + tenant store are explicitly the deferred mvmd half.
+- **Sequencing honesty:** A–C land without 123; D–E need 123's proxy and say so; F is 128's gate. No task pretends the proxy exists before 123.
+- **No new deps / no secret leakage:** every task reuses an existing crate; the binding-before-decrypt order (C2) and the no-bytes-in-IR/audit assertions (A1/E2) are the load-bearing invariants, tested directly.
+- **Voice:** comments mark the non-obvious (why bind-check before decrypt, why the placeholder is opaque/per-session, why argv is unsafe for the value), not the calls.

@@ -11,7 +11,7 @@ Proposed. Metering surface (event emission) sequenced in plan 61 Phase 5. Aggreg
 
 ## Context
 
-mvm/mvmd is positioned in the same product class as Modal, OpenAI Code Interpreter, and other sandbox-runtime platforms (per plan 60's product positioning section). To compete commercially we need a billing model with at least the dimensions the sandbox-runtime category prices on:
+mvm/mvmd is positioned in the same product class as other sandbox-runtime / code-execution platforms (per plan 60's product positioning section). To compete commercially we need a billing model with at least the dimensions the sandbox-runtime category prices on:
 
 - **vCPU-time** (priced per vCPU-hour)
 - **RAM-time** (priced per GB-RAM-hour)
