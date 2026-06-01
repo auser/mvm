@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">mvm layered security architecture</title>
+  <desc id="desc">A stylized architecture diagram showing pinned Nix inputs flowing through build, admission, microVM isolation, guest policy, and audit evidence.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="0.45" stop-color="#121821"/>
+      <stop offset="1" stop-color="#0b1620"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f2937"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#3fb950"/>
+    </linearGradient>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#010409" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <g opacity="0.22" stroke="#30363d" stroke-width="1">
+    <path d="M120 160H1480M120 260H1480M120 360H1480M120 460H1480M120 560H1480M120 660H1480M120 760H1480"/>
+    <path d="M220 100V800M420 100V800M620 100V800M820 100V800M1020 100V800M1220 100V800M1420 100V800"/>
+  </g>
+  <g filter="url(#soft-shadow)">
+    <rect x="130" y="140" width="1340" height="620" rx="26" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+    <rect x="190" y="220" width="1220" height="420" rx="24" fill="#101820" stroke="#58a6ff" stroke-opacity="0.45" stroke-width="2"/>
+    <rect x="250" y="290" width="1100" height="260" rx="20" fill="#0f1b18" stroke="#3fb950" stroke-opacity="0.45" stroke-width="2"/>
+  </g>
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="180" y="112" fill="#e6edf3" font-size="54" font-weight="750">Secure by design</text>
+    <text x="180" y="164" fill="#8b949e" font-size="24">Pinned builds, explicit admission, microVM isolation, and audit evidence.</text>
+    <text x="170" y="720" fill="#8b949e" font-size="22">Host control plane</text>
+    <text x="230" y="603" fill="#8b949e" font-size="22">MicroVM boundary</text>
+    <text x="288" y="512" fill="#8b949e" font-size="22">Guest Linux + workload policy</text>
+  </g>
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="650">
+    <g>
+      <rect x="240" y="370" width="180" height="84" rx="14" fill="url(#card)" stroke="#30363d"/>
+      <text x="286" y="405" fill="#e6edf3">Nix</text>
+      <text x="278" y="435" fill="#8b949e" font-size="17" font-weight="500">pinned inputs</text>
+    </g>
+    <g>
+      <rect x="500" y="370" width="180" height="84" rx="14" fill="url(#card)" stroke="#30363d"/>
+      <text x="535" y="405" fill="#e6edf3">Builder VM</text>
+      <text x="540" y="435" fill="#8b949e" font-size="17" font-weight="500">Linux image</text>
+    </g>
+    <g>
+      <rect x="760" y="370" width="180" height="84" rx="14" fill="url(#card)" stroke="#30363d"/>
+      <text x="800" y="405" fill="#e6edf3">Admission</text>
+      <text x="803" y="435" fill="#8b949e" font-size="17" font-weight="500">signed plan</text>
+    </g>
+    <g>
+      <rect x="1020" y="370" width="180" height="84" rx="14" fill="url(#card)" stroke="#30363d"/>
+      <text x="1060" y="405" fill="#e6edf3">MicroVM</text>
+      <text x="1052" y="435" fill="#8b949e" font-size="17" font-weight="500">isolated run</text>
+    </g>
+    <g>
+      <rect x="1240" y="584" width="140" height="76" rx="14" fill="#121a24" stroke="#3fb950" stroke-opacity="0.7"/>
+      <text x="1272" y="620" fill="#e6edf3">Audit</text>
+      <text x="1264" y="646" fill="#8b949e" font-size="16" font-weight="500">receipts</text>
+    </g>
+  </g>
+  <g fill="none" stroke="url(#accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M420 412H500"/>
+    <path d="M680 412H760"/>
+    <path d="M940 412H1020"/>
+    <path d="M1200 412C1280 426 1310 492 1310 584"/>
+  </g>
+  <g fill="#58a6ff">
+    <path d="M493 400L515 412L493 424Z"/>
+    <path d="M753 400L775 412L753 424Z"/>
+    <path d="M1013 400L1035 412L1013 424Z"/>
+  </g>
+  <g stroke="#58a6ff" stroke-opacity="0.25" stroke-width="2" fill="none">
+    <circle cx="1110" cy="412" r="124"/>
+    <circle cx="1110" cy="412" r="166"/>
+  </g>
+</svg>

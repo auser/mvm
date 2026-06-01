@@ -1,0 +1,87 @@
+---
+import { getCollection } from "astro:content";
+import BlogLayout from "../../layouts/BlogLayout.astro";
+
+const posts = (await getCollection("blog")).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf(),
+);
+
+const [featuredPost, ...otherPosts] = posts;
+---
+
+<BlogLayout
+  title="Blog"
+  description="High-level notes on mvm architecture, microVM security, Nix, and secure sandboxing."
+>
+  <section class="blog-index">
+    <div class="blog-index-hero">
+      <div>
+        <p class="blog-eyebrow">mvm blog</p>
+        <h1>Notes on secure infrastructure</h1>
+      </div>
+      <p class="blog-lede">
+        High-level posts on microVMs, Nix, sandboxing, and the architecture behind mvm.
+      </p>
+    </div>
+
+    {
+      featuredPost && (
+        <article class="blog-featured">
+          <a href={`/blog/${featuredPost.id}/`}>
+            <img src={featuredPost.data.heroImage} alt="" loading="eager" />
+            <div class="blog-featured-copy">
+              <div class="blog-list-meta">
+                <time datetime={featuredPost.data.date.toISOString()}>
+                  {featuredPost.data.date.toLocaleDateString("en-US", {
+                    month: "long",
+                    day: "numeric",
+                    year: "numeric",
+                  })}
+                </time>
+                <span>{featuredPost.data.tags.join(" / ")}</span>
+              </div>
+              <h2>{featuredPost.data.title}</h2>
+              <p>{featuredPost.data.description}</p>
+              <span class="blog-read-more">Read the post</span>
+            </div>
+          </a>
+        </article>
+      )
+    }
+
+    <div class="blog-section-heading">
+      <h2>Latest posts</h2>
+      <p>Architecture notes, release context, and practical security writing.</p>
+    </div>
+
+    <div class="blog-list">
+      {
+        otherPosts.length > 0 ? (
+          otherPosts.map((post) => (
+          <article class="blog-list-item">
+            <a href={`/blog/${post.id}/`}>
+              <img src={post.data.heroImage} alt="" loading="lazy" />
+              <div>
+                <h2>{post.data.title}</h2>
+                <p>{post.data.description}</p>
+                <div class="blog-list-meta">
+                  <time datetime={post.data.date.toISOString()}>
+                    {post.data.date.toLocaleDateString("en-US", {
+                      month: "long",
+                      day: "numeric",
+                      year: "numeric",
+                    })}
+                  </time>
+                  <span>{post.data.tags.join(" / ")}</span>
+                </div>
+              </div>
+            </a>
+          </article>
+          ))
+        ) : (
+          <p class="blog-empty">More posts are coming soon.</p>
+        )
+      }
+    </div>
+  </section>
+</BlogLayout>

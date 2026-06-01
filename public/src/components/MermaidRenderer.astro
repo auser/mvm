@@ -1,0 +1,38 @@
+<script>
+  const currentTheme = () => {
+    const explicitTheme = document.documentElement.dataset.theme;
+    if (explicitTheme === "light") return "default";
+    if (explicitTheme === "dark") return "dark";
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "default" : "dark";
+  };
+
+  const renderMermaidBlocks = async () => {
+    const codeBlocks = Array.from(document.querySelectorAll("pre > code.language-mermaid"));
+    if (codeBlocks.length === 0) return;
+
+    const { default: mermaid } = await import("mermaid");
+
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: currentTheme(),
+    });
+
+    const diagrams = codeBlocks.map((codeBlock, index) => {
+      const diagram = document.createElement("div");
+      diagram.className = "mermaid";
+      diagram.id = `mermaid-${index}`;
+      diagram.textContent = codeBlock.textContent ?? "";
+      codeBlock.parentElement?.replaceWith(diagram);
+      return diagram;
+    });
+
+    await mermaid.run({ nodes: diagrams });
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", renderMermaidBlocks, { once: true });
+  } else {
+    renderMermaidBlocks();
+  }
+</script>
