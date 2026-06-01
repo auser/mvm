@@ -340,13 +340,25 @@ impl LibkrunBuilderVm {
         image: BuilderVmImage,
         workspace_dir: &std::path::Path,
         artifact_out: &std::path::Path,
+        host_bin_dir: &std::path::Path,
     ) -> Result<(), BuilderVmError> {
         ensure_utf8_path(workspace_dir, "workspace_dir")?;
         ensure_utf8_path(artifact_out, "artifact_out")?;
+        ensure_utf8_path(host_bin_dir, "host_bin_dir")?;
         if !workspace_dir.is_dir() {
             return Err(BuilderVmError::ExtractionFailed(format!(
                 "Stage 0 workspace_dir must be an existing directory: {}",
                 workspace_dir.display()
+            )));
+        }
+        // Plan 115 / ADR-065: the builder-vm flake's `.default` package
+        // bakes the cross-compiled host binaries (read from
+        // MVM_HOST_BIN_DIR) into the rootfs, so Stage 0 must mount them
+        // just like the steady-state `run_build` path does.
+        if !host_bin_dir.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "Stage 0 host_bin_dir must be an existing directory: {}",
+                host_bin_dir.display()
             )));
         }
         std::fs::create_dir_all(artifact_out).map_err(|e| {
@@ -381,7 +393,12 @@ impl LibkrunBuilderVm {
             .with_console_output(path_to_str(&console_log, "console_log")?)
             .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
             .add_virtio_fs("work", path_to_str(workspace_dir, "workspace_dir")?)
-            .add_virtio_fs("out", path_to_str(artifact_out, "artifact_out")?);
+            .add_virtio_fs("out", path_to_str(artifact_out, "artifact_out")?)
+            // Plan 115 / ADR-065: mount the extracted host-vm binaries at
+            // /mvm-bins (read-only by convention). init.sh exports
+            // MVM_HOST_BIN_DIR=/mvm-bins so the flake's `.default` build
+            // can bake the correct cross-compiled binaries into the rootfs.
+            .add_virtio_fs("mvm-bins", path_to_str(host_bin_dir, "host_bin_dir")?);
 
         krun = apply_networking_mode(krun, &vm_state_dir)?;
 

@@ -2169,8 +2169,22 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
         flavor = STAGE0_FLAVOR_CURRENT,
     );
 
+    // Plan 115 / ADR-065: extract the mvmctl-embedded host-vm binaries to
+    // the host-bins cache; run_stage0 mounts them at /mvm-bins so the
+    // builder-vm flake's `.default` build can bake them into the rootfs.
+    let host_bins_cache = format!("{}/host-bins", mvm_core::config::mvm_cache_dir());
+    let host_bin_dir =
+        crate::host_binaries::extract::ensure_extracted(std::path::Path::new(&host_bins_cache))
+            .map_err(|e| anyhow::anyhow!("extract embedded host-vm binaries: {e}"))?;
+
     let image = BuilderVmImage::new_root_dir(root_dir.clone(), "/init");
-    let result = run_stage0_root_dir(&staging_dir, &workspace_root, image, source_fingerprint);
+    let result = run_stage0_root_dir(
+        &staging_dir,
+        &workspace_root,
+        image,
+        &host_bin_dir,
+        source_fingerprint,
+    );
     let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
@@ -2207,12 +2221,13 @@ fn run_stage0_root_dir(
     staging_dir: &std::path::Path,
     workspace_root: &std::path::Path,
     image: mvm_build::libkrun_builder::BuilderVmImage,
+    host_bin_dir: &std::path::Path,
     source_fingerprint: &str,
 ) -> std::result::Result<(), (Stage0FailureStage, anyhow::Error)> {
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
 
     LibkrunBuilderVm::default()
-        .run_stage0(image, workspace_root, staging_dir)
+        .run_stage0(image, workspace_root, staging_dir, host_bin_dir)
         .map_err(|e| {
             (
                 Stage0FailureStage::Build,

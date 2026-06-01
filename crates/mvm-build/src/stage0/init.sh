@@ -78,6 +78,12 @@ EOF
 # `add_virtio_fs(tag, ...)` calls in `LibkrunBuilderVm::run_stage0`.
 mountpoint -q /work || mount -t virtiofs work /work
 mountpoint -q /out  || mount -t virtiofs out  /out
+# Plan 115 / ADR-065: the host-vm binaries share (mvmctl-embedded,
+# cross-compiled for the guest arch). The builder-vm flake's `.default`
+# reads them from MVM_HOST_BIN_DIR=/mvm-bins (exported below) at build
+# time. Tag matches `add_virtio_fs("mvm-bins", ...)` in run_stage0.
+mkdir -p /mvm-bins
+mountpoint -q /mvm-bins || mount -t virtiofs mvm-bins /mvm-bins
 if ! mountpoint -q /work; then
   echo "stage0-init: /work mount failed; aborting." >&2
   exit 64
@@ -85,6 +91,10 @@ fi
 if ! mountpoint -q /out; then
   echo "stage0-init: /out mount failed; aborting." >&2
   exit 65
+fi
+if ! mountpoint -q /mvm-bins; then
+  echo "stage0-init: /mvm-bins mount failed; aborting." >&2
+  exit 66
 fi
 
 # libkrun's set_root mode backs the guest root with virtio-fs
@@ -157,6 +167,11 @@ mkdir -p "$HOME"
 # `/`, tripping over /dev/btrfs-control + friends). The flake
 # checks this env under `--impure` (already set below).
 export MVM_WORKSPACE_PATH=/work
+
+# Plan 115 / ADR-065: point the flake at the mounted host-vm binaries.
+# The `.default` build errors at eval if this is unset (it bakes
+# mvm-builder-init / mvm-egress-proxy into the rootfs from here).
+export MVM_HOST_BIN_DIR=/mvm-bins
 
 ARCH="$(uname -m)"
 FLAKE_REF="path:/work/nix/images/builder-vm#packages.${ARCH}-linux.default"
