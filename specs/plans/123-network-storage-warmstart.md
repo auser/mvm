@@ -54,6 +54,15 @@ Claim 10 is egress default-deny today; ADR-066 §"NetworkProvider owns … both 
 
 - [ ] **Step 1:** Failing tests — DNS queries are logged + policy-checked (a denied host's lookup is sink-holed + audited); flow events emit to the shared audit log. Commit after green.
 
+### Task A5: pluggable network modes (`NetworkMode::Custom`) — the WireGuard/Tailscale seam
+
+The IR `NetworkMode` is a closed enum (`None`/`Bridge`/`Host`) — a mesh/VPN mode can't be expressed without a core edit. Same fix as `MountSource::External`: add an open `Custom { provider, config }` + a `NetworkProvider`-registry lookup. **WireGuard/Tailscale themselves are mvmd's** (the control-plane mesh); this plan only exports the *seam* so mvmd registers a `WireGuardNetworkProvider`, expresses it in the IR, and the guest's `netinit` (124) consumes the config delivered on the config-device (124 E1). mvm builds none of the mesh logic.
+
+**Files:** `crates/mvm-ir/src/workload.rs` (`NetworkMode` ~line 489); `crates/mvm-network` (the registry).
+
+- [ ] **Step 1:** Failing test — `NetworkMode::Custom { provider: "wireguard", config }` round-trips; an unregistered provider errors `UnknownNetworkProvider`; the built-in `None`/`Bridge`/`Host` still resolve.
+- [ ] **Step 2:** Add the open variant + the registry lookup (built-ins stay); `netinit` reads a `Custom` config from the config-device. mvmd's WireGuard/Tailscale impl is a separate mvmd plan. Commit.
+
 ## Phase B — `StorageProvider` (`mvm-storage`)
 
 ### Task B1: the trait + `local` impl

@@ -50,7 +50,7 @@
 
 ### Task C2: the quickstart + the contributor guide + troubleshooting + positioning
 
-- [ ] **Step 1:** Quickstart leads with the `Sandbox` one-call DX (120/125) — `pip install mvm; Sandbox.create(image=…); sb.exec(...)`. `contributing/development.md` reflects the 17-crate layout + the new test tiers (128). `troubleshooting.md` matches the new backends/errors (ADR-053 taxonomy). Positioning leads with the security spine (the gap-analysis differentiators), DX as the floor.
+- [ ] **Step 1:** Quickstart leads with the `Sandbox` one-call DX (120/125) — `pip install mvm; Sandbox.create(image=…); sb.exec(...)`. `contributing/development.md` reflects the 17-crate layout + the new test tiers (128). `troubleshooting.md` matches the new backends/errors (ADR-053 taxonomy). Positioning leads with the security spine (the gap-analysis differentiators), DX as the floor, and the **local-first** framing — runs on your machine, data never leaves it, no per-minute billing, free + open (the mvm-standalone story; mvmd is the cloud/fleet layer). mvm-vs-mvmd *is* local-vs-cloud.
 - [ ] **Step 2:** No competitor names anywhere (repo policy). Commit.
 
 ## Phase D — the docs-drift gate
