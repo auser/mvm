@@ -14,6 +14,25 @@ subprocesses to.
 
 ## Quick start
 
+The fastest path is the one-call sandbox — boot a dev-tier microVM, run a
+command, get its output back:
+
+```python
+from mvm import Sandbox
+
+sb = Sandbox.create(image="python:slim")
+try:
+    r = sb.exec("python", "-c", "print(2 + 2)")
+    print(r.stdout)          # "4\n"   (r.exit_code, r.stderr also available)
+finally:
+    sb.shutdown()
+```
+
+`exec` is **dev-tier**: against a prod template it raises `SandboxDevOnly`
+before any work happens (ADR-002 §W4.3 — the prod agent has no exec handler).
+
+For a reproducible, signed workload, declare it and compile it instead:
+
 ```python
 # app.py
 import mvm as mv
