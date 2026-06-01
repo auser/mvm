@@ -13,7 +13,7 @@ export function Landing() {
       <Architecture />
       <CodeExample />
       <CTABanner />
-      {/*<Footer />*/}
+      <Footer />
     </div>
   );
 }

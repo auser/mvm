@@ -279,6 +279,10 @@ nav[aria-label="Main"] [role="group"] > :first-child {
   margin-inline: auto;
 }
 
+.landing-footer__inner {
+  margin-inline: auto;
+}
+
 
 h2.text-title {
   margin-bottom: 1.5rem;
