@@ -117,13 +117,20 @@ ADR-067 §1. The workload routes a secret-bearing request to a host endpoint (ho
 
 ## Phase E — leak-detection + audit (needs 123's proxy)
 
-### Task E1: proxy leak-scan
+### Task E1: proxy leak-scan — declared secrets **and** predicted PII
 
-ADR-067 §1 backstop. Any egress *not* going through substitution is scanned; a placeholder or a known secret value is dropped + audited. The guest can't leak a *value* (it never had one); this catches a placeholder smuggled out a side channel.
+ADR-067 §1 backstop, **expanded (owner, 2026-05-31):** the scan catches not just a declared placeholder/known-secret but **predicted PII and secret-shaped values** the workload may emit (it can't leak a *substituted* value — it never held one — but it can still emit an SSN, a card number, an email, or a high-entropy token it generated or got out-of-band). Detect → act (block | redact | audit-only, per the destination's profile) → audit.
 
-- [ ] **Step 1:** Failing test — a placeholder in a direct (non-substitution) egress request is dropped + audited as `secret.placeholder_dropped`; clean traffic passes.
-- [ ] **Step 2:** Implement the scan in the proxy's egress path (the in-line splice point — see the gvproxy/passt wrap, not a native API). Bound the scan cost (a fixed-size window, not full-body buffering).
-- [ ] **Step 3: Commit.**
+**Detectors (dep-conscious — no ML/NLP on the hot path):**
+- *declared:* the workload's `SecretRef` values + the minted opaque placeholders (already present).
+- *secret-shaped:* regex + Shannon entropy for API-key/token/JWT patterns — the `secretscan` ruleset, or build on the existing `regex` dep with a curated gitleaks-style rule set.
+- *PII:* a **Presidio-aligned regex layer** (SSN, card + **Luhn check**, email, phone, IBAN) — the `pii-vault` regex tier is the reference. **No Candle/NER on the default path;** the heavier ML detectors (`pii` NER, `velka` ensemble) are an **off-by-default feature**.
+
+**Files:** the egress proxy scan stage in `mvm-network` (123 A3); `crates/mvm-core/src/redact/` (the detector ruleset — reused by 127 D1's no-secret-in-spans check so one ruleset governs both surfaces).
+
+- [ ] **Step 1:** Failing tests — a placeholder in non-substitution egress is dropped + audited (`secret.placeholder_dropped`); a high-entropy token or a PII match (SSN/card/email) fires the destination's action (`secret.pii_detected`); the **Luhn check** rejects a non-card 16-digit number (no false positive on order IDs); clean traffic passes.
+- [ ] **Step 2:** Implement the scan as an ordered detector set over a **bounded window** (`RegexSet` + entropy, not full-body buffering — line rate). The ruleset lives in `core::redact`. Per-destination action from the named profile (125 E4).
+- [ ] **Step 3: Commit.** *(The full predictive PII/secret **detection + obfuscation** is a core feature in its own right — it may warrant its own ADR/brainstorm; this task lands the regex+entropy baseline + the seam for the feature-gated heavier detectors.)*
 
 ### Task E2: audit (claim 13 lineage)
 
