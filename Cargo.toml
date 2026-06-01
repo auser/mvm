@@ -466,6 +466,17 @@ strip = true
 lto = true
 codegen-units = 1
 
+# The embedded host-vm binaries (mvm-host-vm-init, mvm-egress-proxy)
+# are baked into the VM rootfs, so size matters more than throughput
+# (they boot once and mostly wait on I/O). Optimize for size on top of
+# the release profile's strip+LTO; panic=abort drops the unwinder
+# (neither binary uses catch_unwind). build.rs builds them under this
+# profile. Keeps mvmctl's own `release` profile speed-tuned.
+[profile.release-embedded]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
 # Speed up `cargo test --workspace` by giving the test profile more
 # parallel codegen units and dropping debug info to line tables only.
 # Test binaries don't need full DWARF; we just need clean panic
@@ -520,6 +531,13 @@ opt-level = 3
 # Pinned cross-compile toolchain for the embedded host-vm binaries
 # baked into mvmctl. Bump in lockstep across this file and CI to keep
 # the embedded payload reproducible (Plan 115 / ADR-065 claim 11).
+#
+# Target is `*-musl` so the binaries are **fully static** — they are
+# baked into the builder/dev-VM rootfs (a Nix rootfs with no
+# `/lib/ld-linux-*.so`) and run as PID 1, so a glibc dynamic-linker
+# hop is not just slower, it ENOENT-panics the kernel at boot (the
+# rootfs has no interpreter). musl-static needs no interpreter and no
+# glibc version pin, which also drops the old `gnu.<ver>` suffix.
 zig = "0.13.0"
 cargo-zigbuild = "0.20.0"
-target = "aarch64-unknown-linux-gnu.2.17"
+target = "aarch64-unknown-linux-musl"

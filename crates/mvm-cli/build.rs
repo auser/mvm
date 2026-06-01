@@ -106,14 +106,22 @@ fn strip_glibc(t: &str) -> &str {
 }
 
 fn run_cargo_zigbuild(root: &Path, pkg: &str, target: &str, out: &Path) {
-    eprintln!("[build.rs] cargo zigbuild --release --target {target} -p {pkg}");
+    eprintln!("[build.rs] cargo zigbuild --profile release-embedded --target {target} -p {pkg}");
     // We need the rustup-managed cargo, not the Homebrew one. The Homebrew
     // cargo sets RUSTC=rustc which doesn't have the cross targets, and that
     // value propagates into the nested `cargo build` that cargo-zigbuild
     // spawns. Using the rustup cargo avoids that.
     let (cargo, rustc) = rustup_cargo_and_rustc(strip_glibc(target));
     let status = Command::new(&cargo)
-        .args(["zigbuild", "--release", "--target", target, "-p", pkg])
+        .args([
+            "zigbuild",
+            "--profile",
+            "release-embedded",
+            "--target",
+            target,
+            "-p",
+            pkg,
+        ])
         .env("RUSTC", &rustc)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC_WRAPPER")
@@ -129,7 +137,7 @@ fn run_cargo_zigbuild(root: &Path, pkg: &str, target: &str, out: &Path) {
     let built = root
         .join("target")
         .join(strip_glibc(target))
-        .join("release")
+        .join("release-embedded")
         .join(pkg);
     std::fs::copy(&built, out)
         .unwrap_or_else(|e| panic!("copy {} → {}: {e}", built.display(), out.display()));
@@ -137,14 +145,15 @@ fn run_cargo_zigbuild(root: &Path, pkg: &str, target: &str, out: &Path) {
 
 fn run_cargo_build(root: &Path, pkg: &str, target: &str, out: &Path) {
     eprintln!(
-        "[build.rs] cargo build --release --target {t} -p {pkg}",
+        "[build.rs] cargo build --profile release-embedded --target {t} -p {pkg}",
         t = strip_glibc(target)
     );
     let (cargo, rustc) = rustup_cargo_and_rustc(strip_glibc(target));
     let status = Command::new(&cargo)
         .args([
             "build",
-            "--release",
+            "--profile",
+            "release-embedded",
             "--target",
             strip_glibc(target),
             "-p",
@@ -161,7 +170,7 @@ fn run_cargo_build(root: &Path, pkg: &str, target: &str, out: &Path) {
     let built = root
         .join("target")
         .join(strip_glibc(target))
-        .join("release")
+        .join("release-embedded")
         .join(pkg);
     std::fs::copy(&built, out)
         .unwrap_or_else(|e| panic!("copy {} → {}: {e}", built.display(), out.display()));

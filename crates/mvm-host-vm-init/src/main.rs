@@ -130,7 +130,9 @@ fn main() -> ExitCode {
 
 #[cfg(any(target_os = "linux", test))]
 fn virtiofs_tag_is_read_only(tag: &str) -> bool {
-    tag == "work"
+    // `work` (the workspace) and `mvm-bins` (embedded host bins) are
+    // inputs — the guest never writes them. `out`/`job` are writable.
+    tag == "work" || tag == "mvm-bins"
 }
 
 /// Bytes from the start of the ext4 superblock that the host-side
@@ -290,8 +292,9 @@ mod tests {
     }
 
     #[test]
-    fn virtiofs_tag_policy_keeps_only_workspace_read_only() {
+    fn virtiofs_tag_policy_keeps_inputs_read_only() {
         assert!(virtiofs_tag_is_read_only("work"));
+        assert!(virtiofs_tag_is_read_only("mvm-bins"));
         assert!(!virtiofs_tag_is_read_only("out"));
         assert!(!virtiofs_tag_is_read_only("job"));
     }
@@ -442,12 +445,24 @@ mod linux {
     /// out after the VM powers off.
     const OUT_DIR: &str = "/out";
 
-    /// Three virtio-fs tags that match the host-side
+    /// Embedded host-vm binaries, mounted read-only. Plan 115 /
+    /// ADR-065: `run_build` shares the extracted bins under this tag so
+    /// the builder-vm flake's `.default`/`.dev` builds can bake them in
+    /// (the flake reads `MVM_HOST_BIN_DIR=/mvm-bins`). Best-effort like
+    /// the others — a job that doesn't share it (e.g. `run_shell_script`)
+    /// just leaves `/mvm-bins` empty.
+    const MVM_BINS_DIR: &str = "/mvm-bins";
+
+    /// virtio-fs tags that match the host-side
     /// `KrunContext::add_virtio_fs` declarations in
     /// `LibkrunBuilderVm::run_build`. Order doesn't matter; the
     /// guest mounts each by tag.
-    const VIRTIOFS_MOUNTS: &[(&str, &str)] =
-        &[("work", WORK_DIR), ("out", OUT_DIR), ("job", JOB_DIR)];
+    const VIRTIOFS_MOUNTS: &[(&str, &str)] = &[
+        ("work", WORK_DIR),
+        ("out", OUT_DIR),
+        ("job", JOB_DIR),
+        ("mvm-bins", MVM_BINS_DIR),
+    ];
 
     /// Max stderr lines we capture into `/job/result`. Keeps
     /// the result file small; the host-side supervisor still
@@ -1647,6 +1662,15 @@ mod linux {
         // mkGuest /init mounts this; we replicate for Plan 86.
         let _ = std::fs::create_dir_all("/dev/pts");
         mount_fs_idempotent("devpts", "/dev/pts", "devpts")?;
+        // `/dev/shm` (tmpfs) backs POSIX named semaphores (`sem_open`).
+        // nixpkgs's `make-ext4-fs.nix` runs `faketime` for reproducible
+        // mtimes, and faketime's wrapper calls `sem_open`; without
+        // `/dev/shm` it bails "sem_open: No such file or directory" and
+        // the rootfs-image derivation (hence every mkGuest build inside
+        // the builder VM) fails. `/dev` is devtmpfs (writable), so the
+        // mountpoint mkdir succeeds even though the rootfs is ro.
+        let _ = std::fs::create_dir_all("/dev/shm");
+        mount_fs_idempotent("tmpfs", "/dev/shm", "tmpfs")?;
         // `/dev/fd → /proc/self/fd` is what bash process substitution
         // (`< <(...)`, `mapfile -t x < <(...)`) needs to open the
         // subshell's pipe FD at `/dev/fd/N`. devtmpfs creates device
@@ -1894,7 +1918,10 @@ mod linux {
             let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
             ifr.ifr_name = name;
 
-            if unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
+            // `as _`: the ioctl request arg is `c_ulong` on glibc but
+            // `c_int` on musl — coerce to whatever the target expects so
+            // the same source cross-compiles for both.
+            if unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) } < 0 {
                 return Err(format!(
                     "SIOCGIFFLAGS {iface}: {}",
                     std::io::Error::last_os_error()
@@ -1909,7 +1936,7 @@ mod linux {
                 let flags = ifr.ifr_ifru.ifru_flags;
                 ifr.ifr_ifru.ifru_flags = flags | (libc::IFF_UP as libc::c_short);
             }
-            if unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) } < 0 {
+            if unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) } < 0 {
                 return Err(format!(
                     "SIOCSIFFLAGS {iface} IFF_UP: {}",
                     std::io::Error::last_os_error()
