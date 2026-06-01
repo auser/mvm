@@ -123,9 +123,15 @@ One gated test driving the whole spine with the **verified** verbs: `mvmctl dev 
   use assert_cmd::cargo::CommandCargoExt;
   use std::process::Command;
 
+  // macOS (libkrun) is forced, test-only: MVM_BUILDER_BACKEND=libkrun on every call
+  // (harmless on `compile`), plus `--hypervisor libkrun` on `up` — auto-select on a
+  // macOS-26 host picks Vz (builder) / apple-container (workload), not libkrun. This
+  // does NOT change `up.rs`'s product auto-select (see Task 4 §1).
   fn mvmctl(args: &[&str]) -> std::process::Output {
       #[allow(deprecated)]
-      Command::cargo_bin("mvmctl").expect("locate mvmctl").args(args).output().expect("spawn mvmctl")
+      Command::cargo_bin("mvmctl").expect("locate mvmctl")
+          .env("MVM_BUILDER_BACKEND", "libkrun")
+          .args(args).output().expect("spawn mvmctl")
   }
 
   #[test]
@@ -137,16 +143,16 @@ One gated test driving the whole spine with the **verified** verbs: `mvmctl dev 
       let out = tempfile::tempdir().expect("tmp out");
       let app = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/python/hello-app/app.py");
 
-      // 1) builder VM up (idempotent).
+      // 1) builder VM up (idempotent), via libkrun.
       assert!(mvmctl(&["dev", "up"]).status.success(), "dev up failed");
 
       // 2) lower the decorator app to flake.nix + launch.json.
       let c = mvmctl(&["compile", app, "--out", out.path().to_str().unwrap()]);
       assert!(c.status.success(), "compile failed: {}", String::from_utf8_lossy(&c.stderr));
 
-      // 3) build + boot the workload microVM; `up` waits for the guest agent
+      // 3) build + boot the workload microVM via libkrun; `up` waits for the guest agent
       //    (wait_for_guest_agent -> vsock Ping). Exit 0 + no "not reachable" == agent answered.
-      let up = mvmctl(&["up", "--flake", out.path().to_str().unwrap()]);
+      let up = mvmctl(&["up", "--hypervisor", "libkrun", "--flake", out.path().to_str().unwrap()]);
       let log = String::from_utf8_lossy(&up.stderr);
       assert!(up.status.success(), "up failed: {log}");
       assert!(!log.contains("Guest agent not reachable"), "agent never answered: {log}");
@@ -155,11 +161,11 @@ One gated test driving the whole spine with the **verified** verbs: `mvmctl dev 
       let _ = mvmctl(&["dev", "down"]);
   }
   ```
-  *(On macOS the workload backend must be libkrun, not the `--backend` firecracker default — Task 4 wires that selection. The assertion contract is fixed: `up` boots and the agent answers.)*
+  *(libkrun is forced here test-only — never bypass admission with `--hypervisor mock`/`MVM_DIRECT_BOOT`, and never set `MVM_ACK_UNRESTRICTED_NETWORK`. Run under `MVM_DATA_DIR` isolation so demo audit/nonce/key state never touches the real `~/.mvm`. The assertion contract is fixed: `up` boots and the agent answers.)*
 
-- [ ] **Step 2: Run it gated** on a libkrun host: `MVM_E2E_SMOKE=1 cargo test -p mvm-cli --test core_demo_e2e -- --nocapture`. First run surfaces the real gaps (Task 4). The default (ungated) run skips and passes — confirm with `cargo test -p mvm-cli --test core_demo_e2e` (prints the skip line, exits 0).
+- [ ] **Step 2: Run it gated** on this libkrun host, under state isolation: `MVM_DATA_DIR="$PWD/.mvm-test" MVM_E2E_SMOKE=1 cargo test -p mvm-cli --test core_demo_e2e -- --nocapture`. First run surfaces the real gaps (Task 4). The default (ungated) run skips and passes — confirm with `cargo test -p mvm-cli --test core_demo_e2e` (prints the skip line, exits 0).
 
-- [ ] **Step 3: Add the lane to CI** as a manual/opt-in job (not every PR — it needs a libkrun runner), mirroring how `dev_up_smoke` is gated. Document it in `public/src/content/docs/contributing/development.md`.
+- [ ] **Step 3: Add the CI lane** (no over-claim — hosted runners can't boot libkrun). A `workflow_dispatch` job that on hosted runners builds + runs `core_demo_e2e` **ungated** (proves it compiles + skip-passes), wired (runner label + conditional `MVM_E2E_SMOKE=1`) to do the real boot when a **self-hosted macOS/libkrun runner** (Homebrew `slp/krun` trio + Apple-Silicon virt) is registered. Document the local `MVM_DATA_DIR=… MVM_E2E_SMOKE=1` invocation in `public/src/content/docs/contributing/development.md`. Real boot-in-CI is deferred to a self-hosted runner; the **Linux/Firecracker** lane (own plan) is where Lima-as-virtual-`/dev/kvm` (AGENTS.md test-tier backend) is the mechanism — note it, don't build it here.
 
 - [ ] **Step 4: Commit.**
   ```bash
@@ -171,7 +177,7 @@ One gated test driving the whole spine with the **verified** verbs: `mvmctl dev 
 
 The spine is *believed* complete (fresh build → `overlay_aware: true` → admits; `up` pings the agent). Task 4 is the iterate-to-green loop: run the gated E2E, read `<vm_state_dir>/console.log` **first** on any boot failure (per the project's debugging convention), fix the one gap, re-run. **No speculative fixes** — only what the E2E proves broken. The likely gaps, in order:
 
-- [ ] **Step 1: macOS workload backend.** `up`'s `--backend` defaults to `firecracker` (`up.rs:705`), which needs Linux KVM. On macOS the workload microVM must run via libkrun. Confirm `up` selects libkrun on macOS (per-OS default) or thread the backend through the E2E. This is the most likely first failure.
+- [ ] **Step 1: macOS workload backend.** `up`'s `--hypervisor` defaults to `firecracker` (`up.rs:705`); the auto-select (`up.rs:1190`) has no libkrun branch, so on a macOS-26 host it resolves to apple-container. **Fix is test-only**: thread `--hypervisor libkrun` + `MVM_BUILDER_BACKEND=libkrun` through the E2E (done in Task 3 §1). **Do NOT** change `up.rs`'s auto-select to default macOS workloads to libkrun — that's a product change that would flip macOS-26 users off the intended apple-container tier (out of scope). Next macOS backend to prove (own follow-up): **Vz workloads** (Apple-native, already an `AnyBackend` variant), ahead of apple-container.
 - [ ] **Step 2: `compile → up` handoff.** Confirm `up --flake <compiled-dir>` consumes `compile`'s rendered `flake.nix`. If `up` expects a flake *reference* rather than a directory of rendered artifacts, wire the handoff (point `up` at the rendered dir, or have the E2E pass it as a path-flake `--flake path:<dir>`).
 - [ ] **Step 3: teardown.** Confirm `dev down` stops the builder; if `up` leaves a workload VM running, stop it (the `mvmctl` stop/kill verb) in the test's teardown so repeated runs stay idempotent.
 - [ ] **Step 4: Repeat** until `MVM_E2E_SMOKE=1 cargo test -p mvm-cli --test core_demo_e2e` is green on a macOS/libkrun host. Each fix is its own red→green→commit cycle.
@@ -181,14 +187,18 @@ The spine is *believed* complete (fresh build → `overlay_aware: true` → admi
 
 The gap analysis (`specs/research/embeddable-sandbox-sdk-dx-gap-analysis.md`) put the parity gap in one place: the imperative "boot a sandbox, exec against it" experience. mvm **already has the class** — `sdks/python/mvm/_sandbox.py` (`Sandbox.create(...)`, `sb.commands.start(...)`) with two modes (record → prod plan, live → dev) and the dev-tier guard `SandboxDevOnly` already in place. This task adds the dead-simple one-shot ergonomic on top and makes it the demo headline. **Extend `Sandbox`; do not add a new class** (and never name it `Box` — that's a competitor's term). Typed helpers / async / Node are plan 125.
 
-**Files:** `sdks/python/mvm/_sandbox.py` (add the one-shot `exec`); test `sdks/python/tests/test_sandbox_exec.py` (gated — it boots a real VM).
+**Files:** `sdks/python/mvm/_sandbox.py` (add the one-shot `exec`); test `sdks/python/tests/test_sandbox_exec.py`.
 
-- [ ] **Step 1: Write the failing test.**
+> `_sandbox.py` is the **hand-written veneer**. Plan 124 Phase D (`xtask gen-sdk`) autogenerates only the IR/protocol types + RPC client stubs into `sdks/*/_generated/`; the 125 veneer sits over that generated core. So hand-editing this class is correct and on-plan; when 124 lands, `_LiveTransport` (today shells `mvmctl`) may be re-pointed at the generated client — `exec()`'s dev-only contract is invariant across that move.
+
+- [ ] **Step 1: Write the tests** (one gated, one always-on):
   ```python
   # Live-mode Sandbox is dev-tier (SandboxDevOnly guards prod). exec() is a
   # one-shot convenience over commands.start: run argv, collect stdout + exit.
+  import os, pytest
   from mvm import Sandbox
 
+  @pytest.mark.skipif(os.environ.get("MVM_E2E_SMOKE") != "1", reason="boots a real VM")
   def test_sandbox_exec_returns_stdout():
       sb = Sandbox.create(image="python:slim")     # boots a dev-tier microVM
       try:
@@ -197,10 +207,30 @@ The gap analysis (`specs/research/embeddable-sandbox-sdk-dx-gap-analysis.md`) pu
           assert r.stdout.strip() == "4"
       finally:
           sb.shutdown()
+
+  def test_sandbox_exec_refuses_prod_before_any_vsock(monkeypatch):
+      # Construct a prod-mode transport directly (no VM); exec must refuse
+      # via SandboxDevOnly BEFORE spawning any mvmctl subprocess (claim 4).
+      import mvm._sandbox as s
+      monkeypatch.setattr(s.subprocess, "run",
+                          lambda *a, **k: pytest.fail("exec() spawned a subprocess on a prod template"))
+      sb = s.Sandbox("wid", live=s._LiveTransport(mvm_cli_bin="/bin/false", vm_id="x", build_mode="prod"))
+      with pytest.raises(s.SandboxDevOnly):
+          sb.exec("python", "-c", "print(1)")
   ```
-- [ ] **Step 2: Add `Sandbox.exec(*argv, timeout=None, cwd=None, env=None) -> ExecResult`** as a one-shot over the existing `commands.start` (start → wait → collect stdout/stderr/exit). Keep the existing `SandboxDevOnly` refusal for prod-tier — no silent fallback (ADR-053). Reuse the `_live_sandbox` one-process invariant already in `_sandbox.py`.
-- [ ] **Step 3: Run gated** (`MVM_E2E_SMOKE=1`) on a libkrun host → PASS; ungated → skip. Commit.
+- [ ] **Step 2: Implement on `_sandbox.py`.** Add `@dataclass ExecResult(stdout, stderr, exit_code)` (export it). Add `_LiveTransport.commands_run(argv, env) -> ExecResult` — **same `SandboxDevOnly` guard as `commands_start`, enforced first** (raise before any vsock traffic when `build_mode != "dev"`; no silent fallback — ADR-002 claim 4), else **capture** stdout/stderr/exit and return. Add `Sandbox.exec(*argv, timeout=None, cwd=None, env=None) -> ExecResult` — **dev-tier, live-mode only** (record mode raises a clear error; no prod path). Add `shutdown()` as a `kill()` alias and accept `image=` as an alias for `template` on `create(...)` (exactly one required, same field) so the headline reads verbatim. Canonical `template`→`image` rename is **125's** job.
+- [ ] **Step 3: Run gated** (`MVM_E2E_SMOKE=1`) on this libkrun host → PASS; ungated → the prod-refusal test still runs and passes. Commit.
 - [ ] **Step 4: Lead the quickstart with it** — README / `mvmctl` quickstart shows the five-line `Sandbox` example, not the build/derive path.
+
+## Security posture & guardrails
+
+This plan adds **no new** security mechanism — encrypt-at-rest + Noise vsock (**122**), claim-gate CI + fuzz (**128**), secrets (**129**) / broker (**104**), verity overlay (**124 Phase C**) are their own plans. But the demo path exercises existing claims live, so the rule is **prove them, never bypass them**:
+
+- **Claim 8 (signed/audited admission).** `up --flake` admits a synthesized + signed `ExecutionPlan` (`verify_plan`, validity window, nonce replay-store, `plan.admitted/launched` audit). The E2E must drive the **real** admitted path — **no `--hypervisor mock` / `MVM_DIRECT_BOOT`** (they bypass admission + audit; the test would prove nothing). The `overlay_aware: true` fresh-build admit is the intended pass; don't disable the verifier to dodge a gap.
+- **Claim 10 (default-deny egress).** hello-app declares no network → default-deny applies; the E2E must pass **without** `MVM_ACK_UNRESTRICTED_NETWORK`.
+- **Claim 4 (dev-only exec).** Task 5 `exec()` refuses prod via `SandboxDevOnly` before any vsock traffic; locked by the always-on prod-refusal unit test.
+- **Mutable-state isolation (hygiene).** Run gated tests under `MVM_DATA_DIR="$PWD/.mvm-test"` so demo audit entries / replay-nonces / signer keys never touch the real `~/.mvm` chain or race a parallel session.
+- **Off-path (later plans, not gaps):** claim 11 (no app-deps in hello-app), claim 13/broker (literal env only, no secrets), claim 3 (dev-tier demo VM — no verity required per the dev-vs-prod tier rule).
 
 ## Acceptance (this plan is done when)
 

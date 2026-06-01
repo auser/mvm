@@ -1,3 +1,19 @@
+# Stage C — Core demo (Plan 120) — IN FLIGHT  [`plans/120-core-demo.md`](plans/120-core-demo.md)
+
+**Branch:** `plan-120-core-demo` (off `cleanup-rearchitecture`; part of the Plan 117 rewrite).
+
+**Goal:** prove the rewrite's #1 deliverable end-to-end on macOS (libkrun): `mvmctl dev up` (persistent builder) → `mvmctl compile <app.py>` (decorator → flake) → `mvmctl up --flake <dir>` (build-in-VM + boot) → guest agent answers `Ping` over vsock. Lock the spine behind a gated E2E regression guard and ship the one-call `Sandbox.exec(...)` DX headline. Brief 117 §4 acceptance.
+
+- [x] Task 1 — `ArtifactSidecar` → `ArtifactManifest` rename (landed on `cleanup-rearchitecture`, 2026-05-31).
+- [ ] Task 2 — `crates/mvm-cli/tests/compile_hello_app.rs` locks `mvmctl compile <app.py>` decorator lowering; stale `compile.rs` docstring corrected.
+- [ ] Task 3 — `crates/mvm-cli/tests/core_demo_e2e.rs` (MVM_E2E_SMOKE-gated, forces `--hypervisor libkrun`); `workflow_dispatch` CI lane + `development.md` note; ungated run green.
+- [ ] Task 4 — drive the gated E2E to green on this macOS/libkrun host (workload-backend / `compile→up` handoff / teardown), never bypassing admission/audit/network; tick brief 117 §4 boxes 436–439.
+- [ ] Task 5 — `Sandbox.exec(...) -> ExecResult` one-shot (dev-tier; `SandboxDevOnly` refuses prod before any vsock); `image=`/`shutdown()` aliases; quickstart leads with it.
+
+**Security posture:** no new mechanism — encrypt-at-rest + Noise (122), claim-gates/fuzz (128), secrets (129)/broker (104), verity overlay (124C) are their own plans. The demo *exercises* claims 8 (signed/audited admission), 10 (default-deny egress), 4 (dev-only exec) and must **prove, never bypass** them. Deferred: Linux/Firecracker parity (own plan, Lima `/dev/kvm` test-tier backend), Vz-workload parity (next macOS backend).
+
+---
+
 # Sprint 42 — microVM hardening: load-bearing guarantees
 
 **Goal:** turn the project's stated security claim ("no SSH in microVMs,
