@@ -239,10 +239,13 @@
       # - `ro` — root is read-only; writes go to the persistent
       #   /nix-store virtio-blk at /dev/vdb (Plan 72 W4 wires it).
       # - `rootfstype=ext4` — skip filesystem auto-detection.
-      # - `init=/sbin/mvm-builder-init` — Plan 72 W3 / Plan 107 A1b
-      #   binary as PID 1. Cargo package is `mvm-host-vm-init`; the
-      #   install path is `/sbin/mvm-builder-init` (T2 manifest).
-      builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
+      # - `init=/sbin/mvm-host-vm-init` — Plan 72 W3 / Plan 107 A1b
+      #   binary as PID 1. The cargo package and the install path are
+      #   both `mvm-host-vm-init` (nix/lib/mvm-host-binaries.nix is the
+      #   source of truth). The earlier `/sbin/mvm-builder-init` name
+      #   was renamed; the cmdline had drifted out of sync with the
+      #   manifest, which made PID 1 ENOENT (kernel panic on boot).
+      builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-host-vm-init";
 
       # Extra packages for the interactive (dev) builder VM image.
       # Added on top of `builderPackages` when `interactive = true`.
@@ -274,8 +277,8 @@
         (libFor { inherit system; }).mkGuest {
           name = "mvm-builder-vm";
           # Skip the addon-dns bake. The builder VM's PID 1 is
-          # `mvm-builder-init` (set via `extraFiles` + the
-          # `init=/sbin/mvm-builder-init` kernel cmdline), so
+          # `mvm-host-vm-init` (set via `extraFiles` + the
+          # `init=/sbin/mvm-host-vm-init` kernel cmdline), so
           # mkGuest's initScript-side addon-dns activation block
           # never runs and the binary would just sit unused at
           # /usr/local/bin/mvm-addon-dns. The win is in Stage 0:
@@ -284,7 +287,7 @@
           # the tmpfs-bound build into OOM territory.
           bakeAddonDns = false;
           # mkGuest requires an entrypoint declaration. At runtime
-          # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
+          # the kernel cmdline sets `init=/sbin/mvm-host-vm-init`,
           # so mkGuest's entrypoint is vestigial — but we still
           # need to declare one to satisfy the type contract.
           entrypoint.shell = "/bin/sh";
